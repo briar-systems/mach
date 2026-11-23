@@ -1,19 +1,37 @@
+[mach](../../README.md) / [cli](../README.md) / [cmd](README.md) / **fmt**
+
 # mach.cli.cmd.fmt
 
-## rec Report
+`mach fmt`, which rewrites source into the canonical layout
 
-```mach
-pub rec Report;
-```
+the operand is a project, one source file formatted with no manifest read, or `-` for
+standard input. under `--check` nothing is written and a source that is not canonical
+fails the command.
 
-`mach fmt`: the project's own source in the one canonical layout
+Source: [`src/cli/cmd/fmt.mach`](../../../../src/cli/cmd/fmt.mach)
 
-visited: source files read
-differing: files whose layout is not canonical (rewritten, or listed by --check)
-malformed: files that do not parse; each was reported and left unchanged
-diagnostics: where a malformed file's diagnostics are rendered
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
 
-## def Operand
+| Type | | |
+| :--- | :--- | :--- |
+| [`Operand`](#operand) | `def` | how the operand names its input |
+
+| On `Operand` | |
+| :--- | :--- |
+| [`classify`](#classify) | which form the operand takes |
+
+| Functions | |
+| :--- | :--- |
+| [`run`](#run) | `mach fmt <path>\|<file>\|- [--check]` |
+
+| Constants | |
+| :--- | :--- |
+| [`COMMAND`](#constants) | `mach fmt` |
+| [`POLICY`](#constants) | what mach holds `mach fmt` to beyond the parse |
+
+---
+
+## Operand
 
 ```mach
 pub def Operand: u8
@@ -21,122 +39,40 @@ pub def Operand: u8
 
 how the operand names its input
 
-stream: `-`, the source arrives on stdin
-source: one source file, formatted with no manifest read
-project: a directory holding a mach.toml, or the mach.toml itself
+| Field | Type | |
+| :--- | :--- | :--- |
+| `stream` |  | `-`, the source arrives on stdin |
+| `source` |  | one source file, formatted with no manifest read |
+| `project` |  | a directory holding a mach.toml, or the mach.toml itself |
 
-## val OPERAND_STREAM
-
-```mach
-pub val OPERAND_STREAM:  Operand = 0
-```
-
-## val OPERAND_SOURCE
+### classify
 
 ```mach
-pub val OPERAND_SOURCE:  Operand = 1
-```
-
-## val OPERAND_PROJECT
-
-```mach
-pub val OPERAND_PROJECT: Operand = 2
-```
-
-## val STREAM_OPERAND
-
-```mach
-pub val STREAM_OPERAND: str = "-"
-```
-
-the operand spelling that names stdin
-
-## val STREAM_NAME
-
-```mach
-pub val STREAM_NAME: str = "<stdin>"
-```
-
-how diagnostics and the check listing name the stream
-
-## def Sink
-
-```mach
-pub def Sink: u8
-```
-
-where the canonical text of one input goes
-
-file: replace the input file in place and name it on stdout
-stream: write the canonical text to stdout, whether or not it differs
-name: write no source; name the input on stdout when its layout differs
-
-## val SINK_FILE
-
-```mach
-pub val SINK_FILE:   Sink = 0
-```
-
-## val SINK_STREAM
-
-```mach
-pub val SINK_STREAM: Sink = 1
-```
-
-## val SINK_NAME
-
-```mach
-pub val SINK_NAME:   Sink = 2
-```
-
-## fun format_project
-
-```mach
-pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, sink: Sink, diagnostics: *writer.Writer) res[Report, outcome.Fail];
-```
-
-format or check one project: the manifest names the source directory, the
-dependency tree is identified so it can never be selected, and the walk
-visits only the source tree
-
-## fun format_one_file
-
-```mach
-pub fun format_one_file(a: *A.Allocator, backing: *A.Allocator, operand: str, sink: Sink, diagnostics: *writer.Writer) res[Report, outcome.Fail];
-```
-
-format one source file named directly, with no manifest read: the file's own
-directory is opened so the leaf is handled exactly as the project walk handles it
-
-## fun format_stream
-
-```mach
-pub fun format_stream(a: *A.Allocator, in_fd: usize, out_fd: usize, sink: Sink, diagnostics: *writer.Writer) res[Report, outcome.Fail];
-```
-
-format the source arriving on one descriptor onto another; nothing on disk is
-read or written, so no manifest is involved at any point. the descriptors are
-parameters rather than the process streams so the caller owns that binding
-
-## fun classify
-
-```mach
-pub fun classify(operand: str) res[Operand, outcome.Fail];
+pub fun classify(a: *std.allocator.Allocator, operand: str) res[Operand, mach.base.fail.Fail]
 ```
 
 which form the operand takes. `-` is the stream; a directory, or a file named
 mach.toml, is a project; any other existing file is a single source
 
-## fun run
+## Functions
+
+### run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach fmt <path>|<file>|- [--check]`
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: exit.OK when every input is canonical (or was made so), exit.USER when an input differs
-      under --check or is malformed, otherwise the code `exit.of` maps the printed failure to
+| Parameter | |
+| :--- | :--- |
+| `cx` | the call |
+| **returns** | exit.OK when every input is canonical (or was made so), exit.USER when an input differs under --check or is malformed, otherwise the failure |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "fmt", aliases: args.NO_WORDS, help: "format source in the canonical layout", usage: "<path>\|<file>\|-", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach fmt` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach fmt` to beyond the parse |
 

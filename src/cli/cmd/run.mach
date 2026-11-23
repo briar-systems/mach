@@ -1,625 +1,212 @@
-use mach.lang.build.outcome;
-use std.allocator.arena;
-use std.allocator.page;
-use du: std.chrono.duration;
-use std.collections.vector;
-use std.collections.vector.Vector;
-use fs: std.filesystem;
-use std.format;
-use io_error: std.io.error;
-use std.print;
-use std.process.env;
-use std.process.exec;
+# `mach run`, which launches an already built executable with the arguments after `--`
+#
+# a runner the target declares, or `--runner`, launches it instead, and a target that is
+# not the host's and has neither is refused. under `--timeout` the program runs in its
+# own process group and is stopped when the time is up.
+
+use mach.base.fail;
+use std_args:        std.args;
+use chrono_duration: std.chrono.duration;
+use std.collections.slice.Slice;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
-use std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
-use std.types.string.str_len;
 
 use A: std.allocator;
 
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.duration;
 use mach.cli.args;
 use mach.cli.cmd.build;
-use cli_diag: mach.cli.diagnostic;
+use cli_diagnostic: mach.cli.diagnostic;
 use mach.cli.exit;
 use mach.cli.util;
-use dkind: mach.lang.diagnostic.kind;
-use mach.lang.driver;
-use dcfg: mach.lang.driver.config;
-use mach.lang.duration;
-use mach.lang.manifest;
-use mach.subprocess;
+use mach.host;
+use mach.host.subprocess;
+use mach.manifest.runner;
+use manifest_select: mach.manifest.select;
+
+# `-o <path>`, the executable to run in place of the selected artifact's
+val OUTPUT: std_args.Flag = std_args.Flag{long: "output", short: 'o', value: "path", repeat: false, negatable: false, help: "the build's output to run, as -o names it in a build (default: the artifact's)"};
+
+# length of FLAGS
+val FLAGS_N: usize = 8;
+# the flags mach run takes: the selectors but `--all`, since run executes one artifact, `--runner`
+# and `--timeout`
+val FLAGS: [FLAGS_N]*std_args.Flag = [FLAGS_N]*std_args.Flag{
+    ?args.HELP, ?args.REPORT, ?args.ARTIFACT, ?args.TARGET, ?args.PROFILE, ?OUTPUT, ?args.RUNNER, ?args.TIMEOUT,
+};
+
+# length of REFUSED
+val REFUSED_N: usize = 14;
+# the build options run recognizes only to refuse, since it builds nothing
+val REFUSED: [REFUSED_N]*std_args.Flag = [REFUSED_N]*std_args.Flag{
+    ?args.ALL, ?args.VERBOSE, ?args.QUIET, ?args.SET, ?args.VERIFY, ?args.OPTIMIZE, ?args.DEBUG, ?args.WORK,
+    ?args.EMIT, ?args.THREADS, ?args.LIB_DIR, ?args.LIB, ?args.NO_CACHE, ?args.PLAN,
+};
+
+# `mach run`
+pub val COMMAND: std_args.Command = std_args.Command{name: "run", aliases: args.NO_WORDS, help: "run a built executable, passing arguments after --", usage: "<path> [-- args...]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: true};
+# what mach holds `mach run` to beyond the parse
+pub val POLICY: args.Policy = args.Policy{refused: Slice[*std_args.Flag]{data: ?REFUSED[0], size: REFUSED_N}, refusal: "run executes an existing artifact", conflicts: args.NO_CONFLICTS};
 
 # `mach run`: execute the project's already-built binary, forwarding the arguments after
-# `--` to it. `--emit` and build-only options are refused; `--runner <cmd>` executes
-# `<cmd> <binary> <args>` instead, which is required when the target is not runnable on
-# this host; `--timeout <duration>` runs the program in its own process group and
-# terminates it after the duration
+# `--` to it. a target that declares a `runner` launches the expanded runner followed by
+# the arguments instead, and `--runner <cmd>` replaces it for this run with
+# `<cmd> <binary> <args>`; a target that is not the host's and has neither is refused.
+# `--timeout <duration>` runs the program in its own process group and terminates it
+# after the duration
 # ---
-# argv: the full process arguments
-# inv:  the parsed invocation for this command
-# ret:  the program's exit code; 128 plus the signal number when it was killed by a signal;
-#       exit.TIMEOUT when the timeout expired; otherwise the shared code of mach's own failure:
-#       exit.USER for a usage error or an artifact that is missing or that the system refuses
-#       to execute (a malformed image fails the spawn on windows), exit.ENVIRONMENT for a wait
-#       failure, exit.INTERNAL out of memory
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
-    val sep: usize = inv.sep_idx;
+# cx:  the call
+# ret: the program's exit code; 128 plus the signal number when it was killed by a signal;
+#      exit.TIMEOUT when the timeout expired; otherwise mach's own failure: a user failure for a
+#      usage error or an artifact that is missing or that the system refuses to execute (a
+#      malformed image fails the spawn on windows), an environment failure for a wait, an
+#      internal one out of memory
+pub fun run(cx: *args.Call) res[i64, fail.Fail] {
+    val inv:   *std_args.Parsed = cx.inv;
+    val argv:  **u8             = inv.args.argv;
+    val alloc: *A.Allocator     = cx.a;
+    val sep:   usize            = std_args.separator(inv);
 
-    val opt_emit: opt[str] = util.flag_value(sep, argv, "--emit");
-    if (sel opt_emit.some) {
-        ret cli_diag.refuse(outcome.user(dkind.CLI_FLAG_INAPPLICABLE, "'mach run' does not support --emit"));
+    val opt_timeout_given: opt[*u8]                 = args.value(inv, ?args.TIMEOUT);
+    var timeout:           chrono_duration.Duration = 0;
+    var timeout_text:      str                      = "";
+    if (sel opt_timeout_given.some) {
+        timeout_text = opt_timeout_given.some::str;
+        val opt_parse: opt[chrono_duration.Duration] = duration.parse(opt_timeout_given.some);
+        if (sel opt_parse.none) { ret refused(alloc, diagnostic_kind.CLI_FLAG_VALUE, std_format.sprint(alloc, "--timeout expects {}", duration.FORMS)); }
+        timeout = opt_parse.some;
+    }
+    var output:           *u8      = nil;
+    val opt_output_given: opt[*u8] = args.value(inv, ?OUTPUT);
+    if (sel opt_output_given.some) { output = opt_output_given.some; }
+
+    val arg: *u8 = args.operand(inv, 0);
+
+    val res_loc: res[util.ProjectLocation, fail.Fail] = util.resolve_project_location(alloc, arg);
+    if (sel res_loc.err) { ret res[i64, fail.Fail].err{res_loc.err}; }
+    val root: str = res_loc.ok.root;
+
+    val res_selectors: res[manifest_select.Selectors, fail.Fail] = args.collect_selectors(alloc, inv);
+    if (sel res_selectors.err) { ret res[i64, fail.Fail].err{res_selectors.err}; }
+    var selectors: manifest_select.Selectors = res_selectors.ok;
+
+    val res_ra: res[runner.RunArtifact, fail.Fail] = runner.resolve_run_artifact(alloc, root, ?selectors, output, cx.sources);
+    if (sel res_ra.err) { ret res[i64, fail.Fail].err{args.selection_hint(alloc, ?selectors, res_ra.err)}; }
+    val ra:          runner.RunArtifact = res_ra.ok;
+    val output_path: str                = ra.path;
+
+    val res_is_file: res[bool, io_error.Error] = fs.is_file(output_path);
+    if (!(sel res_is_file.ok && res_is_file.ok)) {
+        ret refused(alloc, diagnostic_kind.ARTIFACT_NOT_BUILT, std_format.sprint(alloc, "no built artifact at '{}'. run `mach build` first", output_path));
     }
 
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret cli_diag.refuse(outcome.refused(make_r.err)); }
-    var ar:     arena.Arena;
-    val init_r: err[A.Error] = arena.init(?ar, ?backing, 0);
-    if (sel init_r.err) { ret cli_diag.refuse(outcome.refused(init_r.err)); }
-    var alloc:   A.Allocator;
-    val make_r2: err[A.Error] = arena.make(?alloc, ?ar);
-    if (sel make_r2.err) {
-        arena.dnit(?ar);
-        ret cli_diag.refuse(outcome.refused(make_r2.err));
-    }
-
-    val parsed: args.RunInvocation = args.build_run_invocation(inv);
-
-    val inert: opt[*u8] = reject_inert(sep, argv, inv.marks);
-    if (sel inert.some) {
-        cli_diag.headline_lead(dkind.CLI_FLAG_INAPPLICABLE);
-        print.eprintf("option '{}' is not applicable to 'run'; run executes an existing artifact\n",
-            inert.some::str);
-        arena.dnit(?ar);
-        ret exit.USER;
-    }
-    if (args.reject_unknown_from_invocation(inv, argv, "mach run")) {
-        arena.dnit(?ar);
-        ret exit.USER;
-    }
-
-    if (parsed.output_seen && !parsed.has_output) {
-        cli_diag.headline_lead(dkind.CLI_FLAG_VALUE);
-        print.eprint("-o requires a value\n");
-        arena.dnit(?ar);
-        ret exit.USER;
-    }
-
-    var timeout: du.Duration = 0;
-    if (parsed.has_timeout) {
-        val tv: opt[du.Duration] = duration.parse(argv[parsed.timeout_idx]);
-        if (sel tv.none) {
-            cli_diag.headline_lead(dkind.CLI_FLAG_VALUE);
-            print.eprintf("--timeout expects {}\n", duration.FORMS);
-            arena.dnit(?ar);
-            ret exit.USER;
-        }
-        timeout = tv.some;
-    }
-    var output: *u8 = nil;
-    if (parsed.has_output) { output = argv[parsed.output_idx]; }
-
-    val pix: usize = inv.positional_idx;
-    var arg: *u8   = nil;
-    if (inv.has_positional && pix < sep) { arg = argv[pix]; }
-
-    val loc_r: res[util.ProjectLocation, outcome.Fail] = util.resolve_project_location(?alloc, arg);
-    if (sel loc_r.err) {
-        cli_diag.headline_lead(outcome.kind_of(loc_r.err));
-        print.eprint(outcome.describe(loc_r.err));
-        print.eprint("\n");
-        arena.dnit(?ar);
-        ret exit.of(loc_r.err);
-    }
-    val loc:  util.ProjectLocation = loc_r.ok;
-    val root: str                  = loc.root;
-
-    val selectors_r: res[manifest.Selectors, outcome.Fail] = args.collect_selectors(?alloc, args.CMD_RUN, inv, argv);
-    if (sel selectors_r.err) {
-        val code: i64 = cli_diag.refuse(selectors_r.err);
-        arena.dnit(?ar);
-        ret code;
-    }
-    var selectors: manifest.Selectors = selectors_r.ok;
-
-    val res_ra: res[dcfg.RunArtifact, outcome.Fail] = driver.resolve_run_artifact(?alloc, root, ?selectors, output);
-    if (sel res_ra.err) {
-        cli_diag.headline_lead(outcome.kind_of(res_ra.err));
-        print.eprint(outcome.describe(res_ra.err));
-        print.eprint("\n");
-        arena.dnit(?ar);
-        ret exit.of(res_ra.err);
-    }
-    val ra:          dcfg.RunArtifact = res_ra.ok;
-    val output_path: str              = ra.path;
-
-    val is_file_r: res[bool, io_error.Error] = fs.is_file(output_path);
-    if (sel is_file_r.err) {
-        cli_diag.headline_lead(dkind.ARTIFACT_NOT_BUILT);
-        print.eprint("no built artifact at '");
-        print.eprint(output_path);
-        print.eprint("'; run `mach build` first\n");
-        arena.dnit(?ar);
-        ret exit.USER;
-    }
-    if (!(is_file_r.ok)) {
-        cli_diag.headline_lead(dkind.ARTIFACT_NOT_BUILT);
-        print.eprint("no built artifact at '");
-        print.eprint(output_path);
-        print.eprint("'; run `mach build` first\n");
-        arena.dnit(?ar);
-        ret exit.USER;
-    }
-
-    var runner: *u8 = nil;
-    if (parsed.has_runner) {
-        val name:       *u8                    = argv[parsed.runner_idx];
-        val res_runner: res[*u8, outcome.Fail] = util.resolve_cmd(?alloc, name);
+    var launcher:         runner.Runner = ra.runner;
+    val opt_runner_given: opt[*u8]      = args.value(inv, ?args.RUNNER);
+    if (sel opt_runner_given.some) {
+        val name:       *u8                 = opt_runner_given.some;
+        val res_runner: res[*u8, fail.Fail] = host.program_resolve(alloc, name);
         if (sel res_runner.err) {
-            cli_diag.headline_lead(outcome.kind_of(res_runner.err));
-            print.eprint("--runner '");
-            print.eprint(name::str);
-            print.eprint("': ");
-            print.eprint(outcome.describe(res_runner.err));
-            print.eprint("\n");
-            arena.dnit(?ar);
-            ret exit.of(res_runner.err);
+            val res_said: res[str, std_format.FormatError] = std_format.sprint(alloc, "--runner '{}' cannot be used ({})", name::str, fail.describe(res_runner.err));
+            if (sel res_said.err) { ret res[i64, fail.Fail].err{fail.format_refused(res_said.err)}; }
+            ret res[i64, fail.Fail].err{fail.owning(fail.with_text(res_runner.err, res_said.ok))};
         }
-        runner = res_runner.ok;
+        launcher = runner.overriding(res_runner.ok, ra.target_name);
     }
-    or {
+    or (!runner.given(?launcher)) {
         if (!ra.host_runnable) {
-            cli_diag.headline_lead(dkind.TARGET_NOT_RUNNABLE);
-            print.eprintf("target '{}' is not runnable on this host; pass --runner\n", ra.target_name);
-            arena.dnit(?ar);
-            ret exit.USER;
+            ret refused(alloc, diagnostic_kind.TARGET_NOT_RUNNABLE, std_format.sprint(alloc,
+                "target '{}' does not run on this host and declares no runner. declare `runner` in [target.{}] or pass --runner", ra.target_name, ra.target_name));
         }
-        val executable_r: res[str, outcome.Fail] = util.resolve_cmd(?alloc, output_path);
-        if (sel executable_r.err) {
-            cli_diag.headline_lead(dkind.ARTIFACT_NOT_EXECUTABLE);
-            print.eprint("built artifact '");
-            print.eprint(output_path);
-            print.eprint("' is not executable\n");
-            arena.dnit(?ar);
-            ret exit.USER;
+        val res_executable: res[str, fail.Fail] = host.program_resolve(alloc, output_path);
+        if (sel res_executable.err) {
+            ret refused(alloc, diagnostic_kind.ARTIFACT_NOT_EXECUTABLE, std_format.sprint(alloc, "built artifact '{}' is not executable", output_path));
         }
-        str_free(?alloc, executable_r.ok);
+        str_free(alloc, res_executable.ok);
     }
 
     var fwd_len: usize = 0;
-    if (sep < inv.argc) { fwd_len = inv.argc - sep - 1; }
+    if (sep < inv.args.argc) { fwd_len = inv.args.argc - sep - 1; }
 
-    var lead: usize = 0;
-    if (runner != nil) { lead = 1; }
-
-    val child_len:      usize              = lead + 1 + fwd_len + 1;
-    val res_child_argv: res[**u8, A.Error] = A.allocate[*u8](?alloc, child_len);
-    if (sel res_child_argv.err) {
-        arena.dnit(?ar);
-        ret cli_diag.refuse(outcome.refused(res_child_argv.err));
+    val through: bool = runner.given(?launcher);
+    var fwd:     **u8 = nil;
+    if (fwd_len > 0) { fwd = ?argv[sep + 1]; }
+    var cmd: runner.Command;
+    if (through) {
+        val res_made: res[runner.Command, fail.Fail] = runner.command(alloc, ?launcher, output_path, fwd, fwd_len);
+        if (sel res_made.err) { ret res[i64, fail.Fail].err{res_made.err}; }
+        cmd = res_made.ok;
     }
-    val child_argv: **u8 = res_child_argv.ok;
-
-    if (runner != nil) { child_argv[0] = runner; }
-    child_argv[lead] = output_path;
-    var i: usize = 0;
-    for (i < fwd_len) {
-        child_argv[lead + 1 + i] = argv[sep + 1 + i];
-        i                        = i + 1;
+    or {
+        val res_child_argv: res[**u8, A.Error] = A.allocate[*u8](alloc, fwd_len + 2);
+        if (sel res_child_argv.err) { ret res[i64, fail.Fail].err{fail.refused(res_child_argv.err)}; }
+        cmd         = runner.Command{argv: res_child_argv.ok, len: fwd_len + 1, lead: 1};
+        cmd.argv[0] = output_path;
+        var i: usize = 0;
+        for (i < fwd_len) {
+            cmd.argv[1 + i] = fwd[i];
+            i               = i + 1;
+        }
+        cmd.argv[1 + fwd_len] = nil;
     }
-    child_argv[lead + 1 + fwd_len] = nil;
-
-    var exe: *u8 = output_path;
-    if (runner != nil) { exe = runner; }
+    val child_argv: **u8 = cmd.argv;
+    val exe:        *u8  = cmd.argv[0];
 
     var child: subprocess.OwnedSubprocess;
     subprocess.init(?child);
-    var res_spawn: err[subprocess.Error];
+    fin { subprocess.dnit(alloc, ?child); }
+    var options: subprocess.SpawnOptions = subprocess.spawn_options();
+    options.grouped = timeout > 0;
     if (timeout > 0) {
-        res_spawn = subprocess.spawn_grouped(?alloc, ?child, exe::str, child_argv, env.environ());
+        val err_bounded: err[subprocess.Error] = subprocess.bound(?child, timeout);
+        if (sel err_bounded.err) { ret res[i64, fail.Fail].err{subprocess.refusal(alloc, diagnostic_kind.PROCESS_WAIT, "set the timeout of", err_bounded.err, nil)}; }
     }
-    or {
-        res_spawn = subprocess.spawn(?alloc, ?child, exe::str, child_argv, env.environ());
-    }
-    if (sel res_spawn.err) {
-        if (runner != nil) {
-            cli_diag.headline_lead(dkind.PROCESS_SPAWN);
-            print.eprint("failed to execute the runner\n");
-        }
-        or {
-            cli_diag.headline_lead(dkind.PROCESS_SPAWN);
-            print.eprint("failed to execute the built binary\n");
-        }
-        arena.dnit(?ar);
-        ret exit.USER;
+    val err_spawn: err[subprocess.Error] = subprocess.spawn(alloc, ?child, exe::str, child_argv, cx.environ, options);
+    if (sel err_spawn.err) {
+        var op: fail.Op = fail.Op{verb: "run", role: "the built binary", path: exe::str};
+        if (through) { op = fail.Op{verb: "run", role: "the runner", path: exe::str, given: true}; }
+        ret res[i64, fail.Fail].err{subprocess.refusal_of(alloc, diagnostic_kind.PROCESS_SPAWN, op, err_spawn.err)};
     }
 
-    var res_wait: res[subprocess.SubprocessTerminal, outcome.Fail];
-    if (timeout > 0) {
-        subprocess.bound(?child, timeout);
-        val wr: res[*subprocess.OwnedSubprocess, subprocess.Error] = subprocess.wait_any(?alloc, ?child, 1, nil, nil);
-        if (sel wr.err) {
-            res_wait = res[subprocess.SubprocessTerminal, outcome.Fail].err{outcome.environment(dkind.PROCESS_WAIT, subprocess.text(?alloc, wr.err))};
-        }
-        if (sel wr.ok) { res_wait = res[subprocess.SubprocessTerminal, outcome.Fail].ok{child.terminal}; }
+    var res_wait:     res[subprocess.SubprocessTerminal, fail.Fail];
+    val res_wait_any: res[*subprocess.OwnedSubprocess, subprocess.Error] = subprocess.wait_any(alloc, ?child, 1, nil);
+    if (sel res_wait_any.err) {
+        res_wait = res[subprocess.SubprocessTerminal, fail.Fail].err{subprocess.refusal(alloc, diagnostic_kind.PROCESS_WAIT, "wait for", res_wait_any.err, nil)};
     }
-    or {
-        val waited: res[subprocess.SubprocessTerminal, subprocess.Error] = subprocess.wait(?alloc, ?child);
-        if (sel waited.err) { res_wait = res[subprocess.SubprocessTerminal, outcome.Fail].err{outcome.environment(dkind.PROCESS_WAIT, subprocess.text(?alloc, waited.err))}; }
-        if (sel waited.ok)  { res_wait = res[subprocess.SubprocessTerminal, outcome.Fail].ok{waited.ok}; }
-    }
+    if (sel res_wait_any.ok) { res_wait = res[subprocess.SubprocessTerminal, fail.Fail].ok{child.terminal}; }
     if (sel res_wait.err) {
-        cli_diag.headline_lead(outcome.kind_of(res_wait.err));
-        print.eprintlnf("failed to wait for the executed process: {}", outcome.describe(res_wait.err));
-        subprocess.cancel(?alloc, ?child, 0);
-        subprocess.dnit(?alloc, ?child);
-        arena.dnit(?ar);
-        ret exit.of(res_wait.err);
+        val waited_fail: fail.Fail = res_wait.err;
+        if (!subprocess.running(?child)) { ret res[i64, fail.Fail].err{waited_fail}; }
+        val res_cancelled: res[subprocess.SubprocessTerminal, subprocess.Error] = subprocess.cancel(alloc, ?child, 0);
+        if (sel res_cancelled.err) { ret res[i64, fail.Fail].err{fail.with_secondary(alloc, waited_fail, subprocess.refusal(alloc, diagnostic_kind.PROCESS_WAIT, "stop", res_cancelled.err, nil))}; }
+        ret res[i64, fail.Fail].err{waited_fail};
     }
     val expired:  bool                          = subprocess.expired(?child);
-    val terminal: subprocess.SubprocessTerminal =
-        res_wait.ok;
-    subprocess.dnit(?alloc, ?child);
-    arena.dnit(?ar);
+    val terminal: subprocess.SubprocessTerminal = res_wait.ok;
 
     if (expired) {
-        cli_diag.headline_lead(dkind.PROCESS_TIMEOUT);
-        print.eprintf("the program exceeded --timeout {} and its process group was terminated\n",
-            argv[parsed.timeout_idx]::str);
-        ret exit.TIMEOUT;
+        val res_said: res[str, std_format.FormatError] = std_format.sprint(alloc, "the program exceeded --timeout {} and its process group was terminated", timeout_text);
+        if (sel res_said.ok) { cli_diagnostic.report_fail(cx.report, fail.user(diagnostic_kind.PROCESS_TIMEOUT, res_said.ok), diagnostic.ORIGIN_NONE); }
+        ret res[i64, fail.Fail].ok{exit.TIMEOUT};
     }
-    if (terminal.kind == subprocess.STATE_EXITED) {
-        ret terminal.code::i64;
-    }
-    if (terminal.kind == subprocess.STATE_SIGNALED) {
-        ret 128 + terminal.code::i64;
-    }
-    cli_diag.headline_lead(dkind.PROCESS_NO_STATUS);
-    print.eprint("the executed process ended without an exit status or a signal\n");
-    ret exit.ENVIRONMENT;
+    if (terminal.kind == subprocess.STATE_EXITED)   { ret res[i64, fail.Fail].ok{terminal.code::i64}; }
+    if (terminal.kind == subprocess.STATE_SIGNALED) { ret res[i64, fail.Fail].ok{128 + terminal.code::i64}; }
+    ret res[i64, fail.Fail].err{fail.environment(diagnostic_kind.PROCESS_NO_STATUS, "the executed process ended without an exit status or a signal")};
 }
 
-#[testing]
-fun t_run(argc: usize, argv: **u8) i64 {
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 2; }
-    val ir: res[args.ParsedInvocation, outcome.Fail] = args.parse_invocation(?a, argc, argv);
-    if (sel ir.err) { ret 2; }
-    var inv: args.ParsedInvocation = ir.ok;
-    fin { args.dnit_invocation(?a, ?inv); }
-    ret run(argv, ?inv);
-}
-
-fun reject_inert(sep: usize, argv: **u8, marks: *bool) opt[*u8] {
-    var i: usize = 2;
-    for (i < sep) {
-        if (!marks[i]) {
-            val tok: *u8 = argv[i];
-            if (args.flag_in_table(tok, ?args.RDO[0], args.RDO_N)
-                || args.flag_in_table(tok, ?args.CGEN[0], args.CGEN_N)
-                || args.flag_in_table(tok, ?args.OPT[0], args.OPT_N)) {
-                ret opt[*u8].some{tok};
-            }
-        }
-        i = i + 1;
-    }
-    ret opt[*u8].none{};
-}
-
-test reject_inert__run_selectors_and_runner_are_never_rejected {
-    var argv: [7]*u8;
-    argv[0] = "mach";
-    argv[1] = "run";
-    argv[2] = "-t";
-    argv[3] = "linux-x86_64";
-    argv[4] = "-p";
-    argv[5] = "--runner";
-    argv[6] = "wine";
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-    val ir: res[args.ParsedInvocation, outcome.Fail] = args.parse_invocation(?a, 7, ?argv[0]);
-    if (sel ir.err) { ret 1; }
-    val inv: args.ParsedInvocation = ir.ok;
-
-    val reject_inert_r: opt[*u8] = reject_inert(7, ?argv[0], inv.marks);
-    if (sel reject_inert_r.some) { ret 1; }
-    ret 0;
-}
-
-test reject_inert__first_offending_token_in_input_order {
-    var argv: [6]*u8;
-    argv[0] = "mach";
-    argv[1] = "run";
-    argv[2] = ".";
-    argv[3] = "-g";
-    argv[4] = "--pie";
-    argv[5] = "-v";
-    var marks: [6]bool;
-    var i:     usize = 0;
-    for (i < 6) {
-        marks[i] = false;
-        i        = i + 1;
-    }
-
-    val r: opt[*u8] = reject_inert(6, ?argv[0], ?marks[0]);
-    if (sel r.none)                     { ret 1; }
-    if (!str_equals(r.some::str, "-g")) { ret 2; }
-    ret 0;
-}
-
-test run__rejects_every_inert_option_before_effects {
-    var bad: i32 = 0;
-
-    var alone: [3]*u8;
-    alone[0] = "mach";
-    alone[1] = "run";
-    alone[2] = "-g";
-    if (t_run(3, ?alone[0]) != 1) { bad = 1; }
-
-    var with_project: [4]*u8;
-    with_project[0] = "mach";
-    with_project[1] = "run";
-    with_project[2] = ".";
-    with_project[3] = "--emit-ir";
-    if (t_run(4, ?with_project[0]) != 1) { bad = 1; }
-
-    var duplicate: [5]*u8;
-    duplicate[0] = "mach";
-    duplicate[1] = "run";
-    duplicate[2] = "-v";
-    duplicate[3] = ".";
-    duplicate[4] = "-vv";
-    if (t_run(5, ?duplicate[0]) != 1) { bad = 1; }
-
-    ret bad;
-}
-
-#[testing]
-fun t_scratch_runnable(a: *A.Allocator, root_buf: *u8) bool {
-    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mach_run_cmd_smoke");
-    if (sel tf_r.err) { ret false; }
-    var tf:   fs.TempFile = tf_r.ok;
-    val tp:   *u8         = fs.temp_path(?tf)::*u8;
-    val tlen: usize       = str_len(tp);
-    val fits: bool        = tlen + 1 <= 4096;
-    if (fits) {
-        var j: usize = 0;
-        for (j < tlen) {
-            root_buf[j] = tp[j];
-            j           = j + 1;
-        }
-        root_buf[tlen] = 0;
-    }
-    fs.temp_close_and_remove(?tf);
-    if (!fits) { ret false; }
-
-    val root:       str = root_buf::str;
-    var executable: str = "true";
-    var basename:   str = "runsmoke";
-    $if ($mach.build.os == $mach.os.windows) { basename = "runsmoke.exe"; }
-    val body_r: res[str, format.FormatError] = format.sprint(a, "[project]\nmach = \">=5\"\nid = \"runsmoke\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[profile.run]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n\n[artifact.runsmoke]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/{}\"\ntargets = [\"*\"]\nlink = []\nneed = []\n", basename);
-    if (sel body_r.err) { ret false; }
-    val body: str = body_r.ok;
-    fin { str_free(a, body); }
-    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(a, root, 0o755);
-    if (sel create_dir_all_r.err) { ret false; }
-    val toml_path_r: res[path.Path, A.Error] = path.join(a, root, "mach.toml");
-    if (sel toml_path_r.err) { ret false; }
-    val toml_path: str = toml_path_r.ok;
-    fin { str_free(a, toml_path); }
-    val write_bytes_r: err[fs.FsError] = fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644);
-    if (sel write_bytes_r.err) { ret false; }
-
-    val bin_dir_r: res[path.Path, A.Error] = path.join(a, root, "out/bin");
-    if (sel bin_dir_r.err) { ret false; }
-    val bin_dir: str = bin_dir_r.ok;
-    fin { str_free(a, bin_dir); }
-    val create_dir_all_r2: err[fs.FsError] = fs.create_dir_all(a, bin_dir, 0o755);
-    if (sel create_dir_all_r2.err) { ret false; }
-    val bin_path_r: res[path.Path, A.Error] = path.join(a, bin_dir, basename);
-    if (sel bin_path_r.err) { ret false; }
-    val bin_path: str = bin_path_r.ok;
-    fin { str_free(a, bin_path); }
-
-    $if ($mach.build.os == $mach.os.windows) {
-        val source_dir_r: res[path.Path, A.Error] = path.join(a, root, "src");
-        if (sel source_dir_r.err) { ret false; }
-        val source_dir: str = source_dir_r.ok;
-        fin { str_free(a, source_dir); }
-        val create_dir_all_r3: err[fs.FsError] = fs.create_dir_all(a, source_dir, 0o755);
-        if (sel create_dir_all_r3.err) { ret false; }
-        val source_path_r: res[path.Path, A.Error] = path.join(a, source_dir, "main.mach");
-        if (sel source_path_r.err) { ret false; }
-        val source_path: str = source_path_r.ok;
-        fin { str_free(a, source_path); }
-        val source:         str             = "#[symbol(\"mainCRTStartup\")]\nfun start() i32 { ret 0; }\n";
-        val write_bytes_r2: err[fs.FsError] = fs.write_bytes(source_path, source, str_len(source), 0o644);
-        if (sel write_bytes_r2.err) { ret false; }
-        var av: [3]*u8;
-        av[0] = "mach";
-        av[1] = "build";
-        av[2] = root::*u8;
-        val inv_r: res[args.ParsedInvocation, outcome.Fail] = args.parse_invocation(a, 3, ?av[0]);
-        if (sel inv_r.err) { ret false; }
-        var inv: args.ParsedInvocation = inv_r.ok;
-        fin { args.dnit_invocation(a, ?inv); }
-        ret build.run(?av[0], ?inv) == 0;
-    }
-
-    val program_r: res[str, exec.Error] = exec.resolve(a, executable);
-    if (sel program_r.err) { ret false; }
-    val program:   str                         = program_r.ok;
-    val res_bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, program);
-    str_free(a, program);
-    if (sel res_bytes.err) { ret false; }
-    var bytes:          Vector[u8]      = res_bytes.ok;
-    val write_bytes_r3: err[fs.FsError] = fs.write_bytes(bin_path, bytes.data, bytes.len, 0o755);
-    if (sel write_bytes_r3.err) {
-        vector.dnit[u8](?bytes);
-        ret false;
-    }
-    vector.dnit[u8](?bytes);
-    ret true;
-}
-
-#[testing]
-fun t_run_scratch(root: *u8) i64 {
-    var av: [3]*u8;
-    av[0] = "mach";
-    av[1] = "run";
-    av[2] = root;
-    ret t_run(3, ?av[0]);
-}
-
-test run__o_with_no_value_is_rejected_where_the_same_project_runs {
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-    var root: [4096]u8;
-    if (!t_scratch_runnable(?a, ?root[0])) {
-        fs.remove_all(?a, ?root[0]);
-        ret 1;
-    }
-
-    val rc_ok: i64 = t_run_scratch(?root[0]);
-    if (rc_ok != 0) {
-        fs.remove_all(?a, ?root[0]);
-        ret 1;
-    }
-
-    var av_bad: [4]*u8;
-    av_bad[0] = "mach"::*u8;
-    av_bad[1] = "run"::*u8;
-    av_bad[2] = ?root[0];
-    av_bad[3] = "-o"::*u8;
-    val rc_bad: i64 = t_run(4, ?av_bad[0]);
-
-    fs.remove_all(?a, ?root[0]);
-    if (rc_bad != 1) { ret 1; }
-    ret 0;
-}
-
-test run__rejects_a_library_only_selection_before_launch {
-    val body:   str          = "[project]\nmach = \">=5\"\nid = \"runlibonly\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[artifact.runlibonly]\nkind = \"static\"\nentry = \"src/lib.mach\"\nout = \"lib/runlibonly.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-
-    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_run_cmd_lib");
-    if (sel tf_r.err) { ret 1; }
-    var tf:   fs.TempFile = tf_r.ok;
-    val root: str         = fs.temp_path(?tf);
-    fs.temp_close_and_remove(?tf);
-    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(?a, root, 0o755);
-    if (sel create_dir_all_r.err) { ret 1; }
-    val toml_path_r: res[str, A.Error] = path.join(?a, root, "mach.toml");
-    if (sel toml_path_r.err) { ret 1; }
-    val toml_path:     str             = toml_path_r.ok;
-    val write_bytes_r: err[fs.FsError] = fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644);
-    if (sel write_bytes_r.err) { ret 1; }
-
-    var argv: [3]*u8;
-    argv[0] = "mach";
-    argv[1] = "run";
-    argv[2] = root::*u8;
-
-    val rc: i64 = t_run(3, ?argv[0]);
-    fs.remove_all(?a, root);
-    if (rc != 1) { ret 1; }
-    ret 0;
-}
-
-test run__rejects_a_foreign_target_without_a_runner {
-    val body:   str          = "[project]\nmach = \">=5\"\nid = \"runforeign\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[artifact.runforeign]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"bin/runforeign.exe\"\ntargets = [\"windows\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-
-    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_run_cmd_foreign");
-    if (sel tf_r.err) { ret 1; }
-    var tf:   fs.TempFile = tf_r.ok;
-    val root: str         = fs.temp_path(?tf);
-    fs.temp_close_and_remove(?tf);
-    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(?a, root, 0o755);
-    if (sel create_dir_all_r.err) { ret 1; }
-    val toml_path_r: res[str, A.Error] = path.join(?a, root, "mach.toml");
-    if (sel toml_path_r.err) { ret 1; }
-    val toml_path:     str             = toml_path_r.ok;
-    val write_bytes_r: err[fs.FsError] = fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644);
-    if (sel write_bytes_r.err) { ret 1; }
-
-    val bin_dir_r: res[str, A.Error] = path.join(?a, root, "out/bin");
-    if (sel bin_dir_r.err) { ret 1; }
-    val bin_dir:           str             = bin_dir_r.ok;
-    val create_dir_all_r2: err[fs.FsError] = fs.create_dir_all(?a, bin_dir, 0o755);
-    if (sel create_dir_all_r2.err) { ret 1; }
-    val bin_path_r: res[str, A.Error] = path.join(?a, bin_dir, "runforeign.exe");
-    if (sel bin_path_r.err) { ret 1; }
-    val bin_path:       str             = bin_path_r.ok;
-    val write_bytes_r2: err[fs.FsError] = fs.write_bytes(bin_path, "MZ"::*u8, 2, 0o755);
-    if (sel write_bytes_r2.err) { ret 1; }
-
-    var argv: [5]*u8;
-    argv[0] = "mach";
-    argv[1] = "run";
-    argv[2] = root::*u8;
-    argv[3] = "-t";
-    argv[4] = "windows"::*u8;
-
-    val rc: i64 = t_run(5, ?argv[0]);
-    fs.remove_all(?a, root);
-    if (rc != 1) { ret 1; }
-    ret 0;
-}
-
-test run__native_execution_runs_and_rejects_mode_denial_and_malformed_images {
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-    var root: [4096]u8;
-    if (!t_scratch_runnable(?a, ?root[0])) {
-        fs.remove_all(?a, ?root[0]);
-        ret 1;
-    }
-    fin { fs.remove_all(?a, ?root[0]); }
-    if (t_run_scratch(?root[0]) != 0) { ret 2; }
-
-    var leaf: str = "out/bin/runsmoke";
-    $if ($mach.build.os == $mach.os.windows) { leaf = "out/bin/runsmoke.exe"; }
-    val filename_r: res[path.Path, A.Error] = path.join(?a, ?root[0], leaf);
-    if (sel filename_r.err) { ret 3; }
-    val filename: str = filename_r.ok;
-    fin { str_free(?a, filename); }
-
-    val image_r: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, filename);
-    if (sel image_r.err) { ret 4; }
-    var image: Vector[u8] = image_r.ok;
-    fin { vector.dnit[u8](?image); }
-    $if ($mach.build.os != $mach.os.windows) {
-        val remove_file_r: err[io_error.Error] = fs.remove_file(filename);
-        if (sel remove_file_r.err) { ret 4; }
-        val write_bytes_r: err[fs.FsError] = fs.write_bytes(filename, image.data, image.len, 0o644);
-        if (sel write_bytes_r.err)        { ret 4; }
-        if (t_run_scratch(?root[0]) != 1) { ret 5; }
-    }
-
-    val remove_file_r2: err[io_error.Error] = fs.remove_file(filename);
-    if (sel remove_file_r2.err) { ret 6; }
-    val malformed:      str             = "not a native executable image\n";
-    val write_bytes_r2: err[fs.FsError] = fs.write_bytes(filename, malformed, str_len(malformed), 0o755);
-    if (sel write_bytes_r2.err) { ret 7; }
-    var rejected: i64 = 127;
-    $if ($mach.build.os == $mach.os.windows) { rejected = 1; }
-    if (t_run_scratch(?root[0]) != rejected) { ret 8; }
-    ret 0;
+# a user failure of kind k with the formatted text, or the refusal to format it
+fun refused(a: *A.Allocator, k: diagnostic_kind.Kind, said: res[str, std_format.FormatError]) res[i64, fail.Fail] {
+    if (sel said.err) { ret res[i64, fail.Fail].err{fail.format_refused(said.err)}; }
+    ret res[i64, fail.Fail].err{fail.user(k, said.ok)};
 }

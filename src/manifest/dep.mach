@@ -1,0 +1,180 @@
+# the decoding of the `[dep.<name>]` tables
+#
+# a dependency names exactly one source, `git` or `path`. a git dependency selects by
+# `ref` or by a `version` range, never both, and no dependency may share the project's id.
+
+use mach.base.fail;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_is_empty;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.intern;
+use manifest_version: mach.manifest.version;
+
+use mach.manifest.model.DepDef;
+use mach.manifest.model.Manifest;
+use mach.manifest.model.id_of;
+use mach.manifest.model.optional_id_of;
+use mach.manifest.refusal.point_at;
+use mach.manifest.refusal.refuse;
+use mach.manifest.refusal.sfmt;
+use mach.manifest.schema.key_text;
+use mach.manifest.schema.value_span;
+
+# whether `ref` from `start` on is a full object id: 40 or 64 lowercase hex digits
+fun dep_ref_hex(ref: str, start: usize) bool {
+    val n:     usize = str_len(ref);
+    val width: usize = n - start;
+    if (width != 40 && width != 64) { ret false; }
+    var i: usize = start;
+    for (i < n) {
+        val c: u8 = ref[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `ref` from `start` to `end` is one component of a git ref name: non-empty, not
+# starting with '.', and not ending in `.lock`
+fun dep_ref_component(ref: str, start: usize, end: usize) bool {
+    if (start >= end || ref[start] == '.') { ret false; }
+    if (end - start >= 5 && ref[end - 5] == '.' && ref[end - 4] == 'l'
+        && ref[end - 3] == 'o' && ref[end - 2] == 'c' && ref[end - 1] == 'k') { ret false; }
+    ret true;
+}
+
+# whether `ref` from `start` on is a ref name git accepts for a branch or tag
+fun dep_ref_name(ref: str, start: usize) bool {
+    val n: usize = str_len(ref);
+    if (start >= n || ref[start] == '/' || ref[n - 1] == '/' || ref[n - 1] == '.') { ret false; }
+    var component_start: usize = start;
+    var i:               usize = start;
+    for (i < n) {
+        val c: u8 = ref[i];
+        if (c <= ' ' || c == 127 || c == '\\' || c == '~' || c == '^' || c == ':'
+            || c == '?' || c == '*' || c == '[') { ret false; }
+        if (c == '.' && i + 1 < n && ref[i + 1] == '.') { ret false; }
+        if (c == '/' && i + 1 < n && ref[i + 1] == '/') { ret false; }
+        if (c == '@' && i + 1 < n && ref[i + 1] == '{') { ret false; }
+        if (c == '/') {
+            if (!dep_ref_component(ref, component_start, i)) { ret false; }
+            component_start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret dep_ref_component(ref, component_start, n);
+}
+
+# whether `ref` is `branch/<name>`, `tag/<name>` or `commit/<object id>`
+fun dep_ref_valid(ref: str) bool {
+    if (str_starts_with(ref, "branch/")) { ret dep_ref_name(ref, 7); }
+    if (str_starts_with(ref, "tag/"))    { ret dep_ref_name(ref, 4); }
+    if (str_starts_with(ref, "commit/")) { ret dep_ref_hex(ref, 7); }
+    ret false;
+}
+
+# decode every `[dep.<name>]` table of `t` into `m.deps`, nothing when there is none
+# ---
+# alloc: owns the dependency array and a refusal's text
+# itn:   interns the names, sources and selectors
+# t:     the manifest's root table
+# m:     the manifest the dependencies are set on, its `id` already decoded
+# ret:   ok, or the refusal of the first dependency that does not decode
+pub fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail] {
+    val opt_tab: opt[*toml_value.Table] = toml_lookup.get_table(t, "dep");
+    if (sel opt_tab.none) { ret err[fail.Fail].ok{}; }
+    val tab: *toml_value.Table = opt_tab.some;
+    val n:   usize             = toml_lookup.table_len(tab);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val res_deps: res[*DepDef, A.Error] = A.allocate[DepDef](alloc, n);
+    if (sel res_deps.err) { ret err[fail.Fail].err{fail.refused(res_deps.err)}; }
+    m.deps      = res_deps.ok;
+    m.dep_count = n::u32;
+
+    var i: usize = 0;
+    for (i < n) {
+        val opt_name:        opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        if (sel opt_name.none)        { brk; }
+        if (sel opt_table_value.none) { brk; }
+        val res_label: res[str, fail.Fail] = sfmt(alloc, "[dep.{}]", opt_name.some);
+        if (sel res_label.err) { ret err[fail.Fail].err{res_label.err}; }
+        val err_decoded: err[fail.Fail] = dep_decode(alloc, itn, m, opt_name.some, res_label.ok, opt_table_value.some, ?m.deps[i]);
+        str_free(alloc, res_label.ok);
+        if (sel err_decoded.err) { ret err_decoded; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun dep_decode(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, name: str, label: str, v: *toml_value.Value, d: *DepDef) err[fail.Fail] {
+    val sub:         *toml_value.Table            = ?v.data.table;
+    val res_name_id: res[intern.StrId, fail.Fail] = id_of(itn, name);
+    if (sel res_name_id.err) { ret err[fail.Fail].err{res_name_id.err}; }
+    d.name = res_name_id.ok;
+    val git_s:    str  = key_text(sub, "git");
+    val path_s:   str  = key_text(sub, "path");
+    val has_git:  bool = !str_is_empty(git_s);
+    val has_path: bool = !str_is_empty(path_s);
+    if (has_git == has_path) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} needs exactly one source key, 'git' or 'path'", label), v.span)};
+    }
+    val ref_s:       str                    = key_text(sub, "ref");
+    val opt_version: opt[*toml_value.Value] = toml_lookup.get(sub, "version");
+    var version_s:   str                    = "";
+    if (sel opt_version.some) {
+        version_s = opt_version.some.data.string;
+        val res_parsed: res[manifest_version.Range, manifest_version.RangeError] = manifest_version.parse_range(version_s);
+        if (sel res_parsed.err) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.VERSION_INVALID_RANGE, "mach.toml: {}.version = \"{}\" is not a valid range. {} (clause {})", label, version_s, res_parsed.err.reason, res_parsed.err.clause), opt_version.some.span)};
+        }
+        if (!has_git) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.version selects releases, which only a git dependency has", label), opt_version.some.span)};
+        }
+        if (!str_is_empty(ref_s)) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} names both 'ref' and 'version'. keep 'version' for a release range or 'ref' for one exact or branch selector", label), opt_version.some.span)};
+        }
+    }
+    if (has_git && str_is_empty(ref_s) && sel opt_version.none) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_MISSING_REQUIRED, "mach.toml: {} is missing required key 'ref' or 'version' for git source", label), v.span)};
+    }
+    if (has_path && !str_is_empty(ref_s)) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.ref is not allowed for path sources", label), value_span(sub, "ref"))};
+    }
+    if (has_git && !str_is_empty(ref_s) && !dep_ref_valid(ref_s)) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.ref must be branch/<name>, tag/<name>, or commit/<full-object-id>", label), value_span(sub, "ref"))};
+    }
+    if (intern.str_same(d.name, m.id)) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.DEP_SHADOWS_PROJECT, "mach.toml: {} has the same id as this project ('{}'), so `{}.<module>` cannot name both. rename the project or the dependency", label, name, name), v.key)};
+    }
+    var texts: [4]str = [4]str{git_s, path_s, ref_s, version_s};
+    var ids:   [4]intern.StrId;
+    var k:     usize  = 0;
+    for (k < 4) {
+        val res_optional_id_of: res[intern.StrId, fail.Fail] = optional_id_of(itn, texts[k]);
+        if (sel res_optional_id_of.err) { ret err[fail.Fail].err{res_optional_id_of.err}; }
+        ids[k] = res_optional_id_of.ok;
+        k      = k + 1;
+    }
+    d.git     = ids[0];
+    d.path    = ids[1];
+    d.ref     = ids[2];
+    d.version = ids[3];
+    ret err[fail.Fail].ok{};
+}

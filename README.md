@@ -32,7 +32,7 @@
 - **No hidden control flow.** No exceptions, no destructors, no overloaded operators. Execution goes where the code says and nowhere else.
 - **No hidden allocation.** No garbage collector and no runtime quietly reaching for the heap. Memory moves when you move it.
 - **Types on the page.** Nothing is inferred. Every binding states its type, so a reader never has to reconstruct what the compiler decided.
-- **One toolchain.** A single binary builds, links, tests, formats, vendors dependencies and cross-compiles. Nothing else to install. It cooks and cleans if you ask nicely.
+- **One toolchain.** A single binary builds, links, tests, formats, vendors dependencies and cross-compiles. The one outside tool it runs is Git, which `mach dep` uses to fetch and pin dependencies; a build never runs it. Nothing else to install. It cooks and cleans if you ask nicely.
 
 Batteries are not included, there is rarely more than one way to do a thing, and the language will not stop you from doing something dangerous. Safety is a decision the programmer makes, not a restriction imposed on them.
 
@@ -86,17 +86,21 @@ fun main(argc: i64, argv: **u8) i64 {
 
 ```mach
 pub fun halt() {
-    asm x86_64 {
+    asm x86-64 {
         cli
         hlt
     }
 }
 ```
 
-**Constant-time cryptography** (experimental preview). Mark a value [secret](doc/language/secrecy.md) and the compiler refuses to let it steer a branch, an index or a timing. Constant-time code, checked instead of hoped for.
+**Constant-time cryptography** (linux x86-64 and aarch64, experimental on other targets). Mark a value [secret](doc/language/secrecy.md) and the compiler refuses to let it steer a branch, an index or a timing. Constant-time code, checked instead of hoped for.
 
 ```mach
-#[oblivious]
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+#[constant_time("hard")]
 fun check(mac: ^u64, want: ^u64) bool {
     if (mac == want) {
         ret true;
@@ -106,21 +110,21 @@ fun check(mac: ^u64, want: ^u64) bool {
 ```
 
 ```
-error: secret value used as a branch condition
-  --> ./src/mac.mach:3:5
+error[secret.branch] secret value used as a branch condition
+  @ src/mac.mach:7:5
 ```
 
 **GPU compute and shaders.** Vertex, fragment and compute stages are Mach functions. A `spirv` target compiles them straight to a finished SPIR-V module a Vulkan driver loads, with no shading language on the side and no second toolchain. See [shaders](https://machlang.org/docs/shaders.html).
 
 ```mach
-#[storage(0, 0)]
+#[gpu.storage(0, 0)]
 var particles: Particles;
 
-#[builtin("global_invocation")]
+#[gpu.builtin("global_invocation")]
 var global_id: u32x3;
 
-#[stage("compute")]
-#[workgroup(64, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(64, 1, 1)]
 fun step() {
     val i: u32 = global_id[0];
     particles.position[i] = particles.position[i] + particles.velocity[i];
@@ -130,24 +134,25 @@ fun step() {
 
 ## Targets
 
-A target is a fully spelled tuple of isa, os and abi, plus the extensions every host it runs on is promised to have. Declare them once in [`mach.toml`](doc/language/manifest.md) and one command builds every one of them, from a desktop binary to a bare-metal image to a GPU module.
+A target is a fully spelled tuple of architecture, system and ABI, plus the extensions every host it runs on is promised to have. Declare them once in [`mach.toml`](doc/language/manifest.md) and one command builds every one of them, from a desktop binary to a bare-metal image to a GPU module.
 
 ```toml
 [target.linux]
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys  = "linux"
 abi = "sysv64"
-extensions = ["x86-64-v3", "sha"]
+ext = ["x86-64-v3", "sha"]
 
 [target.board]
+arch      = "riscv32"
 isa = "rv32imc"
-os  = "freestanding"
-abi = "ilp32"
+sys       = "freestanding"
+abi      = "ilp32"
 
 [target.gpu]
-isa = "spirv"
-os  = "freestanding"
-abi = "spirv"
+arch = "spirv"
+sys  = "vulkan"
+abi = "shader"
 env = "vulkan1.3"
 ```
 
@@ -158,7 +163,7 @@ mach build . -t '*'
 A target's extensions are comptime facts, so one module can carry a hardware path and a portable fallback. The branch a target does not select is dropped before it is type-checked.
 
 ```mach
-$if ($mach.build.extensions.sha) {
+$if ($mach.build.ext.sha) {
     use impl: app.sha.hw;
 }
 $or {
@@ -166,20 +171,14 @@ $or {
 }
 ```
 
-| field | values |
-|---|---|
-| **isa** | x86_64, aarch64, riscv64, riscv32, rv32imc, rv64imafd, …, spirv, wasm32 |
-| **os** | linux, darwin, windows, freestanding, wasi |
-| **abi** | sysv64, win64, aapcs64, lp64, lp64f, lp64d, ilp32, ilp32f, ilp32d, spirv |
-| **format** | elf, coff, macho, raw, spv, wasm |
-| **spir-v env** | vulkan1.0, vulkan1.1, vulkan1.2, vulkan1.3 |
+A target names an `arch`, a `sys`, an `abi` and optionally an object format `of` and an environment `env`. The values each axis accepts are listed in [the manifest reference](doc/language/manifest.md#accepted-tuple-values).
 
-x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows is a cross-compilation target. `mach info targets` lists every tuple your binary can build.
+x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows self-hosts on x86_64. `mach info targets` lists every tuple your binary can build.
 
 
 ## Documentation
 
-[`doc/language/`](doc/language/README.md) is the language reference. [`doc/mach/`](doc/README.md) is the API reference for the compiler itself, generated by `mach doc .`.
+[`doc/language/`](doc/language/README.md) is the language reference. [`doc/mach/`](doc/mach/README.md) is the API reference for the compiler itself, generated by `mach doc .`. [`doc/project.md`](doc/project.md) describes how the source is laid out.
 
 
 ## Install
@@ -208,7 +207,7 @@ mach build .                                      # build it
 mach run .                                        # run it
 ```
 
-`mach init` leaves a working program in `src/main.mach`:
+`mach init` leaves a working program in `src/bin/main.mach`:
 
 ```mach
 use std.print;

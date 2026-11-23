@@ -1,0 +1,537 @@
+# the size, alignment and member offsets of a type, as mirl's data layout of the build's
+# target lays it out: each source type is interned in a type table the laying holds, no
+# module's, and mirl answers every question of it, so mach computes no layout of its own
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.slice.Slice;
+use collections_vector: std.collections.vector;
+
+use core_state: masc.core.state;
+use types:      mirl.ir.type.table;
+use mirl.ir.type.table.Type;
+use mirl_capability: mirl.target.capability;
+use mirl_layout:     mirl.target.layout;
+use mirl_record:     mirl.target.record;
+
+use mach.base.fail;
+use mach.base.stack;
+use report_phase: mach.report.phase;
+use mach.session;
+use mach.type;
+use type_field: mach.type.field;
+use type_kind:  mach.type.kind;
+use type_prim:  mach.type.prim;
+use type_query: mach.type.query;
+use mach.type.query.subst;
+use mach.type.shape;
+
+# what a build lays its types out by: mirl's target and the context its selection opened,
+# borrowed from the build's back end, and the type table each source type is interned in. it keeps
+# what it laid out only of the types every table over one base names alike (type.memo_keyed), so a
+# laying lent to the thread a layer works on serves every layer it works on
+# ---
+# mapped:     the table's type of each source type interned, under `generation`
+# generation: the projection generation `mapped` and `placed` were made under, since a
+#             later one may give a nominal other fields
+# place:      how a tag's cases are placed on this target, which mach.type.query.areas
+#             decides from the secrecy of their bytes, a query above this one
+# placed:     each tag placed, its cases at `start` in `cases`, under `generation`
+pub rec Laying {
+    alloc:      *A.Allocator;
+    target:     *mirl_record.Target;
+    ctx:        opt[*core_state.Context];
+    table:      types.Table;
+    mapped:     map.Map[type_kind.TypeId, Type];
+    generation: u64;
+    place:      fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail];
+    placed:     map.Map[type_kind.TypeId, Placed];
+    cases:      collections_vector.Vector[shape.Carried];
+}
+
+# a tag's placement as a laying holds it: its `count` cases at `start` and its areas
+rec Placed {
+    start: u32;
+    count: u32;
+    areas: u32;
+}
+
+# a laying over `target` under the context `ctx`, both borrowed, placing tags by `place`.
+# given back by dnit
+pub fun init(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context],
+    place: fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail]) res[*Laying, fail.Fail] {
+    val res_held: res[*Laying, A.Error] = A.allocate[Laying](a, 1);
+    if (sel res_held.err) { ret res[*Laying, fail.Fail].err{fail.refused(res_held.err)}; }
+    val l: *Laying = res_held.ok;
+    l.alloc      = a;
+    l.target     = target;
+    l.ctx        = ctx;
+    l.table      = types.init(a);
+    l.mapped     = map.init[type_kind.TypeId, Type](a);
+    l.generation = 0;
+    l.place      = place;
+    l.placed     = map.init[type_kind.TypeId, Placed](a);
+    l.cases      = collections_vector.init[shape.Carried](a);
+    ret res[*Laying, fail.Fail].ok{l};
+}
+
+# release a laying and its type table, a nil laying holding nothing
+# ---
+# l: the laying
+pub fun dnit(l: *Laying) {
+    if (l == nil) { ret; }
+    map.dnit[type_kind.TypeId, Type](?l.mapped);
+    map.dnit[type_kind.TypeId, Placed](?l.placed);
+    val err_cases:   err[A.Error] = collections_vector.dnit[shape.Carried](?l.cases);
+    val err_dropped: err[A.Error] = types.dnit(?l.table);
+    A.deallocate[Laying](l.alloc, l, 1);
+}
+
+# drops what the laying holds of an earlier projection generation
+fun current(mz: *Measure) {
+    if (mz.laying.generation == mz.q.types.projection_generation) { ret; }
+    map.clear[type_kind.TypeId, Type](?mz.laying.mapped);
+    map.clear[type_kind.TypeId, Placed](?mz.laying.placed);
+    collections_vector.clear[shape.Carried](?mz.laying.cases);
+    mz.laying.generation = mz.q.types.projection_generation;
+}
+
+# where the tag `tid`, its secrecy stripped, holds each case's payload on the laying's target.
+# the cases it gives are the laying's, good until the next tag is placed
+pub fun placement(mz: *Measure, tid: type_kind.TypeId) res[shape.Placement, fail.Fail] {
+    current(mz);
+    val base:  type_kind.TypeId = type.strip_secret(mz.q.types, tid);
+    val keyed: bool             = type.memo_keyed(mz.q.types, base);
+    if (keyed) {
+        val opt_known: opt[*Placed] = map.get[type_kind.TypeId, Placed](?mz.laying.placed, ?base);
+        if (sel opt_known.some) { ret res[shape.Placement, fail.Fail].ok{held(mz, @opt_known.some)}; }
+    }
+    # placing a tag may place the tags its payloads hold, so its own cases are gathered apart
+    var own: collections_vector.Vector[shape.Carried] = collections_vector.init[shape.Carried](mz.laying.alloc);
+    fin { val err_own: err[A.Error] = collections_vector.dnit[shape.Carried](?own); }
+    val place:     fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail] = mz.laying.place;
+    val res_areas: res[u32, fail.Fail]                                                                            = place(mz, base, ?own);
+    if (sel res_areas.err) { ret res[shape.Placement, fail.Fail].err{res_areas.err}; }
+    val start:      usize               = mz.laying.cases.len;
+    val res_extend: res[usize, A.Error] = collections_vector.extend[shape.Carried](?mz.laying.cases, collections_vector.items[shape.Carried](?own));
+    if (sel res_extend.err) { ret res[shape.Placement, fail.Fail].err{fail.refused(res_extend.err)}; }
+    val p: Placed = Placed{start: start::u32, count: own.len::u32, areas: res_areas.ok};
+    if (keyed) {
+        val res_kept: res[bool, A.Error] = map.insert[type_kind.TypeId, Placed](?mz.laying.placed, base, p);
+        if (sel res_kept.err) { ret res[shape.Placement, fail.Fail].err{fail.refused(res_kept.err)}; }
+    }
+    ret res[shape.Placement, fail.Fail].ok{held(mz, p)};
+}
+
+fun held(mz: *Measure, p: Placed) shape.Placement {
+    ret shape.Placement{cases: Slice[shape.Carried]{data: ?mz.laying.cases.data[p.start], size: p.count::usize}, areas: p.areas};
+}
+
+pub def Cause: u8;
+
+val     CAUSE_OK:            Cause = 0;
+pub val CAUSE_UNKNOWN:       Cause = 1;
+val     CAUSE_DEPTH:         Cause = 2;
+val     CAUSE_NOT_RECORD:    Cause = 3;
+pub val CAUSE_FIELD_RANGE:   Cause = 4;
+val     CAUSE_OVERFLOW:      Cause = 5;
+val     CAUSE_DISCRIMINATOR: Cause = 6;
+val     CAUSE_EMPTY_TAG:     Cause = 7;
+val     CAUSE_CYCLE:         Cause = 8;
+val     CAUSE_UNAVAILABLE:   Cause = 9;
+val     CAUSE_UNSIZED:       Cause = 10;
+val     CAUSE_UNMODELLED:    Cause = 11;
+val     CAUSE_RULED:         Cause = 12;
+val     CAUSE_UNSTATED:      Cause = 13;
+val     CAUSE_REFUSED:       Cause = 14;
+val     CAUSE_NO_PAYLOAD:    Cause = 15;
+
+# a type's size and alignment, or why it has none. an offset is carried in `size`
+pub rec Extent {
+    ok:    bool;
+    cause: Cause;
+    size:  u32;
+    align: u32;
+}
+
+# the extent of a type that has none
+# ---
+# cause: why it has none
+# ret:   the extent, not ok
+pub fun unknown(cause: Cause) Extent {
+    ret Extent{ok: false, cause: cause, size: 0, align: 0};
+}
+
+fun extent(size: u32, align: u32) Extent {
+    ret Extent{ok: true, cause: CAUSE_OK, size: size, align: align};
+}
+
+# the text of a cause; absent for one outside the catalog
+pub fun cause_name(cause: Cause) opt[str] {
+    if (cause == CAUSE_OK)            { ret opt[str].some{"no failure"}; }
+    if (cause == CAUSE_UNKNOWN)       { ret opt[str].some{"a type the layout policy cannot classify"}; }
+    if (cause == CAUSE_DEPTH)         { ret opt[str].some{"a type nested deeper than the stack can walk"}; }
+    if (cause == CAUSE_NOT_RECORD)    { ret opt[str].some{"a field offset asked of a non-aggregate type"}; }
+    if (cause == CAUSE_FIELD_RANGE)   { ret opt[str].some{"a field index past the aggregate's field count"}; }
+    if (cause == CAUSE_OVERFLOW)      { ret opt[str].some{"a type extent that does not fit in 32 bits"}; }
+    if (cause == CAUSE_DISCRIMINATOR) { ret opt[str].some{"a tag with no discriminator type"}; }
+    if (cause == CAUSE_EMPTY_TAG)     { ret opt[str].some{"a tag with no cases"}; }
+    if (cause == CAUSE_CYCLE)         { ret opt[str].some{"a type that contains itself by value"}; }
+    if (cause == CAUSE_UNAVAILABLE)   { ret opt[str].some{"the build opened no target to lay types out by"}; }
+    if (cause == CAUSE_UNSIZED)       { ret opt[str].some{"the target's data layout gives the type no representation in memory"}; }
+    if (cause == CAUSE_UNMODELLED)    { ret opt[str].some{"the build's addressing model gives a pointer no representation in memory"}; }
+    if (cause == CAUSE_RULED)         { ret opt[str].some{"the rules of the address space do not lay the type out"}; }
+    if (cause == CAUSE_UNSTATED)      { ret opt[str].some{"the target leaves a fact of its data layout unstated"}; }
+    if (cause == CAUSE_REFUSED)       { ret opt[str].some{"the target's data layout refuses the type"}; }
+    if (cause == CAUSE_NO_PAYLOAD)    { ret opt[str].some{"an offset asked of a tag case with no payload"}; }
+    ret opt[str].none{};
+}
+
+# why mirl's data layout gave a type no extent
+fun refused(e: mirl_record.Error) Cause {
+    if (sel e.unsized)    { ret CAUSE_UNSIZED; }
+    if (sel e.unmodelled) { ret CAUSE_UNMODELLED; }
+    if (sel e.ruled)      { ret CAUSE_RULED; }
+    if (sel e.unstated)   { ret CAUSE_UNSTATED; }
+    if (sel e.overflow)   { ret CAUSE_OVERFLOW; }
+    if (sel e.member)     { ret CAUSE_FIELD_RANGE; }
+    ret CAUSE_REFUSED;
+}
+
+def NodeKind: u8;
+
+pub val NODE_UNKNOWN:   NodeKind = 0;
+pub val NODE_SCALAR:    NodeKind = 1;
+pub val NODE_POINTER:   NodeKind = 2;
+pub val NODE_VECTOR:    NodeKind = 3;
+pub val NODE_ARRAY:     NodeKind = 4;
+pub val NODE_AGGREGATE: NodeKind = 5;
+pub val NODE_ZERO:      NodeKind = 6;
+pub val NODE_OPAQUE:    NodeKind = 7;
+pub val NODE_TAG:       NodeKind = 8;
+
+# what a source type is made of, as its layout is asked
+# ---
+# bytes:       a scalar's or a vector element's size, a tag's discriminator's
+# count:       an array's or a vector's element count
+# child:       an array's element type
+# field_count: an aggregate's fields or a tag's cases
+# align:       the alignment a declaration states, 0 for none
+# overlays:    a union, whose fields overlap
+# packed:      its fields placed with no padding
+pub rec Node {
+    kind:        NodeKind;
+    bytes:       u32;
+    count:       u32;
+    child:       u32;
+    field_count: u32;
+    align:       u32;
+    overlays:    bool;
+    packed:      bool;
+}
+
+fun node(kind: NodeKind) Node {
+    ret Node{kind: kind, bytes: 0, count: 0, child: 0, field_count: 0, align: 0, overlays: false, packed: false};
+}
+
+# a layout walk's view of the store and of the target: the query it answers within, and the
+# laying, nil where the build opened no target
+pub rec Measure {
+    q:      *type_query.Query;
+    laying: *Laying;
+}
+
+# what a source type is made of, its secrecy stripped
+# ---
+# mz:  the layout walk
+# id:  the type's index
+# ret: its node, NODE_ZERO for the nil type and NODE_UNKNOWN for a type with no layout
+pub fun describe(mz: *Measure, id: u32) Node {
+    if (id == type_kind.index(type_kind.TYPE_NIL)) { ret node(NODE_ZERO); }
+    val base: type_kind.TypeId = type.strip_secret(mz.q.types, id::type_kind.TypeId);
+
+    val opt_type: opt[*type.Type] = type.get(mz.q.types, base);
+    if (!sel opt_type.some) { ret node(NODE_UNKNOWN); }
+    val t: *type.Type = opt_type.some;
+
+    val d: type_prim.PrimDesc = type_prim.prim_desc(t.kind);
+    if (d.class == type_prim.PRIM_CLASS_INT || d.class == type_prim.PRIM_CLASS_FLOAT) {
+        var n: Node = node(NODE_SCALAR);
+        n.bytes = d.bits / 8;
+        ret n;
+    }
+    if (d.class == type_prim.PRIM_CLASS_PTR || t.kind == type_kind.TYPE_POINTER || t.kind == type_kind.TYPE_FUN
+        || t.kind == type_kind.TYPE_HANDLE) {
+        ret node(NODE_POINTER);
+    }
+    if (t.kind == type_kind.TYPE_ABI) {
+        var n: Node = node(NODE_OPAQUE);
+        n.bytes = t.data.abi.size;
+        n.align = t.data.abi.align;
+        ret n;
+    }
+    if (t.kind == type_kind.TYPE_VECTOR) {
+        var n: Node = node(NODE_VECTOR);
+        n.bytes = type_prim.prim_desc(t.data.vector.element).bits / 8;
+        n.count = t.data.vector.lanes;
+        ret n;
+    }
+
+    if (t.kind == type_kind.TYPE_ARRAY) {
+        var n: Node = node(NODE_ARRAY);
+        n.child = t.data.array.base::u32;
+        n.count = t.data.array.count;
+        ret n;
+    }
+
+    if (t.kind == type_kind.TYPE_REC || t.kind == type_kind.TYPE_UNI || t.kind == type_kind.TYPE_TAG || t.kind == type_kind.TYPE_INSTANCE) {
+        if (t.kind == type_kind.TYPE_INSTANCE) { subst.ensure(mz.q, base); }
+
+        val opt_overlays: opt[bool] = overlays(mz, base);
+        val tagged:       bool      = type.is_tag(mz.q.types, base);
+        if (!tagged && !sel opt_overlays.some) { ret node(NODE_UNKNOWN); }
+        val opt_tab: opt[*type_field.Table] = type.field_table_for(mz.q.types, base);
+        if (!sel opt_tab.some) { ret node(NODE_UNKNOWN); }
+
+        var n: Node = node(NODE_AGGREGATE);
+        n.field_count = opt_tab.some.fields_len;
+        if (tagged) {
+            n.kind  = NODE_TAG;
+            n.bytes = type.tag_discriminator_bytes(mz.q.types, base);
+        }
+        or (sel opt_overlays.some) { n.overlays = opt_overlays.some; }
+        val dec: type_field.Decoration = type.decoration_of(mz.q.types, base);
+        n.align  = dec.align;
+        n.packed = dec.packed;
+        ret n;
+    }
+
+    ret node(NODE_UNKNOWN);
+}
+
+# the type of one field or case of a type, its secrecy stripped
+# ---
+# mz:    the layout walk
+# id:    the type's index
+# index: the field's position
+# ret:   the field type's index, the error type's for no such field
+pub fun field(mz: *Measure, id: u32, index: u32) u32 {
+    val base:         type_kind.TypeId       = type.strip_secret(mz.q.types, id::type_kind.TypeId);
+    val opt_field_at: opt[*type_field.Entry] = type.field_at(mz.q.types, base, index);
+    if (!sel opt_field_at.some) { ret type_kind.index(type_kind.TYPE_ERROR); }
+    ret opt_field_at.some.ty::u32;
+}
+
+fun overlays(mz: *Measure, tid: type_kind.TypeId) opt[bool] {
+    val nom: type_kind.TypeId = type.aggregate_nominal(mz.q.types, tid);
+    if (type_kind.is_error(nom)) { ret opt[bool].none{}; }
+    val opt_nom: opt[*type.Type] = type.get(mz.q.types, nom);
+    if (!sel opt_nom.some) { ret opt[bool].none{}; }
+    val k: type_kind.TypeKind = opt_nom.some.kind;
+    if (k == type_kind.TYPE_UNI) { ret opt[bool].some{true}; }
+    if (k == type_kind.TYPE_REC) { ret opt[bool].some{false}; }
+    ret opt[bool].none{};
+}
+
+# a source type as the laying's table holds it, or why it has none there
+rec Mapped {
+    cause: Cause;
+    ty:    Type;
+}
+
+fun mapped(ty: Type) Mapped {
+    ret Mapped{cause: CAUSE_OK, ty: ty};
+}
+
+fun unmapped(cause: Cause) Mapped {
+    ret Mapped{cause: cause, ty: 0};
+}
+
+fun interned(mz: *Measure, s: types.Shape) Mapped {
+    val res_intern: res[Type, types.Error] = types.intern(?mz.laying.table, s);
+    if (sel res_intern.err) { ret unmapped(CAUSE_REFUSED); }
+    ret mapped(res_intern.ok);
+}
+
+# the nodes a walk is inside, innermost first: a node met again on its own path contains
+# itself by value and has no layout
+rec Path {
+    id: u32;
+    up: *Path;
+}
+
+fun on_path(path: *Path, id: u32) bool {
+    var at: *Path = path;
+    for (at != nil) {
+        if (at.id == id) { ret true; }
+        at = at.up;
+    }
+    ret false;
+}
+
+# one level of a walk that interns a source type: the walk, the path down to it, and why a
+# member it reached was refused
+rec Step {
+    mz:    *Measure;
+    path:  *Path;
+    cause: Cause;
+}
+
+fun step_member(s: *Step, tid: type_kind.TypeId) opt[Type] {
+    val m: Mapped = lower(s.mz, tid, s.path);
+    if (m.cause != CAUSE_OK) {
+        s.cause = m.cause;
+        ret opt[Type].none{};
+    }
+    ret opt[Type].some{m.ty};
+}
+
+# a handle is laid out as a pointer, as an aggregate holds none
+fun step_handle(s: *Step, t: *type.Type) opt[Type] {
+    val p: Mapped = pointer(s.mz);
+    if (p.cause != CAUSE_OK) {
+        s.cause = p.cause;
+        ret opt[Type].none{};
+    }
+    ret opt[Type].some{p.ty};
+}
+
+fun step_place(s: *Step, tid: type_kind.TypeId) opt[shape.Placement] {
+    val res_placed: res[shape.Placement, fail.Fail] = placement(s.mz, tid);
+    if (sel res_placed.err) {
+        type_query.inherit(s.mz.q, res_placed.err);
+        s.cause = CAUSE_REFUSED;
+        ret opt[shape.Placement].none{};
+    }
+    ret opt[shape.Placement].some{res_placed.ok};
+}
+
+fun pointer(mz: *Measure) Mapped {
+    ret interned(mz, types.Shape.pointer{types.Pointer{space: types.DEFAULT_SPACE}});
+}
+
+# why a source type has no shape, as a cause
+fun unshaped(u: shape.Unshaped, s: *Step) Cause {
+    if (sel u.member)        { ret s.cause; }
+    if (sel u.placement)     { ret s.cause; }
+    if (sel u.empty_tag)     { ret CAUSE_EMPTY_TAG; }
+    if (sel u.discriminator) { ret CAUSE_DISCRIMINATOR; }
+    if (sel u.unknown)       { ret CAUSE_UNKNOWN; }
+    ret CAUSE_REFUSED;
+}
+
+# the laying's type of the source type `tid`: its shape, as mach.type.shape makes it for
+# lowering too, interned in the laying's table
+fun lower(mz: *Measure, tid: type_kind.TypeId, path: *Path) Mapped {
+    val base: type_kind.TypeId = type.strip_secret(mz.q.types, tid);
+    if (!type_kind.is_nil(base)) {
+        if (on_path(path, type_kind.index(base))) { ret unmapped(CAUSE_CYCLE); }
+        if (stack.exhausted())                    { ret unmapped(CAUSE_DEPTH); }
+    }
+    var here: Path = Path{id: type_kind.index(base), up: path};
+
+    current(mz);
+    val keyed: bool = type.memo_keyed(mz.q.types, base);
+    if (keyed) {
+        val opt_known: opt[*Type] = map.get[type_kind.TypeId, Type](?mz.laying.mapped, ?base);
+        if (sel opt_known.some) { ret mapped(@opt_known.some); }
+    }
+
+    val opt_types_entry: opt[*type.Type] = type.get(mz.q.types, base);
+    if (sel opt_types_entry.some) {
+        if (opt_types_entry.some.kind == type_kind.TYPE_INSTANCE) { subst.ensure(mz.q, base); }
+    }
+    val p: Mapped = pointer(mz);
+    if (p.cause != CAUSE_OK) { ret p; }
+    var s:        Step                      = Step{mz: mz, path: ?here, cause: CAUSE_OK};
+    var r:        shape.Reach[Step]         = shape.Reach[Step]{ctx: ?s, member: step_member, handle: step_handle, place: step_place, pointer: p.ty};
+    val res_made: res[Type, shape.Unshaped] = shape.of[Step](?mz.laying.table, mz.q.types, base, ?r);
+    if (sel res_made.err) { ret unmapped(unshaped(res_made.err, ?s)); }
+    if (keyed) {
+        val res_kept: res[bool, A.Error] = map.insert[type_kind.TypeId, Type](?mz.laying.mapped, base, res_made.ok);
+        if (sel res_kept.err) { ret unmapped(CAUSE_REFUSED); }
+    }
+    ret mapped(res_made.ok);
+}
+
+fun layout_of(mz: *Measure) mirl_layout.Layout {
+    ret mirl_layout.of(mz.laying.target, ?mz.laying.table, mz.laying.ctx);
+}
+
+fun narrowed(size: u64, align: u64) Extent {
+    if (size > 0xFFFF_FFFF || align > 0xFFFF_FFFF) { ret unknown(CAUSE_OVERFLOW); }
+    ret extent(size::u32, align::u32);
+}
+
+# the size and alignment of a type on the laying's target
+# ---
+# mz:  the layout walk
+# tid: the type
+# ret: its extent, or why it has none, CAUSE_UNAVAILABLE without a laying
+pub fun size(mz: *Measure, tid: type_kind.TypeId) Extent {
+    if (mz.laying == nil) { ret unknown(CAUSE_UNAVAILABLE); }
+    val m: Mapped = lower(mz, tid, nil);
+    if (m.cause != CAUSE_OK) { ret unknown(m.cause); }
+    var l:          mirl_layout.Layout                             = layout_of(mz);
+    val res_extent: res[mirl_capability.Extent, mirl_record.Error] = mirl_layout.extent(?l, m.ty, types.DEFAULT_SPACE);
+    if (sel res_extent.err) { ret unknown(refused(res_extent.err)); }
+    ret narrowed(res_extent.ok.size, res_extent.ok.align);
+}
+
+# the byte offset of a record field, or of a tag case's payload, in `size`; a case with no
+# payload has none. a union's fields all stand at 0
+pub fun offset(mz: *Measure, tid: type_kind.TypeId, field_ix: u32) Extent {
+    if (mz.laying == nil) { ret unknown(CAUSE_UNAVAILABLE); }
+    val base: type_kind.TypeId = type.strip_secret(mz.q.types, tid);
+    val n:    Node             = describe(mz, base::u32);
+    if (n.kind != NODE_AGGREGATE && n.kind != NODE_TAG) { ret unknown(CAUSE_NOT_RECORD); }
+    if (field_ix >= n.field_count)                      { ret unknown(CAUSE_FIELD_RANGE); }
+    if (n.overlays)                                     { ret extent(0, 1); }
+    val m: Mapped = lower(mz, base, nil);
+    if (m.cause != CAUSE_OK) { ret unknown(m.cause); }
+    var member: u32 = field_ix;
+    if (n.kind == NODE_TAG) {
+        val res_placed: res[shape.Placement, fail.Fail] = placement(mz, base);
+        if (sel res_placed.err) {
+            type_query.inherit(mz.q, res_placed.err);
+            ret unknown(CAUSE_REFUSED);
+        }
+        val opt_held: opt[shape.Carried] = shape.carried(res_placed.ok, field_ix);
+        if (sel opt_held.none) { ret unknown(CAUSE_NO_PAYLOAD); }
+        member = opt_held.some.area;
+    }
+    var l:          mirl_layout.Layout          = layout_of(mz);
+    val res_offset: res[u64, mirl_record.Error] = mirl_layout.offset(?l, m.ty, types.DEFAULT_SPACE, member);
+    if (sel res_offset.err) { ret unknown(refused(res_offset.err)); }
+    ret narrowed(res_offset.ok, 1);
+}
+
+# the size and alignment of a type, asked as a query of its own
+# ---
+# s:      the session holding the store and fact cache the query uses
+# laying: the laying, nil where the build opened no target
+# tid:    the type
+# ret:    its extent, or the internal failure or refusal the query met
+pub fun of(s: *session.Session, laying: *Laying, tid: type_kind.TypeId) res[Extent, fail.Fail] {
+    var status: report_phase.PhaseStatus = report_phase.accepted();
+    var q:      type_query.Query         = type_query.Query{types: s.types, facts: s.type_facts, status: ?status};
+    var mz:     Measure                  = Measure{q: ?q, laying: laying};
+    ret type_query.answer[Extent](?q, size(?mz, tid));
+}
+
+# the byte offset of a record field or tag payload from the same layout that sizes the type;
+# `size` carries the offset when `ok`
+pub fun field_offset(s: *session.Session, laying: *Laying, tid: type_kind.TypeId, field_ix: u32) res[Extent, fail.Fail] {
+    var status: report_phase.PhaseStatus = report_phase.accepted();
+    var q:      type_query.Query         = type_query.Query{types: s.types, facts: s.type_facts, status: ?status};
+    var mz:     Measure                  = Measure{q: ?q, laying: laying};
+    ret type_query.answer[Extent](?q, offset(?mz, tid, field_ix));
+}

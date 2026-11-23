@@ -5,22 +5,28 @@ notices or influence how the compiler emits the symbol: its linker name,
 alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
-Visibility (`pub` / `ext`) is separate and unaffected by decorators.
+Visibility (`pub` / `ext`) is separate. `#[export]` builds on `pub` and never
+replaces it.
 
 ## Surface
 
-A decorator is written as an attribute:
+A decorator is written as `#[...]`:
 
 ```
-#[name]            # bare flag (e.g. inline)
-#[name(args)]      # directive with comptime-expr arguments
+#[<name>]          # bare flag (e.g. naked)
+#[<name>(args)]    # decorator with constant arguments
+#[gpu.<name>(..)]  # a decorator of the GPU set
 ```
+
+Every name is lowercase, with `snake_case` where it is several words. Only the
+GPU set is dotted: it is a large domain that applies only to shader stages and
+uses generic words such as `input` and `shared`.
 
 > `#[...]` is the only decorator surface. A backtick is not a token: one
-> anywhere in source is a lexer error.
+> outside a comment, a string literal or a character literal is a lexer error.
 
-> One caveat the attribute form introduces: a line comment that begins `#[`
-> (with no space) opens an attribute. Write such a comment with a separating
+> One caveat the decorator form introduces: a line comment that begins `#[`
+> (with no space) opens a decorator. Write such a comment with a separating
 > space — `# [...]`.
 
 ## Grammar
@@ -31,43 +37,50 @@ A decorator is written as an attribute:
 #[testing]           # exists only for tests; omitted from ordinary builds
 #[expect("key", ..)] # acknowledge the named warnings inside this declaration
 #[symbol("name")]    # linker name override
+#[weak("name")]      # a definition as a link-time default of that name
 #[library("dep")]    # dynamic import attribution (ext only)
-#[inline]            # force inlining (no arguments)
-#[noinline]          # forbid inlining (no arguments)
+#[export]            # export from a shared library (pub only)
+#[inline("always")]  # force inlining
+#[inline("never")]   # forbid inlining
 #[align(expr)]       # alignment; expr is a comptime integer
-#[packed]            # lay a rec / uni out with no padding (no arguments)
+#[packed]            # lay a rec / uni / tag out with no padding (no arguments)
 #[volatile]          # every access to a rec / uni / tag is a volatile access (no arguments)
 #[section(".name")]  # place in a named object section
-#[oblivious]         # constant-time boundary (no arguments)
-#[scalar]            # opt out of auto-vectorization (no arguments)
+#[at(offset)]        # place a module global at an offset in the image
+#[thread]            # one copy of a module var per thread (no arguments)
+#[constant_time("soft")] # constant-time boundary; the mode is "soft" or "hard"
+#[vectorize("never")] # opt out of auto-vectorization
 #[naked]             # no prologue or epilogue; body as written (no arguments)
-#[extensions(a, b)]  # the function may use these instruction-set extensions
+#[extension("a", "b")] # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
-#[stage("name")]     # GPU pipeline stage; makes the function an entry point
-#[workgroup(x,y,z)]  # compute workgroup dimensions, constants or #[spec] vars (with #[stage("compute")])
-#[input(n)]          # shader interface input at location n (global only)
-#[output(n)]         # shader interface output at location n (global only)
-#[builtin("name")]   # pipeline built-in variable (global only)
-#[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
-#[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
-#[storage(set, bnd, "readonly")] # the same buffer, with writes refused
-#[storage(set, bnd, "writeonly")] # the same buffer, with reads refused
-#[storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
-#[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
-#[push]              # push-constant block, read-only (global only)
-#[spec(id)]          # specialization constant the host supplies (module var only)
-#[shared]            # compute workgroup memory, zero when a stage starts (global only)
-#[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
+#[intrinsic(tgt,set,name)] # the target instruction this function is (its body, if any, runs elsewhere)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
+#[gpu.stage("name")]     # GPU pipeline stage; makes the function an entry point
+#[gpu.workgroup(x,y,z)]  # compute workgroup dimensions, constants or #[gpu.spec] vars (with #[gpu.stage("compute")])
+#[gpu.input(n)]          # shader interface input at location n (global only)
+#[gpu.output(n)]         # shader interface output at location n (global only)
+#[gpu.builtin("name")]   # pipeline built-in variable (global only)
+#[gpu.uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
+#[gpu.storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
+#[gpu.storage(set, bnd, "readonly")] # the same buffer, with writes refused
+#[gpu.storage(set, bnd, "writeonly")] # the same buffer, with reads refused
+#[gpu.storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
+#[gpu.sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
+#[gpu.attachment(n)]     # input attachment index of a subpass input, beside its gpu.storage (global only)
+#[gpu.push]              # push-constant block, read-only (global only)
+#[gpu.spec(id)]          # specialization constant the host supplies (module var only)
+#[gpu.shared]            # compute workgroup memory, zero when a stage starts (global only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
 space-separated on the same line. They attach to the immediately following
-declaration only and do not bleed across declarations.
+declaration only and do not bleed across declarations. Each decorator stands
+at most once on a declaration: a second of the same name, with the same
+arguments or others, is refused with `decorator.duplicate`.
 
 ```mach fragment
-#[inline]
+#[inline("always")]
 #[symbol("big")]
 fun big(a: i64, b: i64) i64 { ... }
 
@@ -75,23 +88,27 @@ fun big(a: i64, b: i64) i64 { ... }
 pub var g_lit64: u8 = 7;
 ```
 
-Each directive is wrapped in its own clause: `#[name]` for a bare flag or
-`#[name(args)]` for a directive that takes arguments. Arguments are comptime
-expressions.
+Each decorator is wrapped in its own clause: `#[<name>]` for a bare flag or
+`#[<name>(args)]` for a decorator that takes arguments. Every argument is a
+constant expression: a number is an integer, and every name, mode or path is a
+string. No decorator takes a bare word. A mode is an argument of one
+decorator, never a sibling decorator: `inline("never")`, not `noinline`.
 
 ### Constant arguments
 
-Where a directive takes a string or an integer, the argument is a constant
+Where a decorator takes a string or an integer, the argument is a constant
 expression of that type, evaluated at compile time in the declaring module. A
 literal is one. So is a `val`, one an `$if` arm selects, or one imported from
-another module. A directive's argument never depends on the build that
-evaluates it, only on the constants in scope. `#[symbol]` stays exactly the
-name you give it: the compiler adds no platform decoration of its own, and a
-`val` gated by comptime is how one declaration names its symbol per target.
+another module. A decorator's argument never depends on the build that
+evaluates it, only on the constants in scope. `#[symbol]` gives the C name,
+and the linker sees it with the target's C symbol prefix, as it sees an `ext`
+declaration's name (see [`symbol`](#symbolstr--linker-name)), so the source
+never spells Darwin's underscore. A `val` gated by comptime is how one
+declaration names a different symbol per target.
 
 ```mach
-$if ($mach.build.os == $mach.os.darwin) {
-    val SPIN: *u8 = "_spin";
+$if ($mach.build.sys == $mach.sys.windows) {
+    val SPIN: *u8 = "spin_win32";
 }
 $or {
     val SPIN: *u8 = "spin";
@@ -104,16 +121,45 @@ pub fun spin() i64 {
 ```
 
 An argument that is not a constant expression, such as a `var` or a call, is
-refused with `decorator.not_constant`, naming the directive. A constant of the
+refused with `decorator.not_constant`, naming the decorator. A constant of the
 wrong type is refused with `decorator.argument`.
 
-## Directives
+A string argument is evaluated when the module loads where it can be, and
+otherwise during type checking. A literal, a string `val` and a `val` an `$if`
+arm selects are known when the module loads. A string only type checking can
+compute, such as `$type_name(T)`, is known only once types are checked, and it
+is accepted wherever nothing reads the decorator's strings before then:
+`section`, `inline`, `vectorize`, `extension`, `intrinsic`, `handle`,
+`abi_type`, `gpu.stage` and `gpu.builtin`.
+
+```mach
+rec Packet { len: u32; }
+
+#[section($type_name(Packet))]
+pub var packets: u32 = 0;
+```
+
+The other string-taking decorators are read before type checking, or by the type
+checking of another module, so each of their strings must be known when the
+module loads: `symbol` and `weak` name what the link sees and `library` the
+import's library, all registered as the module loads, `embed` names a file the
+load reads, `deprecated` carries the notice every importer warns with,
+`expect` names the warnings it acknowledges, `constant_time` gives the mode a
+caller in another module relies on, and `gpu.storage` gives the access
+qualifiers a shader in another module is checked against. Such a string computed
+during type checking is refused with `decorator.not_constant`:
+
+```
+error[decorator.not_constant] the `symbol` decorator's arguments must be known when the module loads, and this one is known only once types are checked
+```
+
+## The decorator set
 
 ### `deprecated` / `deprecated(str)` — source-use notice
 
 Marks a declaration deprecated. The optional argument is one constant string
-carrying a message. Repeating the attribute, giving it more than one argument,
-or giving it an argument that is not a constant string is an error. The attribute changes nothing about visibility, type identity, ABI or
+carrying a message. Repeating the decorator, giving it more than one argument,
+or giving it an argument that is not a constant string is an error. The decorator changes nothing about visibility, type identity, ABI or
 codegen.
 
 A use of the deprecated declaration from another source module warns at the
@@ -138,7 +184,7 @@ pub fun replacement() i32 {
 use example.legacy;
 
 fun caller() i32 {
-    ret legacy.old(); # warning: `old` is deprecated: use replacement
+    ret legacy.old(); # warning: `old` is deprecated. use replacement
 }
 ```
 
@@ -161,7 +207,7 @@ pub tag Reply: u8 {
 use example.reply;
 
 fun read(r: reply.Reply) i64 {
-    if (sel r.value) { ret r.value; } # both sites warn: tag case `value` is deprecated: use fresh
+    if (sel r.value) { ret r.value; } # both sites warn: tag case `value` is deprecated. use fresh
     ret 0;
 }
 
@@ -170,7 +216,7 @@ fun make() reply.Reply {
 }
 
 fun stale() reply.Old {
-    ret reply.Old.empty{}; # warning: `Old` is deprecated: the whole tag
+    ret reply.Old.empty{}; # warning: `Old` is deprecated. the whole tag
 }
 ```
 
@@ -183,7 +229,7 @@ Notices follow imported symbols and re-exports. A `#[deprecated]` on a `use`
 alias or a `fwd` re-export belongs to the forwarding module and replaces any
 inherited notice for that exported name; a clean alias of the same canonical
 definition keeps no notice. `test` blocks and comptime directives reject the
-attribute because they declare no externally usable name.
+decorator because they declare no externally usable name.
 
 ### `testing` — test-only declaration
 
@@ -218,7 +264,7 @@ test queue__drains_in_order {
 fun drained() Queue { ret filled(0); } # so may another testing declaration
 
 pub fun reset() Queue { ret filled(0); }
-# error[testing.use]: `filled` is a `#[testing]` declaration: only a test body or another
+# error[testing.use] `filled` is a `#[testing]` declaration. only a test body or another
 #        `#[testing]` declaration may reference it
 ```
 
@@ -229,13 +275,17 @@ declaration must itself be marked `#[testing]`, because an unmarked `fwd` puts
 the name on a production surface. `pub #[testing]` is valid, and a dependency's
 testing helper is usable from a dependent's tests.
 
+A module the build reaches only through `#[testing] use` (or `#[testing] fwd`),
+directly or through modules it reaches only that way, is loaded and checked in
+every build but emitted only by `mach test`: an ordinary build compiles none of
+its code. A module also reached through an unmarked import is emitted as usual.
+
 It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
 declarations at module scope. `test` blocks reject it because they are already
 test-only, and comptime directives reject it too. It cannot combine with
 `ext` or with `symbol`, `section`, `stage`, `input`, `output`, `builtin`,
 `uniform`, `storage`, `sampler` or `push`, because each names a consumer outside Mach
-source that the check cannot see. Inline `asm` `{name}` operands bind only
-locals, so they never reference a declaration.
+source that the check cannot see.
 
 The mark is not a cycle escape: `mach test` builds with testing declarations
 present, so a `use` cycle that only tests need is still an error. `mach doc`
@@ -266,17 +316,20 @@ test float__rounding {
 
 A warning is matched to the declaration whose source contains its site. That
 holds for a warning raised late in the build, such as `vector.scalarize` from
-lowering, and for a generic instance, whose warnings belong to the generic's
+the back end, and for a generic instance, whose warnings belong to the generic's
 declaration. A warning replayed from the build cache is matched exactly as a
 fresh one, and a warning `#[expect]` covers counts as acknowledged even when a
-profile's `allow` silences its key too.
+profile's `allow` silences its key too. A dependency's expectations govern its
+own warnings, which a build shows only under `--dep-warnings` (see
+[Whose warnings a build shows](manifest.md#whose-warnings-a-build-shows)).
 
 An acknowledgement cannot rot silently. When a key the source alone decides
 (`import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`) names no
 warning raised inside the declaration, that is itself a warning,
 `expect.unfulfilled`. A key whose warning depends on the target or on what the
-build compiles, such as `vector.scalarize`, may be quiet in a given build, so
-its expectation is not reported. A build with errors judges no expectation.
+build compiles, such as `vector.scalarize`, which a build without debug
+information never raises, may be quiet in a given build, so its expectation is
+not reported. A build with errors judges no expectation.
 
 It applies to `fun`, `rec`, `uni`, `tag`, `val`, `var` and `test` declarations
 and may appear once, naming every key it acknowledges. There is no
@@ -286,7 +339,7 @@ errors, and a key named twice are refused, since an error is never
 acknowledged:
 
 ```
-error[expect.error_key]: `secret.not_oblivious` names an error, and an error is never acknowledged
+error[expect.error_key] `secret.branch` names an error, and an error is never acknowledged
 ```
 
 ### `symbol(str)` — linker name
@@ -305,15 +358,28 @@ ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 Without `symbol`, the compiler mangles the Mach name — except on an `ext`
 declaration, which names a C declaration and takes the target's C symbol name for
 it (Darwin's underscore prefix, nothing elsewhere; see
-[ext-fun.md](ext-fun.md)). `symbol` gives the exact name the linker sees, with no
-platform prefix applied to it.
+[ext-fun.md](ext-fun.md)). `symbol` gives the C name, and the linker sees it with
+the target's C symbol prefix, so `#[symbol("main")]` is `_main` on Darwin. Two definitions in one module cannot state one
+name, and the second is refused with `name.duplicate`.
+A module cannot refer to another module's declaration by a name it defines either,
+and the reference is refused with `name.clash`. That rule and the one that holds each
+`ext fun` of a symbol to one signature are in [ext-fun.md](ext-fun.md#one-symbol-one-signature).
+
+A symbol names a definition for whatever refers to it by name, and keeps
+nothing: the link keeps a function or global exactly while something it keeps
+refers to it, so a definition nothing refers to is left out whatever symbol it
+states. `main` is no exception. The link enters the image at the runtime's
+entry, which calls `main`, and that call is what keeps it. A reference from an
+`asm` block is a relocation like any other and keeps what it names.
 
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
 `std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
 introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
-`m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
-`arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted
+`m.f$m.Map$$m.Vec$$$i64$$p$$u8$u8`, `str` being the `*u8` it aliases. `p$u8` is `*u8`, `sec$u32` is `^u32`,
+`arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, `fnv$$i64$$u8` is the
+C-variadic `fun(u8, ...) i64`, `fns$$i64$$u8` and `fnh$$i64$$u8` are `fun(u8) i64`
+marked soft and hard, a record is its own dotted
 origin FQN, a comptime value is its literal, and a variadic-pack instance carries
 a `pack` marker before its element list. A test's symbol is its qualified name,
 `<module path>#<identifier>` (see [test.md](test.md#grammar)). There is no prefix:
@@ -321,75 +387,157 @@ a mangled name always contains a `.` or a `#`, and a C identifier never can. Bot
 any emitted symbol can be named from `asm` — but the spelling is not a stability
 promise, and binding to one from C is not a supported use.
 
+### `weak(str)` — a definition as a link-time default
+
+Emits the function under the name given, as a weak definition: the program runs
+it unless the link holds a strong definition of the name.
+
+```mach fragment
+# file: src/spawn.mach
+#[weak("mach_thread_backend")]
+fun backend(entry: *u8) i64 {
+    ret -1;
+}
+
+# file: src/backend.mach, in the package that replaces it
+#[symbol("mach_thread_backend")]
+fun backend(entry: *u8) i64 { ... }
+```
+
+The replacement is an ordinary strong definition of the name: a
+`#[symbol("name")]` function, or a definition in a C or asm object the link
+takes. The name is spelled as `symbol` spells it, and it takes the target's C
+prefix the same way. The default is replaced at link time only: a `#[weak]`
+definition is hidden from other images, whether or not it is `pub`, so a shared
+library keeps its own default unless the override is in its link. `#[export]` still
+exports it, under the rule every export follows. A COFF object states the definition
+as a weak external whose fallback is the body.
+
+The compiler does not check the pairing. It compares no signatures and matches
+no replacement to its default, so a replacement of another shape is the same
+fault it would be between C objects, and a default nothing replaces is never
+reported. Whichever definition the link keeps is the one every caller reaches,
+the module defining the default included. Every call is a call of the symbol: it
+is never inlined and never bound to the default's body, so the link's choice
+holds at each one.
+
+- A declaration is refused: an `ext` function or one with no body has nothing to
+  default to, and there are no weak imports.
+- One module cannot define a name twice, whichever of `weak` and `symbol` state
+  it: a second definition is refused with `name.duplicate`, so a default and its
+  replacement stand in two modules, and the build has to reach the module holding
+  the replacement. Only the arms of a `$if` that are taken count.
+- The argument is required and is not empty. A second `weak` on a function is
+  refused with `decorator.duplicate`, and `weak` with `symbol` or with
+  `inline("always")` is refused with `decorator.conflict`.
+- A generic, comptime-parameter or pack function is refused: its instances have
+  no one symbol.
+- It applies to functions only, and it cannot stand with `testing`, as `symbol`
+  cannot.
+- A module compiled to a `spirv` object, as a project's modules are, refuses it
+  with `spirv.unsupported`: SPIR-V linkage has no replaceable definition, and a
+  module calls its own functions by id, never by name, so no link could replace
+  the default.
+
 ### `library(str)` — dynamic import attribution
 
 Pins an `ext` import to a specific dependency in the link set. Applies to
 `ext` functions only.
 
 ```mach
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 #[symbol("WSAStartup")]
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 ```
 
-- The value normally names a `[link.X]` requirement's stable logical identity:
-  its `library` value, or `X` when that key is omitted. A bare command-line
-  `-l name` also exposes `name`. Exact canonical loader names remain accepted.
-  Pinning to an absent dependency is a link error, never a silent fallback. A
-  logical identity may not equal a different dependency's loader name.
+- The value names a `[link.X]` requirement by its table key, `X`. A bare
+  command-line `-l name` exposes `name`. A loader name such as `ws2_32.dll`
+  does not bind, and an import attributed to one is refused with a message
+  naming the entry whose key to write. The refusal comes from the link
+  (`link.import_library`), so `mach check`, which links nothing, accepts it. Pinning to an absent dependency is a
+  link error, never a silent fallback. A key may not equal a different
+  dependency's loader name.
 - PE and Mach-O use two-level namespaces, so every dynamic import on those
   targets needs a `library` attribution.
 - On ELF (Linux) the loader resolves imports by global search, so `library`
   has no effect on the emitted binary; the value is still validated against
   the link's dependency set.
+- On wasm an import names the module it comes from, and `library` naming an
+  entry of `kind = "module"` makes that the import's module (see
+  [manifest.md](manifest.md#import-modules)). On freestanding `wasm32`, whose
+  system supplies no module, every import nothing defines needs it.
 - `library` composes with `symbol`: the import is emitted under the renamed
   symbol within the named dependency.
 
-### `inline` — force inlining
+### `inline(mode)` — force or forbid inlining
 
-Marks a function for inlining at every direct call site, overriding the
-compiler's size and use-count heuristics and exempt from the caller's expansion
-budget. Applies to functions only and takes no arguments. The optimization
-pipeline must enable inlining. Indirect calls and recursive call cycles are not
-expanded by this attribute. Taking a function's address retains its callable
-identity even when direct calls are inlined.
+Takes one mode, `"always"` or `"never"`, and applies to functions only. It may
+stand once on a function, so the two modes never meet.
 
-Release optimization makes small ordinary helper bodies available across source
-modules without emitting extra definitions. A helper is small when its body has
-fewer than 25 live instructions after promotion, debug annotations excluded, so
-`-g` never moves the decision. Extraction, import and per-caller heuristic expansion each
-have a limit of 1024 copied IR instructions and 256 KiB of owned payload. An
-`inline` function is expanded at every direct call site in the same module
-without charging that budget, so the outcome never depends on what else the
-caller expanded first; across modules it is imported within the extraction and
-import limits like any other body. An
-`oblivious` function is expanded only into another `oblivious` function, so
-its instructions never leave a constant-time validated body; a `naked` or
-`noinline` function, a recursive cycle and an indirect call are never expanded.
-A remaining call or taken address still names the original defining function.
-Generic, comptime and pack specializations keep their existing shared weak
-linkage. When several modules materialize that same specialization, body import
-uses an already available definition or the first acquired provider of that
-linkage, and tracks that provider as a query dependency.
-Helpers referencing compiler-local literal pools retain their calls because those
-objects have module-local identity. Named globals keep their original symbols,
-and copied instructions preserve effects, assembly bindings and debug locations.
+`inline("always")` expands a function at every direct call the inliner may
+expand, whatever its size. A build that optimizes runs the inliner over each
+module (see [manifest.md](manifest.md), the `inline` pass), and it expands calls
+of functions of the same module and of the modules it imports directly. Without
+a decorator, a direct call is
+expanded where the callee is small: at most 5 instructions after promotion of
+its locals to values, or fewer than 25 where the call stands inside a loop of
+the caller. Debug annotations are not instructions, so `debug = true` never
+moves the decision. The inliner works bottom up, so a callee is expanded with
+the calls the inliner already expanded into it.
+
+The inliner never expands a call of an `inline("never")` function, a call
+within a recursive call cycle, an indirect call, a call of a
+[`weak`](#weakstr--a-definition-as-a-link-time-default), `naked` or
+`vectorize("never")` function, or any call inside a `vectorize("never")`
+function, whatever the decorator says. A `constant_time`
+function is expanded only into another `constant_time` function whose call
+trusts it by the two declarations alone (a `soft` caller, or a `hard` callee),
+so its instructions never leave a constant-time validated body, and a function
+that is not `constant_time` is never expanded into one. A function whose
+`#[extension]` names an extension its caller's does not is never expanded into
+it. Expanding a call removes no function: the function keeps its symbol and its
+own code, a remaining call or a taken address still names it, and one nothing
+reaches any more is left out by the link as any unreferenced function is. The
+copied instructions keep their secrecy, their effects and their debug
+locations, and record the call as the site they were inlined at.
+
+A function of another module is expanded from the body that module offers its
+importers, as it lowered it, before any optimization. A module offers each of
+its `pub` functions the rules above may expand: one that is not `inline("never")`,
+`weak`, `naked`, `vectorize("never")`, exported from a shared image, run by the
+loader or decorated with `#[extension]`, that holds no inline `asm`, that is
+`inline("always")` or smaller than 25 instructions after promotion, and whose
+body names only functions and globals another module may refer to (a `pub` one,
+not a private helper, a string literal or a generic instance). A function
+that fails one of these is called across modules as before. A generic instance
+is never offered: each module that uses one compiles its own copy, which the
+link folds or, where constant-time code calls it, keeps local. An offered
+function is the one strong definition of its symbol, so the link binds every
+other module's reference to that symbol to it, and the importer expands it
+only where linking would have called it: an importer copies an offered body
+only where it calls that function and does not define it, along with the
+offered bodies of the same module that body calls, and only where it defines
+no symbol the copied body names or defines. A `symbol`
+function is offered like any other, and only a name a `symbol` states can meet
+another module's, so a program in which no two modules state one symbol loses
+no expansion by this. A target that
+compiles an artifact as one module (`vulkan-spirv`) has every body to hand and
+offers none. Because an importer copies those bodies, a build that runs the
+`inline` pass keys each module's reused object on the whole of its direct
+imports (see [manifest.md](manifest.md), the object cache).
 
 ```mach
-#[inline]
+#[inline("always")]
 fun fast_path(x: i64) i64 {
     ret x * 2;
 }
 ```
 
-### `noinline` — forbid inlining
-
-The inverse of `inline`: forbids inlining a function into any caller, overriding
-the compiler's size- and use-count heuristics that would otherwise fold it in.
-Applies to functions only; takes no arguments.
+`inline("never")` forbids inlining a function into any caller, overriding the
+size rule that would otherwise expand it.
 
 ```mach
-#[noinline]
+#[inline("never")]
 fun cold_path(code: i64) i64 {
     ret code * 100;
 }
@@ -399,20 +547,21 @@ Use it to keep a function's frame and symbol real — for a profiler or stack
 sampler to attribute its cost correctly, to keep a cold path from bloating a hot
 caller's instruction cache, or to hold code size down on a constrained target.
 
-- `inline` and `noinline` on the same function is a direct contradiction and is
-  rejected in sema; neither wins silently.
-- `scalar` already declines inlining as a side effect (#2141), so pairing it
-  with `noinline` is legal but redundant.
-- Purely a hint to the inliner; it does not otherwise change codegen. It binds
-  at every optimization level — the debug pipeline runs no inlining pass at
-  all, so `noinline` is inert (and unnecessary) there — and it will bind
-  identically when a callee body is available from another module. Recursive
-  peeling also respects `noinline` and `scalar`.
+- A second `inline` on the same function is refused with `decorator.duplicate`,
+  so `"always"` and `"never"` never contradict each other.
+- `vectorize("never")` already declines inlining as a side effect, so pairing it
+  with `inline("never")` is legal but redundant.
+- It changes nothing but which calls are expanded. It binds in every build, and
+  a build that does not optimize runs no inliner at all, so `inline("never")`
+  is inert there.
+- v6's bare `#[inline]` is `#[inline("always")]`, and its `#[noinline]` is
+  `#[inline("never")]`. Each v6 spelling is refused, naming its replacement (see
+  [v6 spellings](#v6-spellings)).
 
 ### `align(expr)` — alignment override
 
-Sets the alignment of a global variable, a record/union type, or a function's
-entry. `expr` must
+Sets the alignment of a global variable, a record, union or tag type, or a
+function's entry, which the object places at that boundary. `expr` must
 be a comptime integer — either a literal or a comptime expression such as
 `$size_of(T)` or `$align_of(T)`, in both positions.
 
@@ -444,11 +593,11 @@ naming the type that closes it.
 
 - On a `var` / `val`, sets the global's section alignment and address
   alignment.
-- On a `rec` or `uni`, sets the type's own alignment, which is then inherited
+- On a `rec`, `uni` or `tag`, sets the type's own alignment, which is then inherited
   by any global of that type.
 - On a `fun`, sets the alignment of the function's entry address. Without it
   a function still starts at the target's own entry alignment: 16 bytes on
-  x86-64 and aarch64, as gcc and llvm align them, and no padding on riscv. The
+  x86-64 and aarch64, and no padding on riscv. The
   bytes before an entry are an instruction that traps. `align` only raises the
   target's alignment, so a value below it changes nothing.
 - `align` does not apply to `def` aliases (transparent, no layout of their
@@ -463,13 +612,18 @@ instruction and up to `N - 16` bytes of frame. A function with nothing
 over-aligned emits exactly the prologue it always did.
 
 The frame pointer stays where the ABI put it, so incoming stack arguments, the
-frame record and a stack walk through it are unaffected.
+frame record and a stack walk through it are unaffected. Where such a function also
+moves the stack pointer, as an `asm` block can, it copies the masked stack pointer
+into a preserved base register (rbx on x86-64, x19 on aarch64, s1 on riscv) and
+addresses its locals from there, which costs that register and its save only in
+those functions.
 
 ### `packed` — no padding
 
 Lays a `rec` or `uni` out with no padding: every field sits immediately after the
 previous one, there is no padding at the tail, and the type takes no alignment from
-its fields. Takes no arguments.
+its fields. On a `tag` it places the payload immediately after the discriminator
+(see [tag.md](tag.md)). Takes no arguments.
 
 `align` only ever raises alignment. `packed` is the inverse, and it exists for the
 case where the layout is not mach's to choose — a C struct, a file header, a wire
@@ -495,7 +649,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-Naturally the same shape is 24 bytes. `$size_of`, `$align_of` and `$offset_of` all
+Naturally the same shape is 16 bytes, aligned to 8. `$size_of`, `$align_of` and `$offset_of` all
 report the packed layout, and so does the code that reads and writes the fields —
 there is one layout, not a declared one and an emitted one.
 
@@ -525,9 +679,8 @@ fun main(argc: i64, argv: **u8) i64 {
 #### Packing is not transitive
 
 A `packed` record packs **its own** fields. A record it contains keeps its own
-internal padding and is merely *placed* without padding. This matches C, and it is
-the rule that composes: an inner type's layout does not change depending on who
-holds it.
+internal padding and is merely *placed* without padding. That is the rule that
+composes: an inner type's layout does not change depending on who holds it.
 
 ```mach
 use std.print;
@@ -564,37 +717,20 @@ it into a local.
 
 This is fail-closed on purpose. Refusing can be relaxed later, once alignment can
 ride in a pointer type; permitting cannot be tightened later without breaking
-programs that came to depend on it. Rust refuses; C permits, and it is a standing
-source of faults.
+programs that came to depend on it.
 
 **Atomics on a packed field** are refused by that same rule, not by one of their own.
 `std.sync.atomic` is ordinary functions over `*i64`, so a pointer is the only route
 an atomic has to a field, and there is no pointer to hand it.
 
-**Vector fields.** A vector in a packed record is refused for now, including one
-reached through an array or a nested record. The reason is evidence rather than
-arithmetic: an unaligned **scalar** access is measured on real hardware, and that
-measurement is what `#[packed]` rests on.
+**Vector fields.** A vector in a packed record is refused, including one reached
+through an array or a nested record. Packing places the vector at an offset nothing
+guarantees is a multiple of its width, and a vector's size and alignment can
+disagree (`f32x3`, `f32x5`), so its footprint depends on its lane count through
+aggregate layout and ABI classification. Store the lanes as scalar fields, or drop
+`#[packed]` from the record.
 
-The vector measurement now exists too. The codegen corpus's `vec/vec_mem` case
-writes `f32x3` and `f32x5` — the two shapes whose size and alignment disagree — into
-packed buffers and records where every write has a live neighbour, folding the
-neighbour after the write so a store too wide by a lane changes the checksum. It
-runs at both pipelines on every target with an execution engine, against a C
-reference the host's own compiler built, so a dropped lane or a disturbed
-neighbouring byte is a differing number rather than a passing run. The row that
-matters is `aarch64-linux` on `ubuntu-24.04-arm`, because aarch64 has 128-bit forms
-with alignment requirements; `x86_64-linux` and `x86_64-windows` carry it too.
-`riscv64-linux` also passes and is not evidence: it runs under qemu-user, and
-riscv64 declares no 128-bit vector support, so the access there is a scalar
-expansion rather than a vector access.
-
-What the refusal still waits on is the other half,
-[#2687](https://github.com/briar-systems/mach/issues/2687) — a lane-dependent vector
-footprint through aggregate layout and ABI classification. This is a sequencing
-decision and is expected to be lifted, not a permanent rule.
-
-**Interface blocks.** `packed` cannot apply to a `#[uniform]`, `#[storage]` or `#[push]` block:
+**Interface blocks.** `packed` cannot apply to a `#[gpu.uniform]`, `#[gpu.storage]` or `#[gpu.push]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as
 explicit SPIR-V `Offset` decorations, which packing would contradict.
 
@@ -608,13 +744,22 @@ usability, so treat a green riscv64 leg as evidence about correctness only.
 
 This has not been measured on riscv64 hardware. It cannot be: qemu-user emulates a
 misaligned guest load directly and never takes the kernel path, so a qemu measurement
-shows no cost whether or not real silicon would. If the cost turns out to matter, the
-answer is byte-wise lowering of packed field access on faulting targets, which is
-codegen work and not part of `#[packed]` as it stands.
+shows no cost whether or not real silicon would.
 
-x86-64 and aarch64 do unaligned scalar access in hardware. The aarch64 answer is
-measured on real hardware rather than assumed — `int`'s `linux-arm64` leg runs
-natively.
+#### Target note: alignment-faulting targets
+
+Every access to a packed field states the alignment its offset admits in the record,
+never its type's own. A target that does not carry out an access below its type's
+alignment, as freestanding aarch64 (which runs with the MMU off, where such an access
+faults) and freestanding riscv64 and riscv32 do, makes each such access of the widest
+accesses that alignment admits, joined into the value or taken out of it in the
+target's byte order. Linux, darwin, windows and uefi targets carry out the access as
+one load or store.
+
+x86-64 and aarch64 do unaligned scalar access in hardware. Both architectures define an
+unaligned load or store to ordinary memory, and Linux runs aarch64 programs with alignment
+checking off, so a packed field access there is one ordinary load or store. Its cost on
+aarch64 hardware has not been measured either.
 
 ### `volatile` — every access to the type is a volatile access
 
@@ -683,64 +828,188 @@ fun f_hot(x: i64) i64 {
 pub var g_sec: u64 = 100;
 ```
 
-The named section is created if absent. Cross-section calls and accesses use
+The named section is created if absent, and the globals of one object that
+name it share that one section, each at its own aligned offset. A function's
+section holds code, a `var`'s writable data, a `val`'s read-only data and a
+`#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
 
-### `oblivious` — constant-time boundary
+A named section is one unit to the link: it keeps all of it while anything it
+keeps refers to any symbol in it, and leaves all of it out when nothing does.
+A function or global that nothing refers to is not in the image, in a named
+section or not, unless it is stated with `#[at]`, so a table a loader or the
+hardware reads by its address, as an interrupt vector table, is stated with
+`#[at]` or referred to from the entry's code. Naming a section keeps nothing.
 
-Marks a function as a constant-time boundary. Applies to functions only; takes
-no arguments. Inside it the backend must not introduce a secret-dependent
-branch or select a variable-latency instruction on a secret operand; a
-translation validator re-derives the secret taint over the lowered MIR and
-rejects any such leak.
+### `at(offset)` — placement in the image
+
+Places a module global at an integer offset in the image, counted from the start
+of the region it runs in, or from the image base where it runs in none (see
+[manifest.md](manifest.md#memory-regions)). The global becomes a section of its
+own, which the link places at the offset, so a boot signature, a header a loader
+looks for at a fixed byte or a page table at a known offset is stated in source.
+The link keeps a placed global whether or not anything references it.
+
+```mach fragment
+#[at(510)]
+val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
+```
+
+- It applies to a module `val` or `var` only, and takes one integer constant.
+- It cannot combine with `section`, since a placed global is a section of its
+  own, or with `thread`, since each thread's copy lies in its own block. An
+  `ext` declaration places nothing.
+- The link lays the image's other sections around a placed global, so none of
+  their bytes overlap it. Two globals that overlap are refused at the link,
+  naming both.
+- It works on a flat image and on a `freestanding` ELF image, where the offset
+  is the same address: from the start of the global's region, or from the base,
+  where the image's first loaded byte lies. A system whose loader maps the
+  image places it where it chooses, so an offset means nothing there, and mink
+  refuses it.
+
+### `export` — a shared library's export
+
+Exports a function or global from a shared library under its symbol name. It
+requires `pub` and is refused with `decorator.requires` on a declaration that is
+not `pub`, and with `decorator.misplaced` on an `ext` declaration, which another
+image defines. It is also refused with `decorator.misplaced` on a generic,
+comptime-parameter or pack function, whose instances have no one symbol, so one
+instantiation is exported through a non-generic `#[export]` wrapper. `pub` alone states a module's interface to other Mach modules and
+never exports. Takes no arguments, and `#[testing]` cannot combine with it. An
+exported declaration is seen from outside the image wherever its project sits in
+the build, so a dependency's `#[export]` is exported as the root project's is.
+
+Every definition without it is seen from no other image, and a call or access to
+it from inside its own image binds there. On ELF an export takes default
+visibility, so another image loaded ahead of the library, as `LD_PRELOAD` loads
+one, may preempt it, the library's own calls to it included, except an exported
+`#[constant_time]` function that is not `#[weak]`, which takes protected
+visibility: no other image replaces the code its callers in the library were
+checked against. A PE DLL and a Mach-O dylib bind a library's calls to its own
+exports when the library is linked, weak ones included, so nothing preempts them
+there.
+See [manifest.md](manifest.md#artifactname) for how each format spells it.
+
+```mach fragment
+#[export]
+pub fun version() u32 { ... }
+```
+
+### `thread` — a thread-local module var
+
+Gives each thread its own copy of a module-level `var`. Applies to a `var`
+only. Its initializer is a constant, as every module binding's is, and it is
+the template each thread's copy starts from. Nothing runs when a thread exits.
+
+```mach fragment
+#[thread]
+var depth: u32 = 0;
+```
+
+- An executable reaches its thread-locals at offsets its link fixes, the
+  local-exec model. A shared library reaches them at offsets its loader fixes
+  when the process starts, the initial-exec model, and an `#[export]` one is
+  exported with the library. General-dynamic access is never lowered, so a library that
+  uses thread-locals and is opened with `dlopen` after start draws on the
+  loader's small static thread-local reserve, and a loader that has none left
+  refuses to open it.
+- A thread-local an `ext` declaration names may live in another image, so it is
+  reached as a library's is.
+- The address of a thread-local is no constant, since each thread holds its
+  copy at its own address. A module binding whose initializer takes one is
+  refused with `global.init_not_constant`, with a note saying why.
+- A shader interface role and `thread` are refused together.
+- A `constant_time` function reaches a thread-local as it does a global, on
+  every target but darwin, whose thread-locals are reached through a resolver
+  call the constant-time check cannot see into, so there it is refused (see
+  [secrecy.md](secrecy.md#constant_time-the-codegen-contract)).
+
+### `constant_time(mode)` — constant-time boundary
+
+Marks a function as a constant-time boundary. Applies only to a function with a
+body, since the build proves the mark by walking the code it compiles: an `ext`
+declaration's code is compiled elsewhere and checked by nothing here, so the mark
+is refused there (`decorator.misplaced`). It takes one mode, `"soft"` or `"hard"`, which is required: a bare
+`#[constant_time]` is refused. Inside it, in either mode, the emitted code may
+not branch, index, address or divide on a secret, and a callee that receives a
+secret must be constant time itself. masc's walk proves this on the encoded
+code.
+
+- `"soft"`: mirl saves, sets and restores the processor's data-independent
+  timing mode (aarch64's DIT) around the function, guarded by std's
+  availability byte where the target does not guarantee the mode. Without it
+  the function runs anyway.
+- `"hard"`: decided at compile time. The target must guarantee data-independent
+  timing for every operation the function uses (aarch64 needs DIT in the
+  baseline, riscv needs Zkt in the selection, x86-64's scalar cells pass), or
+  the build is refused naming the missing feature.
+
+See [secrecy.md](secrecy.md#soft-and-hard) for both modes.
 
 Inline `asm` inside such a function is **validated rather than rejected**: the
 block is parsed and walked for the same leaks, and refused only where a leak is
 found or where the construct cannot be modelled. See
-[secrecy.md](secrecy.md#oblivious--the-codegen-contract) for what is checked and
-what is refused, including the x86-64 conditional-branch limitation.
+[secrecy.md](secrecy.md#constant_time-the-codegen-contract) for what is checked and
+what is refused.
 
 The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
-and describing it as one understates it. A write into secret storage carries a
-taint applied at lowering, keyed on the storage's secrecy rather than on any
-decorator, so a zeroizing wipe is protected in a function carrying no
-`#[oblivious]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
+and describing it as one understates it. It rests on the write, not on any
+decorator: no pass removes a store, and `$zeroize` is a kept fill no pass may
+remove, so a zeroizing wipe is protected in a function carrying no
+`#[constant_time]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
 for what that covers and what it does not.
 
 ```mach fragment
-#[oblivious]
+#[constant_time("hard")]
 fun ct_eq(a: ^[8]u8, b: ^[8]u8) u8 { ... }
 ```
 
-The decorator is purely subtractive — on a secret-free function it is a no-op.
-A function instance that *computes* on a `^` secret (arithmetic, bitwise, shift,
-comparison, negation) is **required** to carry it; an instance that only moves,
-stores, or declassifies secrets stays annotation-free.
+No function is required to carry it. The secret gates hold in every function
+with or without it, and a function that computes on a secret without it compiles
+with no promise about the timing of its code.
 
-It is rejected outright for a target whose back half emits a module for a
-downstream compiler rather than the executed instructions (the experimental
-SPIR-V backend): the contract cannot be validated or upheld there.
+It is refused at the mark for a target whose instruction set classifies no
+instruction's timing (SPIR-V, whose module a downstream compiler translates),
+and warned at the mark for one that cannot guarantee any instruction's timing
+(wasm, whose runtime decides the instructions that run).
 
-> **Experimental preview.** The constant-time guarantee is not complete and has
-> not been audited — see [secrecy.md](secrecy.md#assurance) for the known open
-> holes. Do not build production cryptography on it at this version.
+On a `def` of a function type it marks the type with the mode instead, the one
+alias that is not the type it is written as: a value of the alias holds only a
+function declared constant time in that mode or a stronger one, and a
+constant-time function may pass secrets through it. The alias must name a
+function type that is not C-variadic and carries no mode yet, or the mark is
+refused (`decorator.misplaced`). See [def.md](def.md#a-marked-alias-of-a-function-type)
+and [secrecy.md](secrecy.md#function-types-marked-constant-time).
 
-### `scalar` — opt out of auto-vectorization
+```mach fragment
+#[constant_time("soft")]
+def Seal: fun(^Key, *u8) u64;
+```
+
+v6 spelled it `#[oblivious]`, which is refused naming `constant_time` and its two
+modes (see [v6 spellings](#v6-spellings)).
+
+
+### `vectorize("never")` — opt out of auto-vectorization
 
 Excludes a function from loop auto-vectorization, so its loops compile to scalar
 code even in the release pipeline on a vector-capable target. Applies to
-functions only; takes no arguments.
+functions only, and takes one mode, `"never"`. v6 spelled it `#[scalar]`, which
+is refused naming its replacement.
 
 ```mach fragment
-#[scalar]
+#[vectorize("never")]
 fun reference_sum(a: *i64, n: usize) i64 { ... }
 ```
 
-A `#[scalar]` function is also declined by the inliner, so the opt-out survives
-inlining — it cannot be lost by the body moving into an unflagged caller. Use it
+A `#[vectorize("never")]` function is also declined by the inliner both ways, so the opt-out
+survives inlining: it cannot be lost by the body moving into an unflagged caller, and no
+call inside it is expanded, so a callee's loop never becomes scalar by moving into it. Use it
 for a scalar reference twin in a differential test, or where vectorized codegen
-is undesirable for a specific function. The project-wide equivalent is the
-`vectorize` profile key (see [manifest.md](manifest.md#profilename)).
+is undesirable for a specific function. For a whole build no `vectorize` key exists:
+`optimize` schedules vectorization and `passes.vectorise = false` leaves it out
+(see [manifest.md](manifest.md#passes)).
 
 ### `naked` — no prologue, no epilogue, body as written
 
@@ -752,13 +1021,13 @@ return. Applies to functions only; takes no arguments.
 #[naked] #[symbol("_start")]
 fun start() {
     $if ($mach.build.arch == $mach.arch.x86_64) {
-        asm x86_64 {
+        asm x86-64 {
             mov rdi, [rsp]        # argc, straight off the kernel-supplied stack
             lea rsi, [rsp+8]      # argv
             call main
         }
     }
-    $or { asm aarch64 { ... } }
+    $or { asm armv8-a { ... } }
 }
 ```
 
@@ -772,17 +1041,24 @@ a thread entry point whose register state at entry *is* the interface.
   rejected. A local, an expression, or a `ret` lowers to code that assumes a
   frame the function does not have, and the result would run and return a wrong
   answer rather than fail.
-- **No return is generated.** If the asm falls off the end, control runs into
-  whatever the linker placed next. Write the return the ABI (or the interrupt
+- **No return is generated.** Control that falls off the end of the asm reaches
+  a trap the compiler places there. Write the return the ABI (or the interrupt
   controller) actually calls for.
+- **An asm block of a naked body binds no `{name}`.** The function has no frame
+  to hold a local, so a binding is refused where the block is written.
 - **Parameters and the return type are still checked** at every call site, so a
   naked function is called like any other. No moves are emitted for them: the
   arguments arrive in the ABI's registers and the body reads them there.
-- **Mutually exclusive with `inline`** — there is no coherent winner between a
-  body spliced into a caller and one that owns its own frame — and with
-  `oblivious`, which already forbids inline asm because a type system cannot
-  check it. Both combinations are rejected in sema. `noinline` is redundant: the
-  inliner declines a naked function unconditionally.
+- **Mutually exclusive with `inline("always")`** — there is no coherent winner
+  between a body spliced into a caller and one that owns its own frame — and
+  with `constant_time`, since the compiler builds a constant-time function's
+  entry and returns, where it switches the timing mode, and a naked body writes
+  its own. Both combinations are rejected in sema. `inline("never")` is
+  redundant: the inliner declines a naked function unconditionally.
+- **No unwind entry.** A naked function states no frame, so the object holds no
+  `.eh_frame` FDE, `.pdata` or compact unwind record for it, whatever the
+  profile's `unwind` key says: its body is entered with no frame the compiler
+  could describe.
 - **Debug info carries no `DW_AT_frame_base`** for a naked subprogram. Every
   other function has a frame base the compiler established and can name; this
   one does not, so it declares none rather than pointing at a register the asm
@@ -797,15 +1073,58 @@ also makes a call gets one, since an unaligned call boundary (x86-64) or a
 clobbered link register (aarch64, riscv64) is not something the author asked
 for by writing assembly.
 
-### `extensions(names)` — an outlier function
+### `noreturn` — control never comes back
 
-Lets one function use instruction-set extensions the target does not select.
-Applies to a function with a body; takes one or more bare extension names.
+A function marked `#[noreturn]` never returns to its caller, and an `asm` block marked
+`#[noreturn]` never falls through to the statement after it. Takes no arguments.
 
 ```mach fragment
-#[extensions(sha, ssse3)]
+#[noreturn]
+pub fun exit(code: i32) {
+    $if ($mach.build.arch == $mach.arch.x86_64) {
+        #[noreturn]
+        asm x86-64 {
+            mov edi, {code}
+            mov eax, 60
+            syscall
+        }
+    }
+    $or { $error("no exit for this architecture"); }
+}
+```
+
+- **Checked where it is written.** A `noreturn` function states no result type and
+  holds no `ret`, and control must not be able to reach the end of its body: it ends
+  in a call to a `noreturn` function, a `noreturn` asm block, a `$error`, or a bare
+  `for` no `brk` of its own leaves. Whether the end can be reached is decided as it
+  is for a function with a result type, see
+  [fun.md](fun.md#a-body-with-a-result-ends-in-ret), so a `$if` counts by the arm
+  the build selects. Anything else is refused with `noreturn.returns`.
+- **An `ext fun` may be marked.** Nothing checks a body the compiler does not see, so
+  the declaration is the author's word, as it is for every other fact an `ext`
+  declaration states.
+- **A call to a `noreturn` function ends its block.** The compiler writes no code for
+  what follows the call, so a function that ends in one has no epilogue and no return.
+  The same holds after a `noreturn` asm block, and a local the block names is not
+  written back after it.
+- **A `noreturn` block is the one decorated statement.** `#[noreturn]` written before
+  an `asm` statement marks the block. Every other decorator on a statement, and
+  `noreturn` before any other statement, is refused with `decorator.misplaced`.
+- **Only direct calls.** A function pointer states no `noreturn`, so a call through
+  one is an ordinary call.
+
+### `extension(names)` — an outlier function
+
+Lets one function use instruction-set extensions the target does not select.
+Applies to a function with a body, once, and takes one or more extension names,
+each a string. v6 wrote `#[ext(sha)]` and `#[extensions(sha)]` with bare names,
+which are refused naming `#[extension("sha")]`. The manifest's `ext` key and
+`$mach.build.ext` keep their names.
+
+```mach fragment
+#[extension("sha", "ssse3")]
 fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
-    asm x86_64 {
+    asm x86-64 {
         # sha256msg1, sha256rnds2, pshufb, ...
     }
 }
@@ -816,45 +1135,57 @@ fun compress(state: *[8]u32, block: *[64]u8) {
 }
 ```
 
-This is the same contract as Rust's `#[target_feature(enable = "...")]` and
-gcc's `__attribute__((target("...")))`. Inside the function, inline `asm` may
+Inside the function, inline `asm` may
 use every instruction the named extensions admit, in addition to what the
-target selects. **The caller owns the run-time check.** Calling an outlier on a
+target selects. The compiler builds the function's own code under the same
+widened selection: a vector operation the named extensions compute is taken
+whole there, so under `simd = "require"` an `i64x4` comparison in a function
+naming `avx2` is accepted on a baseline x86-64 target, and the rest of the
+program keeps the target's selection. **The caller owns the run-time check.** Calling an outlier on a
 processor that lacks one of its extensions is undefined behaviour, typically an
 illegal-instruction trap. The compiler neither inserts the check nor verifies
 that one precedes the call, because only the program knows how it detects the
 processor's features and when that answer holds.
 
-- **Names come from every instruction set.** A name no instruction set declares
-  is refused, and the refusal lists the known names. A name another instruction
-  set declares admits nothing on this target and is not an error, so one
-  declaration serves a multi-arch source: `#[extensions(sse41, sha2)]` admits
-  `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
+- **Names come from every instruction set.** A name no extension catalog names
+  is refused, and the refusal names the catalogs it was read against, masc's
+  extension catalog of each instruction set it serves (riscv, x86, wasm, spirv and
+  aarch64). It lists no names: the catalogs hold hundreds, the manifest's
+  [`ext`](manifest.md#instruction-set-extensions) table says where each is read
+  from, and the names are spelled as the instruction set's own sources spell them,
+  so `float16` is no name where `Float16` is. A name a catalog holds that the compiler
+  emits nothing against, or that another instruction set declares, admits
+  nothing on this target and is not an error, so one
+  declaration serves a multi-arch source: `#[extension("sse41", "sha2")]` admits
+  `sse41` on x86_64 and `sha2` on aarch64, and an `asm armv8-a {}` block in an
   x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
   the isa. Each name may appear once. The names are those the manifest's
-  [`extensions`](manifest.md#instruction-set-extensions) key takes, closed over
+  [`ext`](manifest.md#instruction-set-extensions) key takes, closed over
   what they imply (`sse41` admits `pshufb`), except the rows only a target
-  selects (riscv `i`, `c`, `f`, `d`, `zkt`), which are refused with the reason.
+  selects (riscv `i`, `c`, `f`, `d`, `zkt`, and every spirv name, since a SPIR-V
+  module declares what it holds once for all its functions, as the manifest
+  [says](manifest.md#instruction-set-extensions)), which are refused with the
+  reason. Which rows those are, and why, is masc's catalog's.
 - **One predicate, everywhere.** A function's admitted set is the target's
   selection plus what the decorator names. An instruction requiring an extension
   is emitted only into a function whose admitted set holds it (see
   [asm.md](asm.md#extension-instructions)); the encoder checks every row against
-  it, and the inliner checks it before moving a body, so an outlier the target
-  already selects may still inline into a baseline caller.
+  it, and the inliner declines to move a body whose function names an extension
+  its caller's does not name, whether or not the target already selects it.
 - **Only the instructions change.** The decorator admits instructions in the
   function's inline `asm`. It does not change how the compiler generates the
   rest of the body, which stays within the target's selection. The function is
   called through the ordinary ABI, and its address is an ordinary `fun(...)`
   value that dispatch through a pointer calls like any other.
 - **It is never inlined into a caller that admits less.** The inliner declines
-  to move an outlier's body into a function whose admitted set does not hold
-  every extension the outlier's does, so the extension instructions stay behind
-  the call the run-time check guards. `#[inline]` does not override this. A
-  caller carrying a superset of the outlier's extensions may still inline it,
-  and any function may be inlined *into* an outlier. A generic function's
+  to move an outlier's body into a function whose decorator does not name every
+  extension the outlier's names, so the extension instructions stay behind the
+  call the run-time check guards. `#[inline("always")]` does not override this. A
+  caller naming a superset of the outlier's extensions may still inline it, and
+  any function may be inlined *into* an outlier. A generic function's
   instances carry the decorator's set.
-- **Nothing else changes.** The decorator composes with `inline`, `noinline`,
-  `symbol` and `section`. `#[oblivious]` already refuses the instructions a
+- **Nothing else changes.** The decorator composes with `inline`, `symbol`,
+  `section` and `align`. `#[constant_time]` already refuses the instructions a
   constant-time check cannot model, and an extension row it can model is
   checked like any other.
 
@@ -882,21 +1213,21 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
   project root: an embed that escapes it (`../../outside.txt` from `src/`) is
-  refused at the decorator (`` `embed` path escapes the project root; an
-  embedded file must live inside the project and the file is not read ``) and
+  refused at the decorator with `embed.escapes_root` (`` the `embed` path is
+  outside the project root. an embedded file must be inside the project ``) and
   the file outside is never read. Keep assets under the project.
 - A path holding `{artifact.<id>.out}` names the output of a required artifact
   and resolves against the **root project's** directory rather than the
   declaring file's directory; the required artifact is built first. The name is
   read in the manifest that owns the declaring module: the root's own module
   names an artifact the built artifact requires, and a dependency's module names
-  an artifact that dependency's `default = true` library artifact requires,
+  an artifact that dependency's `export = true` library artifact requires,
   which the consumer's build produces for it. No other template variable may
   appear in an `embed` path. See
   [manifest.md](manifest.md#artifact-requirements).
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
-  `[_]` is an inferred array length, legal **only** on an `#[embed]`
-  declaration — written anywhere else it is rejected (see
+  `[_]` is an inferred array length, which an `#[embed]` declaration takes from
+  the file and an array literal gives its own annotation (see
   [grammar.md](grammar.md#types)). A `[_]u8` embed can be asked for its own
   length: `$length_of(LOGO)` is its element count and `$size_of(LOGO)` its byte
   count, both folded at compile time (see
@@ -923,572 +1254,37 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   [manifest.md](manifest.md#stepname--build-steps) for the equivalent
   guarantee on `[step]` `in` entries.
 
-### `stage(str)` — GPU pipeline stage
+### GPU decorators
 
-Marks a function as the entry point of a graphics or compute pipeline stage. The
-argument names the stage and the set is closed:
+The `gpu.` decorators shape a pipeline stage and its workgroup, the shader
+interface and specialization constants. They, with the handle types a target
+mints (`handle`) and the functions that are target instructions (`intrinsic`),
+are described in [gpu.md](gpu.md). An `intrinsic` names any instruction of its
+set but one a construct of the language writes, which the refusal names, one that
+is no instruction a program writes, as a type or a decoration, and one that
+transfers control ([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)). v6 spelled the GPU set without its prefix
+(`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
+is refused naming its replacement, which takes the same arguments.
 
-| Value        | Stage                     |
-|--------------|---------------------------|
-| `"vertex"`   | vertex shader             |
-| `"fragment"` | fragment (pixel) shader   |
-| `"compute"`  | compute shader            |
+### `gpu.attachment(index)`: a subpass input's input attachment
 
-An unrecognized value is a compile error, not a module that quietly forms no
-stage.
-
-```mach
-#[stage("vertex")]
-fun vertex_main() {}
-
-#[stage("fragment")]
-fun fragment_main() {}
-```
-
-A staged function **takes no parameters and returns nothing**. A pipeline stage
-does not have a caller: its inputs arrive through input interface variables and
-its results leave through output ones, so there is no argument list or return
-value to carry them. A staged function with either is rejected.
-
-The decorator is accepted on every target, because which target a module is built
-for is not a property of its source. Only a target that has pipeline stages acts
-on it: on `spirv` a staged function becomes an `OpEntryPoint` with the matching
-execution model, and on a machine target the stage is ignored and the function is
-compiled normally.
-
-A module that declares any stage is a **shader module**, and that changes the whole
-artifact rather than just the one function. A shader module carries entry points
-and no external linkage at all; a module with no stage is a **library module**,
-which publishes each function as a linkage export so a consumer can find it. The
-two are exclusive — a Vulkan consumer refuses a module carrying linkage — so
-adding the first `#[stage(...)]` to a module stops it exporting its functions.
-
-The entry point's name, as a pipeline-creation call looks it up, is the function's
-**bare source name** (`vertex_main` above), not a mangled linker symbol. A shader
-module has no linker symbols to mangle.
-
-### `workgroup(x, y, z)` — compute workgroup dimensions
-
-Sizes the workgroup of a `#[stage("compute")]` function. The three arguments are
-comptime integers giving the x, y and z dimensions.
-
-```mach
-#[stage("compute")]
-#[workgroup(64, 1, 1)]
-fun compute_main() {}
-```
-
-It requires a stage on the same function — without one it would silently mean
-nothing — and it applies only to the compute stage. When it is omitted, a compute
-stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
-declared in the emitted module, since a compute stage that does not state its
-workgroup size is not one a consumer can dispatch.
-
-Any dimension may instead name a `#[spec]` var (see
-[`spec`](#specid--specialization-constants)), which the host sets when it creates
-the pipeline. The var must be a `u32` or `i32`, and any other variable is refused.
+A subpass input, a handle the target declares one (on SPIR-V an `image` of `Dim`
+`SubpassData`), states the input attachment it reads by this decorator, beside the
+`#[gpu.storage(set, binding)]` that binds it:
 
 ```mach fragment
-#[spec(0)] var tile: u32 = 64;
-
-#[stage("compute")]
-#[workgroup(tile, 1, 1)]
-fun compute_main() {}
+#[gpu.storage(0, 0)] #[gpu.attachment(0)] var albedo: SubpassInput;
 ```
 
-On `spirv` how a specialized workgroup is emitted depends on the environment.
-Where it allows it, the stage carries `LocalSizeId` over the spec constant. That
-needs SPIR-V 1.2 and, on Vulkan, the `maintenance4` feature, which only Vulkan
-1.3 requires of every device, so the form is used with no `env` and with
-`vulkan1.3`. Every other environment gets a `WorkgroupSize` built-in over an
-`OpSpecConstantComposite`. That built-in sizes **every** compute stage in the
-module, so a module in such an environment whose compute stages size their
-workgroups differently, and at least one of them through a `#[spec]` var, is
-refused. Give the stages one workgroup or put them in separate modules.
-
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` / `spec(id)` / `shared` — shader interface
-
-A pipeline stage does not receive its inputs or return its results through a call.
-It reads and writes **module-scope variables** that the pipeline binds, and these
-directives say which kind each variable is. They apply only to module-level
-`val` / `var` bindings, and a variable carries **exactly one** of them — they
-are mutually exclusive. `spec`, described in its own section below, is one of
-them too.
-
-```mach fragment
-#[input(0)]            var in_position: f32x4;
-#[output(0)]           var out_colour:  f32x4;
-#[builtin("position")] var position:    f32x4;
-
-rec Camera { view: f32x4; proj: f32x4; }
-#[uniform(0, 0)] var camera: Camera;
-
-rec Particles { pos: [64]f32x4; }
-#[storage(0, 1)] var particles: Particles;
-
-#[sampler(1, 0)] var albedo: Sampler2D;
-
-rec Params { tint: f32x4; count: u32; }
-#[push] var params: Params;
-```
-
-`input` and `output` number a **varying** with a location, which is how one
-stage's outputs line up with the next stage's inputs: the producer's
-`#[output(0)]` feeds the consumer's `#[input(0)]`.
-
-`builtin` names a value the pipeline supplies or consumes instead of one a
-location carries. The accepted set is closed:
-
-| Value                      | Meaning                                | Type    | Direction | Stage    |
-|----------------------------|----------------------------------------|---------|-----------|----------|
-| `"position"`               | clip-space vertex position             | `f32x4` | written   | vertex   |
-| `"point_size"`             | rasterized point size                  | `f32`   | written   | vertex   |
-| `"vertex_index"`           | index of the current vertex            | `u32`   | read      | vertex   |
-| `"instance_index"`         | index of the current instance          | `u32`   | read      | vertex   |
-| `"frag_coord"`             | fragment window coordinate             | `f32x4` | read      | fragment |
-| `"global_invocation"`      | compute global invocation id           | `u32x3` | read      | compute  |
-| `"local_invocation"`       | compute local invocation id            | `u32x3` | read      | compute  |
-| `"workgroup_id"`           | compute workgroup id                   | `u32x3` | read      | compute  |
-| `"num_workgroups"`         | compute workgroup count of a dispatch  | `u32x3` | read      | compute  |
-| `"local_invocation_index"` | compute local invocation id, flattened | `u32`   | read      | compute  |
-| `"subgroup_size"`          | invocations in a subgroup              | `u32`   | read      | every    |
-| `"subgroup_invocation"`    | the invocation's index in its subgroup | `u32`   | read      | every    |
-| `"subgroup_id"`            | the subgroup's index in its workgroup  | `u32`   | read      | compute  |
-| `"num_subgroups"`          | subgroups in the workgroup             | `u32`   | read      | compute  |
-
-The direction is a property of the built-in, not something you restate — a stage
-writes its position and reads what the pipeline hands it — so there is no
-input/output marker to pair with `builtin`, and none that could disagree with it.
-
-The **type** is a property of the built-in too, and it is a requirement rather
-than a suggestion: the pipeline binds the variable itself, so a wider or narrower
-one is an invalid module rather than a wasteful one. Declaring a built-in at any
-other type is a compile error naming both the declared type and the required one.
-The scalar integer rows accept `i32` as well as `u32`, because the compiler carries
-an integer's width and not its sign and the emitted type is sign-less either way.
-
-The **stage** is a property of the built-in as well. Each row exists in the stages
-SPIR-V defines it in, in its direction: the pipeline supplies an input built-in to
-those execution models alone and consumes an output one from them alone, so
-`position` and `point_size` are a vertex stage's outputs, `frag_coord` is a
-fragment stage's input, the seven compute rows are the `GLCompute` execution
-model's, and `subgroup_size` and `subgroup_invocation` are every stage's, decorated
-`Flat` as a fragment stage's integer inputs. A stage that uses a built-in outside
-its row, directly or through a function it calls, is a compile error naming the
-built-in and both stages. The four subgroup built-ins need SPIR-V 1.3, and outside
-a compute stage the `subgroup_graphics_stages` feature, as the subgroup operations do.
-
-`uniform` binds a read-only block by descriptor set and binding. Its type **must
-be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar
-or vector has no block layout for a pipeline to bind. The record is emitted with
-its `Block` decoration and an explicit byte offset on every member, taken from the
-same layout the rest of the compiler uses, so what the shader reads is what the
-host wrote. Wrap a single value in a one-field record.
-
-`storage` binds a **read-write** buffer by descriptor set and binding, where
-`uniform` binds a read-only one. Both must be a `rec` for the same reason, and both
-are emitted as a `Block`-decorated struct with an explicit offset on every member.
-
-They differ in one place: their **layout rules**. A uniform block follows
-std140-shaped rules, under which an array's stride is rounded up to 16 — which
-mach's own layout does not do, so an array of anything narrower than 16 bytes is
-refused rather than silently repacked. A storage buffer follows std430-shaped
-rules, which use the element's natural stride, and that *is* mach's layout, so
-`[8]f32` is fine in a `storage` block and rejected in a `uniform` one.
-
-A compute stage's data path is `storage`: Vulkan forbids the `Output` storage class
-in a compute execution model, so a compute shader reads and writes buffers rather
-than varyings.
-
-`storage` takes **memory qualifiers** after the descriptor pair, any number of them
-in any order: `"readonly"`, `"writeonly"` and `"coherent"`. `"readonly"` says that
-nothing writes the binding:
-
-```mach
-rec Palette { columns: [512]f32x4; }
-#[storage(0, 3, "readonly")]
-var palette: Palette;
-```
-
-A store through a `"readonly"` binding is a compile error on every target, naming
-the line that wrote it. That is what the qualifier buys over what the compiler
-works out on its own: a buffer no body in the module stores through is emitted with
-the SPIR-V `NonWritable` decoration whether or not it is marked, and Vulkan reads
-that decoration to decide whether a stage needs `vertexPipelineStoresAndAtomics`.
-So an accidental write does not produce a wrong module, it produces a **correct one
-that quietly costs a hardware feature**. Marking the binding turns that into a
-diagnostic instead.
-
-The inference is one-sided on purpose. Anything the compiler cannot follow, such as
-the binding's address handed to a function, counts as a write, so a missing
-decoration is possible and a wrong one is not.
-
-`"writeonly"` is the mirror: it says that nothing reads the binding, and the buffer
-is emitted `NonReadable`.
-
-```mach
-rec Frame { texels: [4096]f32x4; }
-#[storage(0, 4, "writeonly")]
-var frame: Frame;
-```
-
-A read of a `"writeonly"` binding is a compile error on every target, naming the
-expression that read it. Storing into a field or an element reads nothing, and
-neither does taking the binding's address, so `frame.texels[i] = c` and
-`?frame.texels[i]` are accepted. Writing **one lane** of a vector inside it is
-refused, because a lane write loads the whole vector and stores it back: store the
-whole vector instead. On SPIR-V, a load the compiler follows through the binding's
-address is refused as well, with the same caution as `"readonly"`: anything the
-compiler cannot follow counts as a read. `"readonly"` and `"writeonly"` together
-are refused, since that binding would be neither read nor written.
-
-`"coherent"` makes a write one invocation makes visible to invocations in other
-workgroups, which is what atomics and flags shared across workgroups rely on. It
-combines with either of the other two. How depends on the memory model the target
-selects (see [manifest.md](manifest.md#finished-module-targets)):
-
-- Under the GLSL450 model the buffer is decorated `Coherent`.
-- Under the Vulkan model, which has no such decoration, each access through the buffer
-  carries its own availability or visibility: a store `MakePointerAvailable`, a load
-  `MakePointerVisible`, each with `NonPrivatePointer`, at the `QueueFamily` scope,
-  every invocation of the dispatch and of later work on that queue family. That is
-  glslang's reading of `coherent`, and it needs no device-scope feature. A storage
-  image's `OpImageRead` and `OpImageWrite` carry `MakeTexelVisible` or
-  `MakeTexelAvailable` with `NonPrivateTexel` the same way. A storage image handed to
-  a function as a parameter carries no qualifier into it, so every image read and
-  write in such a function is coherent in a module that binds a coherent image.
-
-```mach
-rec Counters { done: u32; }
-#[storage(0, 5, "coherent")]
-var counters: Counters;
-```
-
-`sampler` binds a **handle** by descriptor set and binding, at the same descriptor
-addressing `uniform` and `storage` use, so a host binds one the way it binds the
-others. Its type must be a **handle type**, a bodyless `def` carrying `#[handle]`
-(see [types.md](types.md)), and a handle type must carry this decorator: a handle
-names a descriptor rather than an object with storage, so one with no descriptor
-address is reachable from no stage. A handle cannot sit behind a pointer, inside an
-array, or in a local binding, and each of those is a compile error naming why.
-
-A **storage image** is the exception: an `image` handle whose `Sampled` operand is
-`2` is read and written directly rather than sampled, which is Vulkan's
-`STORAGE_IMAGE` descriptor, so it binds through `storage` and not `sampler`. The
-`"readonly"`, `"writeonly"` and `"coherent"` qualifiers apply to it exactly as they
-do to a buffer, checked against the instructions that read and write its texels. A
-storage texel buffer, an image of `Dim` `Buffer` with `Sampled` `2`, binds the same
-way, and a uniform texel buffer (`Sampled` `1`) keeps `sampler`. Binding a storage
-image through `sampler`, or any other handle through `storage`, is a compile error.
-A storage image is read and written by `OpImageRead` and `OpImageWrite`, a uniform
-texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
-`OpImageQuerySize`, `OpImageQuerySizeLod`, `OpImageQueryLevels` and
-`OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
-which every Vulkan version accepts.
-
-`OpImageRead`, `OpImageWrite`, `OpImageFetch`, `OpImageSampleImplicitLod` and
-`OpImageGather` take an optional `Image Operands` mask leading their tail, so a declaration either stops at
-the instruction's required operands or passes the mask and the operands its bits
-bring, each typed by its bit. `Sample` (`0x40`) names one sample of a multisampled
-image, and a fetch's `Lod` (`0x2`) the level it reads. A multisampled image is read,
-written and fetched only with `Sample`, and only a multisampled image takes it.
-`OpImageSampleExplicitLod` always takes the mask, which must set `Lod` or `Grad`
-(`0x4`), whose two operands are the coordinate's derivatives along x and y, and never
-both. An implicit-lod sample takes `Bias` (`0x1`), a float added to the level it
-derives, and is reached only from a fragment stage, the one stage with the coordinate
-derivatives it derives that level from. A fetch, a sample and a gather take
-`ConstOffset` (`0x8`), an integer constant added to the coordinate, or `Offset`
-(`0x10`), the same computed at run time, one component per dimension of the
-coordinate, and never on a `Cube` image. A gather may take `ConstOffsets` (`0x20`)
-instead, a constant `[4]i32x2` of the offsets of the four texels it reads. An
-instruction takes one offset bit at most. `Offset` and `ConstOffsets` need the
-`image_gather_extended` extension, and `Offset` on a fetch or a sample `maintenance8` as well,
-since Vulkan admits it outside a gather only under that feature. A sample takes
-`MinLod` (`0x80`), the least level of detail it reads, which an explicit-lod sample
-takes only with `Grad` and which needs the `resource_min_lod` extension.
-`OpImageGather` reads one component, a constant id, of the four texels a sample of a
-`2D` or `Cube` image would filter. A constant operand is a constant by emission: a
-literal, a vector of literals directly or through a binding, a module-scope `val`,
-which a shader reads as the constant it is, or an aggregate passed whole as an array
-literal of constants or a copy of a `val`, written as one composite constant. An
-aggregate any run-time value writes, or one written only in part, is a value, and is
-refused with `op.operand_not_constant`. `OpImageQuerySamples` reads the sample
-count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
-`OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
-image, a storage image or a texel buffer, so a single-sampled sampled image is
-queried with `OpImageQuerySizeLod` instead.
-Each is refused at the call with `op.operand_value`.
-
-```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, MULTISAMPLED, SAMPLED, FORMAT_UNKNOWN)]
-pub def TextureMS;
-
-#[op("spirv", "core", "OpImageFetch")]
-fun fetch_sample(img: TextureMS, at: i32x2, mask: u32, sample: i32) f32x4;
-
-#[op("spirv", "core", "OpImageQuerySamples")]
-fun sample_count(img: TextureMS) i32;
-```
-
-```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
-pub def Target2D;
-
-#[op("spirv", "core", "OpImageWrite")]
-fun image_write(img: Target2D, at: i32x2, texel: f32x4);
-
-#[storage(0, 6, "writeonly")] var target: Target2D;
-```
-
-A **depth comparison** samples a depth image, one whose `Depth` operand is `1`
-(see [types.md](types.md)), and compares each texel it reads against a reference
-value, an `f32` scalar that follows the coordinate. `OpImageSampleDrefImplicitLod`
-and `OpImageSampleDrefExplicitLod` filter the comparisons into one scalar of the
-image's texel scalar, and `OpImageDrefGather` returns the comparisons of the four
-texels a gather reads. Each takes the `Image Operands` its plain form takes, after
-the reference, under the same rules: the implicit-lod comparison takes `Bias`,
-an offset and `MinLod` and is reached only from a fragment stage, the explicit-lod
-one always takes the mask with `Lod` or `Grad`, and the gather takes an offset or
-`ConstOffsets` and reads only a `2D` or `Cube` image. A comparison of an image
-whose `Depth` is `0` is refused with `op.operand_value`, and so is one of a `3D`
-image, which Vulkan never compares (`VUID-StandaloneSpirv-OpImage-04777`).
-
-```mach fragment
-#[op("spirv", "core", "OpImageSampleDrefImplicitLod")]
-fun shadow(s: ShadowSampler, uv: f32x2, depth: f32) f32;
-
-#[op("spirv", "core", "OpImageSampleDrefExplicitLod")]
-fun shadow_lod(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, lod: f32) f32;
-
-#[op("spirv", "core", "OpImageDrefGather")]
-fun shadow_gather(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, offset: i32x2) f32x4;
-```
-
-The projective forms, `OpImageSampleProj*` and `OpImageSampleProjDref*`, have no
-row. Each divides the coordinate, and a comparison's reference, by the
-coordinate's last component before sampling, which a shader writes as that
-division and passes to the plain form: they add no sampling a row here does not
-already give, HLSL, MSL and WGSL have none, and each brings its own refusals (no
-`Cube` image, no arrayed one). A declaration naming one is refused as an
-instruction the target does not define.
-
-`push` binds a **push-constant block**, a small `rec` the host supplies with the
-command that records a dispatch or draw rather than through a descriptor, so it
-takes no arguments: there is no set or binding to name. Like `uniform` and
-`storage` it must be a `rec`, and it is emitted as a `Block`-decorated struct with
-an explicit offset on every member. Its layout rules are std430-shaped, the same
-ones a `storage` buffer follows and checked the same way, so `[8]f32` is fine in a
-push block.
-
-A push block is **read-only** in the shader. A store to it is a compile error on
-every target, and on `spirv` so is a store the compiler follows through its address
-handed to a function. Vulkan admits **one push-constant block per entry point**:
-two push blocks used by the same stage are refused, naming both, while two stages
-that each use a different one are accepted.
-
-```mach
-rec Params { scale: f32; slot: u32; }
-#[push]
-var params: Params;
-```
-
-Sampling a handle is an `#[op(...)]` declaration rather than a language form,
-because a sample IS one SPIR-V instruction like `sqrt` and `dot` are:
-
-```mach fragment
-#[op("spirv", "core", "OpImageSampleImplicitLod")]
-fun sample(s: Sampler2D, uv: f32x2) f32x4;
-
-#[stage("fragment")]
-fun frag_main() {
-    out_colour = sample(albedo, in_uv);
-}
-```
-
-The separately-bound form works the same way, with the instruction that combines
-an image and a sampler declared alongside it:
-
-```mach fragment
-#[op("spirv", "core", "OpSampledImage")]
-fun combine(t: Texture2D, s: Sampler) Sampler2D;
-
-#[sampler(1, 0)] var base_tex: Texture2D;
-#[sampler(1, 1)] var base_smp: Sampler;
-
-#[stage("fragment")]
-fun frag_sep() { out_colour = sample(combine(base_tex, base_smp), in_uv); }
-```
-
-The combined value is handed straight to the sample rather than named: SPIR-V
-requires an `OpSampledImage` result be consumed by an image instruction in the block
-that produced it, which is the same rule that makes a handle-typed local a compile
-error. Returning one, or passing one to a function, is refused with
-`op.result_flow`, and so is a sample whose later operand branches, as `&&` and `||`
-do, since its sampled image would then be consumed in another block. Compute such an
-operand into a binding before the call.
-
-`shared` declares **workgroup memory**: one instance per workgroup of a compute
-stage, which every invocation of that workgroup reads and writes. It applies to a
-`var` only, since a `val` of workgroup memory could only ever read zero. It takes no
-arguments, and the variable has no descriptor and no location, because the pipeline
-never binds it.
-
-```mach fragment
-#[builtin("local_invocation")] var local_id: u32x3;
-#[shared] var tile: [256]f32;
-
-#[stage("compute")]
-#[workgroup(64, 1, 1)]
-fun blur() { tile[local_id[0]] = 1.0; }
-```
-
-Workgroup memory exists only in a compute stage, so a `#[shared]` variable used from
-a vertex or fragment stage, directly or through a function the stage calls, is a
-compile error naming the stage.
-
-A `#[shared]` variable is **zero** when a compute stage starts, as every mach
-variable is, on every environment. How depends on the environment:
-
-- Where workgroup memory is zero-initialized by the consumer, the variable carries an
-  `OpConstantNull` initializer. `vulkan1.3` guarantees that
-  (`shaderZeroInitializeWorkgroupMemory` is core there), and a target that selects the
-  `zero_init_workgroup` extension declares it for an earlier version (see
-  [manifest.md](manifest.md#instruction-set-extensions)). The consumer then has to
-  enable the feature (`VK_KHR_zero_initialize_workgroup_memory`).
-- Otherwise the compiler zeroes it itself, at the start of each compute stage that uses
-  it. Each invocation stores zero to its own slice, the elements of an array its local
-  invocation index reaches in steps of the workgroup size and the whole of any other
-  type for invocation 0, and then the stage executes one workgroup `OpControlBarrier`.
-  The barrier precedes all of the stage's own code, so every invocation reaches it.
-
-Because the value on entry is always zero, a `#[shared]` variable cannot have an
-initializer. Assign it inside the stage.
-
-Workgroup memory is **coherent** among the invocations of a workgroup under either
-memory model. Under GLSL450 it is so by definition. Under the Vulkan model an access
-is private unless it says otherwise, and a barrier orders no private access between
-invocations, so each load and store of a `#[shared]` variable carries
-`MakePointerVisible` or `MakePointerAvailable` with `NonPrivatePointer` at the
-`Workgroup` scope, the compiler's own zeroing stores included. A workgroup barrier
-with acquire-release semantics then orders them as it does under GLSL450.
-
-Whether a variable may carry an **initializer** is settled by its role, since the
-role says who puts the first value in it:
-
-| Role                                             | Initializer | Why                                                   |
-|--------------------------------------------------|-------------|-------------------------------------------------------|
-| `input`, a read built-in                         | refused     | the previous stage or the pipeline supplies the value |
-| `uniform`, `storage`, `sampler`, `push`          | refused     | the host binds or supplies the memory                 |
-| `shared`                                         | refused     | workgroup memory is zero when a stage starts          |
-| `spec`                                           | required    | it is the default the pipeline keeps                  |
-| `output`, a written built-in                     | allowed     | it is the value the variable starts at                |
-
-A refused initializer is a compile error, because the value it writes would never be
-the one the shader sees. An `output` or a written built-in starts at its
-initializer, and at zero without one, as every mach `var` does:
-
-```mach fragment
-#[output(0)] var out_colour: f32x4 = f32x4{0.0, 0.0, 0.0, 1.0};
-#[output(1)] var out_mask:   u32;
-```
-
-On `spirv` the Output `OpVariable` carries that value as its initializer: the
-constant the initializer spells, or `OpConstantNull` where it is zero or absent.
-SPIR-V and Vulkan both admit an initializer on an Output variable.
-
-As with `#[stage(...)]`, these are accepted on every target and acted on only by a
-target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
-matching storage class, carrying the matching decoration, and the Input and Output
-variables are named in every entry point's interface list. A `sampler` binding
-becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
-permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
-and `Binding` exactly as a `uniform` does. A `push` block becomes an `OpVariable`
-in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `shared` variable
-becomes an `OpVariable` in the `Workgroup` class, named in the interface of each entry
-point that uses it from SPIR-V 1.4.
-
-### `spec(id)` — specialization constants
-
-A specialization constant is a value the host supplies when it creates the
-pipeline, after the shader has been compiled. It is declared as a module-level
-`var` carrying the constant's id, and its initializer is the default the pipeline
-keeps when the host supplies nothing for that id. The initializer is required:
-
-```mach
-#[spec(0)]
-var tile_size: u32 = 64;
-#[spec(1)]
-var gain:      f32 = 0.5;
-```
-
-It is a `var` like every other value the host supplies, and that settles how the
-compiler treats it:
-
-- It is **never a compile-time value**. It cannot be an array length or a comptime
-  operand, since what it holds is decided after the build. A `#[spec]` on a `val`
-  is refused for the same reason.
-- The optimizer **never folds it to its initializer**, even when nothing in the
-  module writes it. A mutable global is never replaced by its initial value, and
-  that is exactly what keeps the host's value live.
-- A **store to it is refused**, naming the line that wrote it. On the GPU it is a
-  constant once the pipeline exists, so there is nothing to write. Copy it into a
-  local to change the value. Handing its address to a function counts as a store.
-
-The type must be a scalar integer or float. There is no boolean specialization
-constant, because mach has no boolean type the compiler knows: `bool` is an alias
-of `u8`. Write a flag as an integer spec var, which the host sets with the same 4
-bytes as a `VkBool32`:
-
-```mach
-#[spec(3)]
-var use_fog: u32 = 1;
-```
-
-A narrower integer such as `u8` works too, but it needs the capability for its
-width like any other `u8` in a shader. On `spirv` each one becomes an
-`OpSpecConstant` whose literal is the initializer, decorated with `SpecId`, and a
-read uses that constant directly with no load. Two `#[spec]` vars with one id in
-the same module are refused, since the host names the constant by its id. On a
-machine target the decorator has no effect and the var is an ordinary global.
-
-A `#[spec]` var may also size a compute workgroup (see
-[`workgroup`](#workgroupx-y-z--compute-workgroup-dimensions)).
-
-### `handle(target, constructor, operands...)` — a type the target mints
-
-A bodyless `def` carrying this directive declares a type whose representation is
-**not the program's**: the owning target mints it and the pipeline binds it.
-
-```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
-pub def Texture2D;
-
-#[handle("spirv", "sampled_image", Texture2D)]
-pub def Sampler2D;
-```
-
-The first argument names the target and the second the type constructor within it.
-Both are constant strings matched against the target's own definition table.
-Everything after them is **operands to that
-constructor**, never rule knobs: the rules a handle carries are fixed and closed
-(see [types.md](types.md)) and never vary per declaration.
-
-An operand is an ordinary comptime constant, with one exception. A constructor that
-composes over another handle takes a **type name**, and that is the only place a
-decorator argument is read as a type rather than as a value. It exists so a
-composing declaration names what it wraps instead of restating it, which is what
-keeps the two from disagreeing. The named type must be a handle the same target
-mints, with the constructor that position requires.
-
-A declaration addressed to a target this build did not select is **inert**: it
-still denotes a type and still sizes at the target's pointer width, so a library of
-handles compiles on a machine target. A constructor name the selected target does
-not define, an operand count that disagrees with the constructor's, or an operand
-combination the target cannot emit is a compile error at the declaration.
+It takes one integer constant, an unsigned 32-bit one, and a negative or wider value is
+refused with `decorator.argument`. It is required on a subpass input, which is refused
+without it with `handle.unbound`, and refused with `decorator.misplaced` on anything
+else. The SPIR-V target emits it as `InputAttachmentIndex`. See
+[gpu.md](gpu.md#gpuattachmentindex-and-subpass-inputs).
 
 ### `abi_type(name)` — a C type whose layout the target declares
 
-A bodyless `def` carrying this directive declares a C type whose size and alignment
+A bodyless `def` carrying this decorator declares a C type whose size and alignment
 come from the **selected target** and whose contents the program never reaches.
 
 ```mach
@@ -1497,7 +1293,7 @@ pub def VaList;
 ```
 
 `va_list` is the only name, and the set is closed in the front end for the reason
-`op`'s instruction names are: which target a module is built for is not a property
+`intrinsic`'s instruction names are: which target a module is built for is not a property
 of the source, so a typo checked only where it is acted on would go unreported on
 every other build of the same library. A target that declares no layout for the
 named type refuses the declaration rather than substituting a default.
@@ -1508,361 +1304,68 @@ or union field, a global, a return position, a pointer or array of one, and a ca
 in either direction are each refused where they are written. See
 [ext-fun.md](ext-fun.md) for the recipe and for why forwarding is the whole scope.
 
-### `op(target, set, name)` — a function that *is* a target instruction
-
-A shader needs `sqrt`, `normalize`, `dot` and `mix`. None of them is an operator,
-and none of them is a call SPIR-V can make: each is one instruction. This directive
-says which one a function is, so that on a `spirv` target a call to it becomes that
-instruction, inline, rather than a call.
-
-```mach
-#[op("spirv", "GLSL.std.450", "Sqrt")]
-pub fun sqrt(x: f32) f32;
-
-#[op("spirv", "GLSL.std.450", "Normalize")]
-pub fun normalize(v: f32x4) f32x4;
-
-#[op("spirv", "core", "OpDot")]
-pub fun dot(a: f32x4, b: f32x4) f32;
-```
-
-The first argument names the **target**, the second the instruction set, and the
-third the instruction within it. The target is the ISA name the manifest selects
-with, so nothing about this directive is specific to one back end. The arguments
-must be strings on every target, but the instruction set and name are checked only
-when the named target is the one selected: a declaration for any other target is
-inert, and that target's table is not consulted. When it is checked, the parameter
-count is held to the instruction's own operand count, which is not uniform across a
-family that looks it.
-
-| Set              | Meaning                                                     |
-|------------------|-------------------------------------------------------------|
-| `"core"`         | the core opcode space; needs no import                       |
-| `"GLSL.std.450"` | the standard extended set; imported once per module, on use  |
-
-The substitution is uniform: the emitted instruction's **result type is the
-function's declared return type** and its **operands are the function's parameters
-in declaration order**. That is what lets `dot` and `length` return a scalar from
-vectors, and `refract` mix a scalar operand with vector ones, without any of them
-being a special case.
-
-Each instruction's row in the target's table also says **how each operand is
-written** and **whether the instruction has a result**, and when the target is
-selected the declaration's types are checked against both:
-
-| Kind            | The operand is                                              | Parameter type |
-|-----------------|-------------------------------------------------------------|----------------|
-| value           | an ordinary id, the argument's value                        | not a pointer  |
-| constant id     | an id that must be an integer constant by emission, such as a `Scope` or `MemorySemantics` | an integer |
-| literal         | a constant written inline as a literal word, such as an image-operands mask | an integer |
-| pointer read    | the argument's address, only read through                   | a pointer      |
-| pointer write   | the argument's address, only stored through                 | a pointer      |
-| pointer update  | the argument's address, read and written (read-modify-write) | a pointer     |
-| handle read     | a handle whose memory the instruction reads, such as a storage image's texels | a handle |
-| handle write    | a handle whose memory the instruction writes                | a handle       |
-| truth value     | a predicate the instruction takes as SPIR-V's boolean, true where the argument is nonzero | an integer |
-
-A **pointer operand takes its storage class from the call site**: the argument's
-own access chain decides whether it points into a storage buffer, workgroup memory,
-a function-local object or an image, since an `op` has no body and so no boundary at
-which its parameter's pointer could be given one. Any access chain is accepted, a
-member or element as well as a whole object. The kinds are also what the
-`"readonly"` and `"writeonly"` qualifiers of a `storage` binding are checked
-against: an atomic load through a `readonly` binding is accepted and an atomic add
-on it is refused, and an atomic store into a `writeonly` binding is accepted and an
-atomic load from it is refused. A handle passed as an ordinary value names its
-descriptor and touches none of its memory, and a handle read or write is checked the
-same way, so `OpImageWrite` into a `"readonly"` storage image and `OpImageRead` from a
-`"writeonly"` one are refused.
-
-A non-constant argument to a constant id or a literal is refused at the call,
-naming the operand. A row **without a result** is declared with no return type,
-and a row with one must return it. A row may also **return a pointer** into a
-storage class the row itself declares, as `OpImageTexelPointer` returns an `Image`
-pointer, and that result is accepted as a later instruction's pointer operand. A
-row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
-returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
-which a target without `int8` carries at 32 bits like any other 8-bit local
-([manifest.md](manifest.md#finished-module-targets)), so the module needs no Int8 for it.
-
-```mach
-#[op("spirv", "core", "OpControlBarrier")]
-pub fun barrier(execution: u32, memory: u32, semantics: u32);
-
-#[op("spirv", "core", "OpMemoryBarrier")]
-pub fun memory_barrier(memory: u32, semantics: u32);
-
-#[op("spirv", "core", "OpAtomicIAdd")]
-pub fun atomic_add(p: *u32, scope: u32, semantics: u32, v: u32) u32;
-```
-
-On the target that owns the instruction, a decorated function **is the
-instruction and never its body**, so a call to it is never inlined away or
-deleted, and the optimizer treats it as reading and writing all memory. No
-load or store is moved across a barrier or an atomic, at any optimization
-level. `OpControlBarrier` takes an execution scope, a memory scope and memory
-semantics, and `OpMemoryBarrier` a memory scope and semantics, each an integer
-constant. A memory scope and memory semantics are held to the module's memory model:
-under the Vulkan model the `Device` scope needs the `vulkan_memory_model_device_scope`
-extension, and under GLSL450 the `QueueFamily` scope and the `MakeAvailable`,
-`MakeVisible` and `Volatile` semantics need `vulkan_memory_model` (see
-[manifest.md](manifest.md#finished-module-targets)). An atomic's scope and semantics
-are held the same way. The execution scope is not, since a Vulkan barrier executes
-at `Workgroup` or `Subgroup` only. `SequentiallyConsistent` semantics are refused under
-either model, since Vulkan defines no sequentially consistent order
-(VUID-StandaloneSpirv-MemorySemantics-10866): use `Acquire`, `Release` or
-`AcquireRelease`.
-
-A control barrier must be reached in **uniform control flow**: every
-invocation of its execution scope executes it, or none does. That is the
-program's obligation, as it is in GLSL and WGSL, because whether a branch is
-uniform is not statically decidable in general. The compiler does not check
-it, and a barrier inside a branch or loop that some invocations of the scope
-skip is undefined behavior on the device.
-
-A row may also carry **requirements**: a capability and the extensions of the
-target's vocabulary that every use of it needs. A **literal operand can be
-enumerated**, so that its value is one of a closed set the row names (or, for a
-mask, a union of that set's bits), and each value brings a requirement of its own
-and, where the instruction grows with it, operands at the end of the instruction.
-Such a row has an **optional tail**: a declaration may take its required operands
-alone or the tail too, and each call must pass exactly the operands its literal's
-value brings. `OpGroupNonUniformIAdd` is one:
-
-```mach
-#[op("spirv", "core", "OpGroupNonUniformIAdd")]
-pub fun subgroup_add(scope: u32, operation: u32, v: u32) u32;
-
-#[op("spirv", "core", "OpGroupNonUniformIAdd")]
-pub fun subgroup_cluster_add(scope: u32, operation: u32, v: u32, cluster_size: u32) u32;
-```
-
-Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
-`ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
-`GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
-declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
-it is passed only to the four-parameter declaration.
-
-Where the specification makes the literal itself optional, as it does an
-instruction's `Image Operands` or `Memory Operands`, the literal **leads the tail**:
-a declaration leaves it out with every operand it would bring, or takes it followed
-by those operands. A mask's set bits bring theirs in ascending bit order, the order
-the specification writes them in, so the parameters after the mask are declared in
-that order. Each value types the operands it brings, so `Grad` brings two values and
-`ConstOffset` one constant wherever they land after the mask, and a parameter
-receiving one is held to its kind at the call rather than at the declaration. Each is
-checked at the call, where the literal's value is known:
-
-| At the call                                            | Is refused with                    |
-|--------------------------------------------------------|------------------------------------|
-| a value outside the operand's enumeration              | `op.operand_value`, naming the values |
-| a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
-| a parameter the value's operand kind does not admit     | `op.signature`, naming the operand |
-| a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
-| a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
-
-A device feature is an extension the target names in its `extensions` once the
-consumer enables it, since no environment guarantees it: `subgroup_arithmetic` is
-Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
-every extension. A module declares a capability only when something it emits needs
-it, with `OpExtension` for a capability a SPIR-V extension defines.
-
-A row may also be **typed**: its requirement depends on the type it operates on, read
-from one operand (a pointer's pointee), and on the storage class that operand's
-memory lives in. The atomics are typed. A declaration whose type the row admits in no
-storage class is refused with `op.signature`, and each call is checked where its
-storage class is known. A load reads its pointer and every other atomic writes it, so
-a `"readonly"` binding admits only an atomic load.
-
-```mach
-#[op("spirv", "core", "OpAtomicIAdd")]
-pub fun atomic_add64(p: *u64, scope: u32, semantics: u32, v: u64) u64;
-
-#[op("spirv", "core", "OpAtomicFAddEXT")]
-pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
-```
-
-A 32-bit integer atomic is core in every storage class. Every other type needs the
-Vulkan device feature of its storage class, named for its `shaderBuffer*`,
-`shaderShared*` or `shaderImage*` member: `buffer_*` on buffer memory
-(`StorageBuffer`, `Uniform` before SPIR-V 1.3, or `PhysicalStorageBuffer` through a
-[physical pointer](types.md#pointers-on-spir-v)), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
-workgroup memory, and `image_*` on a storage image texel (`Image`, through
-`OpImageTexelPointer`), where Vulkan defines only a 64-bit integer and an `f32`. Any
-other storage class is refused. An image of 64-bit texels (`R64ui` or `R64i`) declares
-`Int64ImageEXT` (`SPV_EXT_shader_image_int64`), which `image_int64_atomics` enables, so
-the image itself needs that feature whatever reaches it. An `f16` atomic also needs
-`float16`, under which `f16` memory is the `OpTypeFloat 16` the atomic operates on, and
-the storage buffer holding one needs `storage_buffer_16bit_access`
-([manifest.md](manifest.md#finished-module-targets)).
-
-| Rows | Type | Extensions | Vulkan feature | Capability (SPIR-V extension) |
-|------|------|-----------|----------------|-------------------------------|
-| all 15 integer atomics | `u32`, `i32` | none | core | none |
-| all 15 integer atomics | `u64`, `i64` | `buffer_int64_atomics`, `shared_int64_atomics`, `image_int64_atomics` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics`, `shaderImageInt64Atomics` | `Int64Atomics` |
-| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f16`, `f32`, `f64` | `buffer_float{16,32,64}_atomics`, `shared_float{16,32,64}_atomics`, `image_float32_atomics` | `shader{Buffer,Shared}Float{16,32,64}Atomics`, `shaderImageFloat32Atomics` | none |
-| `OpAtomicFAddEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_add`, `shared_float{32,64}_atomic_add`, `image_float32_atomic_add` | `shader{Buffer,Shared}Float{32,64}AtomicAdd`, `shaderImageFloat32AtomicAdd` | `AtomicFloat{32,64}AddEXT` (`SPV_EXT_shader_atomic_float_add`) |
-| `OpAtomicFAddEXT` | `f16` | `buffer_float16_atomic_add`, `shared_float16_atomic_add` | `shader{Buffer,Shared}Float16AtomicAdd` | `AtomicFloat16AddEXT` (`SPV_EXT_shader_atomic_float16_add`) |
-| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f16`, `f32`, `f64` | `buffer_float{16,32,64}_atomic_min_max`, `shared_float{16,32,64}_atomic_min_max`, `image_float32_atomic_min_max` | `shader{Buffer,Shared}Float{16,32,64}AtomicMinMax`, `shaderImageFloat32AtomicMinMax` | `AtomicFloat{16,32,64}MinMaxEXT` (`SPV_EXT_shader_atomic_float_min_max`) |
-
-The features come from `VkPhysicalDeviceShaderAtomicInt64Features`,
-`VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT`,
-`VkPhysicalDeviceShaderAtomicFloatFeaturesEXT` and
-`VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT`. No environment guarantees any of
-them, so a target names each one its consumer enables, and a target naming no `env`
-holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
-`OpAtomicExchange`, `OpAtomicCompareExchange`, `OpAtomicIIncrement`,
-`OpAtomicIDecrement`, `OpAtomicIAdd`, `OpAtomicISub`, `OpAtomicSMin`, `OpAtomicUMin`,
-`OpAtomicSMax`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr` and `OpAtomicXor`.
-
-| At the call                                            | Is refused with                    |
-|--------------------------------------------------------|------------------------------------|
-| a type the row admits only in other storage classes    | `spirv.capability`, naming the class |
-| a type whose feature the target does not select        | `spirv.capability`, naming the feature |
-
-A row also states how its operands' types and its result's **relate** to the type it
-operates on, the type of the one operand its typing reads (a pointer's pointee). A
-declaration that breaks a relation is refused with `op.signature`, naming both the
-parameter (or the return type) and the operand it relates to, so a mismatch is caught
-at the declaration rather than as an invalid module.
-
-| Rows | Relation |
-|------|----------|
-| every atomic | the result and each value operand are the pointer's pointee |
-| `OpImageRead`, `OpImageFetch`, `OpImageSample*Lod`, `OpImageGather` | the result is a 4-vector of the image's texel scalar, a sampled image's being its image's |
-| `OpImageSampleDref*Lod` | the result is a scalar of the image's texel scalar, and the reference is an `f32` scalar |
-| `OpImageDrefGather` | the result is a 4-vector of the image's texel scalar, and the reference is an `f32` scalar |
-| `OpImageWrite` | the texel is a scalar or vector of the image's texel scalar, with at least as many components as the image's format stores (any for `Unknown`) |
-| `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
-| `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `sampler` |
-| `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
-| the GLSL.std.450 math rows, float and integer | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
-| `Modf` | the result is the value's type, and the out-pointer points to the value's type, where the whole part is stored |
-| `Frexp` | the result is the value's type, and the out-pointer points to an `i32` scalar or vector with as many components as the value, where the exponent is stored |
-| `OpDot` | the second vector is the first's type |
-
-A relation on a pointer operand, such as the out-pointer `Modf` and `Frexp` store
-their second part through, holds the type it points to. The pointer may address a
-local, a `#[shared]` variable or a storage buffer, or any part of one, and the store
-counts as a write to that binding, so a `readonly` one is refused.
-
-```mach
-#[op("spirv", "GLSL.std.450", "Frexp")]
-pub fun frexp(x: f32x4, exp: *i32x4) f32x4;
-```
-
-A declaration that returns a handle is refused with `op.signature` unless its row
-names the operand its result derives from, since a handle holds a binding's
-descriptor and only that operand says whose. Each math row and subgroup row states the
-class of number it operates on. The GLSL.std.450 float rows and `OpDot` operate on a
-scalar or vector of floats, and the subgroup rows on a scalar or vector of integers or
-floats. The GLSL.std.450 integer rows operate on the signedness their name states:
-`SAbs`, `SSign`, `SMin`, `SMax`, `SClamp` and `FindSMsb` on signed integers, `UMin`,
-`UMax`, `UClamp` and `FindUMsb` on unsigned ones, and `FindILsb` on either. A data
-operand of any other type is refused with `op.signature`: an integer for `FAbs`, an
-`i32` for `UMin`, a handle, a pointer or an aggregate. GLSL.std.450 removed `IMix`, so
-it has no row.
-
-Each image row names the rule its texel's component count comes from, and the
-refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
-the 4-vector fetch, sample and gather results and the scalar depth-comparison result are SPIR-V's own, and the write's count against the
-format is Vulkan's `VUID-RuntimeSpirv-OpImageWrite-07112`, which spirv-val cannot check
-because it sees no `VkFormat`.
-
-
-The **subgroup operations** are the `OpGroupNonUniform*` rows, each taking the
-Subgroup scope (3) as its first operand. Every one needs SPIR-V 1.3, so `vulkan1.1`
-or later, and each family needs its capability and the feature Vulkan reports it by:
-
-| Family            | Rows                                                         | Feature                     |
-|-------------------|--------------------------------------------------------------|-----------------------------|
-| basic             | `Elect`                                                      | none: every vulkan1.1 device |
-| vote              | `All`, `Any`, `AllEqual`                                     | `subgroup_vote`             |
-| arithmetic        | `IAdd`, `FAdd`, `IMul`, `FMul`, `SMin`, `UMin`, `FMin`, `SMax`, `UMax`, `FMax`, `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `LogicalAnd`, `LogicalOr`, `LogicalXor` with `Reduce` or a scan | `subgroup_arithmetic` |
-| clustered         | the same rows with `ClusteredReduce` and a ClusterSize       | `subgroup_clustered`        |
-| ballot            | `Ballot`, `InverseBallot`, `BallotBitExtract`, `BallotBitCount`, `BallotFindLSB`, `BallotFindMSB`, `Broadcast`, `BroadcastFirst` | `subgroup_ballot` |
-| shuffle           | `Shuffle`, `ShuffleXor`                                      | `subgroup_shuffle`          |
-| relative shuffle  | `ShuffleUp`, `ShuffleDown`                                   | `subgroup_shuffle_relative` |
-| quad              | `QuadBroadcast`, `QuadSwap`                                  | `subgroup_quad`             |
-
-`BallotBitCount` takes a `GroupOperation` too, which its ballot capability covers
-and which has no clustered form. `Broadcast`'s lane, `QuadBroadcast`'s index and
-`QuadSwap`'s direction are constant ids, which every SPIR-V version accepts. Vulkan
-guarantees subgroup operations only in compute stages, so a use reached from a
-vertex or fragment stage, an operation or a subgroup built-in alike, also needs
-`subgroup_graphics_stages`, the device's `subgroupSupportedStages`.
-
-```mach
-use std.types.bool.bool;
-
-#[op("spirv", "core", "OpGroupNonUniformBallot")]
-pub fun subgroup_ballot(scope: u32, predicate: bool) u32x4;
-
-#[op("spirv", "core", "OpGroupNonUniformShuffleXor")]
-pub fun subgroup_shuffle_xor(scope: u32, v: u32, mask: u32) u32;
-```
-
-`OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
-module uses the set**. A module that calls none of these carries no import.
-
-Note that `dot` is **core `OpDot`**, not a GLSL.std.450 instruction, even though
-GLSL spells it beside `normalize` and `length`. Check each function against the
-specification rather than against GLSL's surface.
-
-On every target other than `spirv` the directive is inert, and a decorated function
-is an ordinary function. A **bodiless** one — which is what the shader-side maths
-library uses — is then an undefined symbol, so a CPU build that calls it fails at
-link time naming the symbol. That is a deliberate design choice on the library's
-part, not a property of the directive: a decorated function may have a body, and if
-it does, that body is what every non-`spirv` target runs while `spirv` substitutes
-the instruction. A `spirv` build never emits the body at all.
-
-The set of accepted instructions is the table in
-`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
-result, its requirements, its typing and the enumerations of its literals. The capabilities, with
-the SPIR-V version and extension each needs, are the table in
-`src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
-
 ## Applicability
 
-| Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
-|-------------|:-----:|:---------:|:-------------:|:-------------:|
-| `deprecated`|  yes  |    yes    |      yes      |      yes      |
-| `testing`   |  yes  |    no     |      yes      |      yes      |
-| `symbol`    |  yes  |    yes    |      yes      |      no       |
-| `library`   |  no   |    yes    |      no       |      no       |
-| `inline`    |  yes  |    no     |      no       |      no       |
-| `noinline`  |  yes  |    no     |      no       |      no       |
-| `align`     |  no   |    no     |      yes      |      yes      |
-| `packed`    |  no   |    no     |      no       |      yes      |
-| `section`   |  yes  |    yes    |      yes      |      no       |
-| `oblivious` |  yes  |    no     |      no       |      no       |
-| `scalar`    |  yes  |    no     |      no       |      no       |
-| `naked`     |  yes  |    no     |      no       |      no       |
-| `extensions`|  yes  |    no     |      no       |      no       |
-| `embed`     |  no   |    no     |      yes      |      no       |
-| `stage`     |  yes  |    no     |      no       |      no       |
-| `workgroup` |  yes  |    no     |      no       |      no       |
-| `input`     |  no   |    no     |      yes      |      no       |
-| `output`    |  no   |    no     |      yes      |      no       |
-| `builtin`   |  no   |    no     |      yes      |      no       |
-| `uniform`   |  no   |    no     |      yes      |      no       |
-| `storage`   |  no   |    no     |      yes      |      no       |
-| `push`      |  no   |    no     |      yes      |      no       |
-| `spec`      |  no   |    no     |      yes      |      no       |
-| `op`        |  yes  |    no     |      no       |      no       |
-| `handle`    |  no   |    no     |      no       |      no       |
-| `abi_type`  |  no   |    no     |      no       |      no       |
+Where each decorator stands. The declarations are named by their keyword,
+`ext` is an `ext` import of any kind, and `case` is a tag case. A decorator
+written anywhere else is refused with `decorator.misplaced`. The last column is
+a further rule the decorator's own section states.
 
-The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
-is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
-`spec` is the reverse and accepts only `var` (see
-[`spec`](#specid--specialization-constants)).
-`deprecated` also applies to `tag`, `def`, `use` and `fwd` declarations and to a
-tag case, and `testing` to `tag`, `def`, `use` and `fwd` declarations, none of
-which the table columns cover.
+| Decorator | Stands on | Only on |
+|---|---|---|
+| `deprecated` | `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use`, `fwd`, `case` |  |
+| `testing` | `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use`, `fwd` | not an `ext` declaration |
+| `expect` | `fun`, `rec`, `uni`, `tag`, `val`, `var`, `test` |  |
+| `symbol` | `fun`, `val`, `var` |  |
+| `section` | `fun`, `val`, `var` |  |
+| `library` | `ext` |  |
+| `export` | `fun`, `val`, `var` | a `pub` declaration that is not `ext` |
+| `inline` | `fun` |  |
+| `align` | `fun`, `rec`, `uni`, `tag`, `val`, `var` |  |
+| `packed` | `rec`, `uni`, `tag` | not a `gpu.uniform`, `gpu.storage` or `gpu.push` block |
+| `volatile` | `rec`, `uni`, `tag` |  |
+| `at` | `val`, `var` | not `ext`, `section` or `thread` |
+| `thread` | `var` | no shader interface role |
+| `constant_time` | `fun`, `def` | a function with a body, or an alias of a function type that is not C-variadic and carries no mode |
+| `vectorize` | `fun` |  |
+| `naked` | `fun` |  |
+| `noreturn` | `fun`, `ext`, an `asm` statement | a function that states no result |
+| `extension` | `fun` | a function with a body |
+| `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
+| `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run |
+| `handle` | `def` | a `def` with no type, checked by `handle` itself |
+| `abi_type` | `def` | a `def` with no type, checked by `abi_type` itself |
+| `gpu.stage` | `fun` |  |
+| `gpu.workgroup` | `fun` | a function that also carries `#[gpu.stage("compute")]` |
+| `gpu.input` | `val`, `var` | a `var`: an input takes no initializer and a `val` needs one, so a `val` is refused for its initializer (`decorator.conflict`) |
+| `gpu.output` | `val`, `var` |  |
+| `gpu.builtin` | `val`, `var` | a `var` where the built-in is an input, for the same reason |
+| `gpu.uniform` | `val`, `var` |  |
+| `gpu.storage` | `val`, `var` |  |
+| `gpu.sampler` | `val`, `var` |  |
+| `gpu.attachment` | `val`, `var` | a binding of a handle the target declares a subpass input, where it is required |
+| `gpu.push` | `val`, `var` |  |
+| `gpu.spec` | `val`, `var` | a `var` |
+| `gpu.shared` | `val`, `var` | a `var` |
 
-The set is closed. New directives require a compiler change.
+The set is closed. New decorators require a compiler change. A name outside it
+is refused with `decorator.unknown`, and the refusal lists every decorator.
+
+### v6 spellings
+
+A v6 spelling is refused with `decorator.unknown`, naming the v7 spelling, and
+`mach migrate` rewrites each one. A bare `#[inline]` is refused with
+`decorator.arity`, for the same reason.
+
+| v6 | v7 |
+|---|---|
+| `#[ext(a, b)]`, `#[extensions(a, b)]` | `#[extension("a", "b")]` |
+| `#[inline]` | `#[inline("always")]` |
+| `#[noinline]` | `#[inline("never")]` |
+| `#[scalar]` | `#[vectorize("never")]` |
+| `#[oblivious]` | `#[constant_time("soft")]` or `#[constant_time("hard")]`, and `mach migrate` writes the first |
+| `#[op(tgt, set, name)]` | `#[intrinsic(tgt, set, name)]` |
+| `#[stage]` … `#[shared]` | `#[gpu.stage]` … `#[gpu.shared]` |
 
 ## See also
 
@@ -1870,9 +1373,9 @@ The set is closed. New directives require a compiler change.
 - [ext-fun.md](ext-fun.md) — `ext` imports, `library` and `symbol` use cases
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
-- [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
-- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `extensions` admits
+- [secrecy.md](secrecy.md) — `^` secret types and the `constant_time` contract
+- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `extension` admits
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
-- [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares
-- [manifest.md](manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
+- [types.md](types.md) — the SIMD vector types a shader stage computes over and `intrinsic` operates on, and the handle types `handle` declares
+- [manifest.md](manifest.md) — the removed `vectorize` profile key, and content-fingerprinted build inputs (`embed`, `[step]` `in`)

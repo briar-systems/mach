@@ -1,0 +1,388 @@
+# interned strings: one stable id per distinct byte string
+#
+# a string may hold NUL bytes and is equal to another by its bytes and length. an interner may be
+# layered over a base: it answers every id the base had issued when it was made and issues its
+# own past them, and `child_reintern` maps a child's strings into its base.
+#
+# a child is how work off the owner thread names strings. its contract:
+# - a child reads its base without a lock, so the base takes no new names while the child lives.
+#   a child with no base reads nothing shared and may live on any thread
+# - only the child's own thread adds to it, and its ids are its own until it is merged
+# - `child_reintern` merges it on the owner: each string the child issued is interned in the target
+#   in the order the child issued it, and the remap names the target's id for each of the child's.
+#   the target is the child's base or another child of that base, which the owner names strings in
+#   while the base is frozen and `fold` gives back to the base when it thaws
+# - so when the owner merges children at the points a single thread would have interned their
+#   strings, and in that order, every merged id is the id the single thread would have issued
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.collections.map;
+use std.crypto.hash.fnv1a;
+use std.memory;
+use std.system.panic.panic;
+use text_string: std.text.string;
+
+use mach.base.growth;
+use mach.base.role;
+
+# the identity of one interned string
+#
+# a plain `def` alias of `u32`, so the type system does not keep a string id
+# apart from another id or a bare integer. absence is `STR_NIL`, never an
+# `opt[StrId]`.
+pub def StrId: u32;
+
+pub val STR_NIL: StrId = 0xFFFFFFFF;
+
+# the string id at `index`
+pub fun str_id(index: u32) StrId {
+    var id: StrId;
+    id = index;
+    ret id;
+}
+
+# the index a string id names
+pub fun str_index(id: StrId) u32 {
+    ret id;
+}
+
+# whether two ids name the same interned string
+pub fun str_same(left: StrId, right: StrId) bool {
+    ret left == right;
+}
+
+# whether an id is STR_NIL
+pub fun str_is_nil(id: StrId) bool {
+    ret id == STR_NIL;
+}
+
+# one interned string: `len` bytes at `data`, then a terminator
+#
+# the length is the string and the terminator is not: a decoded literal may
+# hold NUL bytes, so two entries are equal by their bytes and length, and the
+# terminator only lets a name be read as a `str`
+rec Entry {
+    data: str;
+    len:  usize;
+}
+
+fun entry_hash(e: *Entry) u64 {
+    ret fnv1a.step_bytes(fnv1a.FNV_INIT, e.data::*u8, e.len);
+}
+
+fun entry_eq(a: *Entry, b: *Entry) bool {
+    ret a.len == b.len && memory.equal[char](a.data, b.data, a.len);
+}
+
+# a table of interned strings, each id naming one entry
+# ---
+# a:        owns every entry's bytes and the table
+# strings:  the entries this layer issued, in issue order
+# len:      how many entries this layer issued
+# cap:      the capacity of `strings`
+# dedup:    each entry this layer issued, to its id
+# base:     the interner this one is layered over, nil for none
+# base_len: how many ids the base and its own bases had issued when this one was made
+pub rec Interner {
+    a:        *A.Allocator;
+    strings:  *Entry;
+    len:      usize;
+    cap:      usize;
+    dedup:    map.MapBy[Entry, StrId];
+    base:     *Interner;
+    base_len: usize;
+}
+
+# an empty interner with no base, released with dnit
+pub fun init(a: *A.Allocator) Interner {
+    var itn: Interner;
+    itn.a        = a;
+    itn.strings  = nil;
+    itn.len      = 0;
+    itn.cap      = 0;
+    itn.dedup    = map.init_by[Entry, StrId](a, entry_hash, entry_eq);
+    itn.base     = nil;
+    itn.base_len = 0;
+    ret itn;
+}
+
+# an interner layered over `base`: it answers every id `base` and its own
+# bases had issued when it was made, and issues its own past them. a base may
+# itself be a child, so a session over a plan's interner layers its parallel
+# workers over the session's
+pub fun child_init(base: *Interner, a: *A.Allocator) Interner {
+    var itn: Interner = init(a);
+    itn.base     = base;
+    itn.base_len = base.base_len + base.len;
+    ret itn;
+}
+
+# whether `itn` answers every id `base` has issued: it is `base`, or layered over it
+pub fun descends(itn: *Interner, base: *Interner) bool {
+    var at: *Interner = itn;
+    for (at != nil) {
+        if (at == base) { ret true; }
+        at = at.base;
+    }
+    ret false;
+}
+
+# release an interner and its strings; a nil interner holds nothing
+pub fun dnit(itn: *Interner) {
+    if (itn == nil) { ret; }
+
+    var i: usize = 0;
+    for (i < itn.len) {
+        entry_free(itn.a, itn.strings[i]);
+        i = i + 1;
+    }
+
+    if (itn.strings != nil && itn.cap > 0) {
+        A.deallocate[Entry](itn.a, itn.strings, itn.cap);
+    }
+
+    map.dnit_by[Entry, StrId](?itn.dedup);
+
+    itn.strings = nil;
+    itn.len     = 0;
+    itn.cap     = 0;
+}
+
+fun entry_free(a: *A.Allocator, e: Entry) {
+    A.deallocate[char](a, e.data, e.len + 1);
+}
+
+fun entry_of(itn: *Interner, id: StrId) opt[Entry] {
+    if (itn.base != nil) {
+        if (str_index(id)::usize < itn.base_len) { ret entry_of(itn.base, id); }
+        val local: usize = str_index(id)::usize - itn.base_len;
+        if (local >= itn.len) { ret opt[Entry].none{}; }
+        ret opt[Entry].some{itn.strings[local]};
+    }
+    if (str_index(id)::usize >= itn.len) { ret opt[Entry].none{}; }
+    ret opt[Entry].some{itn.strings[str_index(id)]};
+}
+
+# the text of `id`. an interner answers every id it or its base issued for as
+# long as it lives, so the read is total: an id it never issued, STR_NIL among
+# them, is a broken precondition of the caller, and it stops the compiler
+pub fun text(itn: *Interner, id: StrId) str {
+    val opt_found: opt[str] = get(itn, id);
+    if (sel opt_found.some) { ret opt_found.some; }
+    panic("intern: text read for an id the interner never issued\n");
+    ret nil;
+}
+
+# the text of `id`, or none for an id the interner never issued. it ends at
+# the first NUL, so a string that may hold one is read through `bytes`
+pub fun get(itn: *Interner, id: StrId) opt[str] {
+    val opt_found: opt[Entry] = entry_of(itn, id);
+    if (sel opt_found.none) { ret opt[str].none{}; }
+    ret opt[str].some{opt_found.some.data};
+}
+
+# every byte of `id`, NULs included, or none for an id the interner never issued
+pub fun bytes(itn: *Interner, id: StrId) opt[View] {
+    val opt_found: opt[Entry] = entry_of(itn, id);
+    if (sel opt_found.none) { ret opt[View].none{}; }
+    ret opt[View].some{view(opt_found.some.data, opt_found.some.len)};
+}
+
+# the id of the text `text` up to its first NUL, interned when it was not yet
+# ---
+# itn:  the interner
+# text: the text
+# ret:  its id, or the allocator's refusal
+pub fun add(itn: *Interner, text: str) res[StrId, A.Error] {
+    ret range_add(itn, text, 0, str_len(text));
+}
+
+# the id of the `len` bytes at `data`, NULs included, interned when they were not yet
+# ---
+# itn:  the interner
+# data: the bytes
+# len:  how many
+# ret:  their id, or the allocator's refusal
+pub fun bytes_add(itn: *Interner, data: str, len: usize) res[StrId, A.Error] {
+    ret range_add(itn, data, 0, len);
+}
+
+# the `len` bytes of `source` from `offset`, interned. the bytes are taken as
+# they are, so a NUL among them is part of the string
+pub fun range_add(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, A.Error] {
+    var probe: Entry = Entry{data: ?source[offset], len: len};
+    if (len == 0) { probe.data = ""; }
+    val hash:     u64        = entry_hash(?probe);
+    val opt_held: opt[StrId] = probe_find(itn, ?probe, hash);
+    if (sel opt_held.some) { ret res[StrId, A.Error].ok{opt_held.some}; }
+
+    val res_dup: res[str, A.Error] = text_string.str_dup_range(itn.a, probe.data, 0, len);
+    if (sel res_dup.err) { ret res[StrId, A.Error].err{res_dup.err}; }
+
+    ret store_and_index(itn, Entry{data: res_dup.ok, len: len}, hash);
+}
+
+# the id `text` was interned under, none when it never was; nothing is interned, so a reader
+# that shares the interner may ask while no one adds
+pub fun find(itn: *Interner, text: str) opt[StrId] {
+    $if (role.CHECKED) { role.touched(role.INTERN_FIND, itn::ptr); }
+
+    var probe: Entry = Entry{data: text, len: str_len(text)};
+    ret probe_find(itn, ?probe, entry_hash(?probe));
+}
+
+# every layer hashes with entry_hash, so the one hash of `probe` serves them all. a layer
+# interns a string only when no layer below answers it, so at most one layer holds it and
+# the layer asked first is the one most strings live in, the top
+fun probe_find(itn: *Interner, probe: *Entry, hash: u64) opt[StrId] {
+    val opt_existing: opt[*StrId] = map.get_by_hashed[Entry, StrId](?itn.dedup, probe, hash);
+    if (sel opt_existing.some) { ret opt[StrId].some{@opt_existing.some}; }
+    # each base answers only the ids it had issued when the layer above it was
+    # made; one it issued since lies in that layer's own range
+    var below: *Interner = itn.base;
+    var limit: usize     = itn.base_len;
+    for (below != nil) {
+        val opt_base: opt[*StrId] = map.get_by_hashed[Entry, StrId](?below.dedup, probe, hash);
+        if (sel opt_base.some) {
+            if (str_index(@opt_base.some)::usize < limit) { ret opt[StrId].some{@opt_base.some}; }
+        }
+        limit = below.base_len;
+        below = below.base;
+    }
+    ret opt[StrId].none{};
+}
+
+fun store_and_index(itn: *Interner, owned: Entry, hash: u64) res[StrId, A.Error] {
+    $if (role.CHECKED) { role.touched(role.INTERN_ADD, itn::ptr); }
+
+    var handed: bool = false;
+    fin {
+        if (!handed) { entry_free(itn.a, owned); }
+    }
+    val err_grown: err[A.Error] = growth.reserve_usize[Entry](itn.a, ?itn.strings, ?itn.cap, itn.len + 1);
+    if (sel err_grown.err) { ret res[StrId, A.Error].err{err_grown.err}; }
+
+    val new_id: StrId = str_id((itn.base_len + itn.len)::u32);
+    itn.strings[itn.len] = owned;
+    itn.len              = itn.len + 1;
+
+    val res_insert: res[bool, A.Error] = map.insert_by_hashed[Entry, StrId](?itn.dedup, owned, new_id, hash);
+    if (sel res_insert.err) {
+        itn.len = itn.len - 1;
+        ret res[StrId, A.Error].err{res_insert.err};
+    }
+
+    handed = true;
+    ret res[StrId, A.Error].ok{new_id};
+}
+
+# the ids a merged child's strings got in the merge's target
+# ---
+# base_len: where the child's own range began, an id below it left as it is
+# ids:      the target's id for each string the child issued, in issue order
+# len:      how many
+pub rec Remap {
+    base_len: usize;
+    ids:      *StrId;
+    len:      usize;
+}
+
+# release a remap; a nil remap holds nothing
+pub fun remap_dnit(alloc: *A.Allocator, remap: *Remap) {
+    if (remap == nil) { ret; }
+    if (remap.ids != nil && remap.len > 0) {
+        A.deallocate[StrId](alloc, remap.ids, remap.len);
+    }
+    remap.base_len = 0;
+    remap.ids      = nil;
+    remap.len      = 0;
+}
+
+# the id in the merge's target that `id`, issued by the merged child, names: an id below the
+# child's own range is its base's and stays, one in it is mapped
+pub fun remapped(remap: *Remap, id: StrId) StrId {
+    if (str_is_nil(id) || str_index(id)::usize < remap.base_len) { ret id; }
+    ret remap.ids[str_index(id)::usize - remap.base_len];
+}
+
+# `child` merged into `into`, its base, another child of its base or, for a child with no base, any
+# interner: each string the child issued interned there in the order it issued them, and the ids
+# they got. a child layered over another interner is a contract violation of the receiver, reported
+# as the allocator layer reports its own (`invalid`)
+pub fun child_reintern(child: *Interner, into: *Interner, alloc_: *A.Allocator) res[Remap, A.Error] {
+    if (child.base != nil && child.base != into && child.base != into.base) { ret res[Remap, A.Error].err{A.Error.invalid{}}; }
+    var out: Remap;
+    out.base_len = child.base_len;
+    out.ids      = nil;
+    out.len      = child.len;
+    if (child.len == 0) { ret res[Remap, A.Error].ok{out}; }
+
+    val res_map: res[*StrId, A.Error] = A.allocate[StrId](alloc_, child.len);
+    if (sel res_map.err) {
+        ret res[Remap, A.Error].err{res_map.err};
+    }
+    val remap: *StrId = res_map.ok;
+
+    var i: usize = 0;
+    for (i < child.len) {
+        val res_id: res[StrId, A.Error] = range_add(into, child.strings[i].data, 0, child.strings[i].len);
+        if (sel res_id.err) {
+            A.deallocate[StrId](alloc_, remap, child.len);
+            ret res[Remap, A.Error].err{res_id.err};
+        }
+        remap[i] = res_id.ok;
+        i        = i + 1;
+    }
+    out.ids = remap;
+    ret res[Remap, A.Error].ok{out};
+}
+
+# `layer` folded into its base, which issued nothing since the layer was made: each string the layer
+# issued moved there under the id it has, the layer left holding none. strings move, not copy, so
+# both draw on one allocator. a base that issued since is a contract violation of the receiver
+# (`invalid`); a failure leaves the strings not yet moved in the layer, still layered over the base
+pub fun fold(layer: *Interner) err[A.Error] {
+    val base: *Interner = layer.base;
+    if (base == nil || base.a != layer.a || base.base_len + base.len != layer.base_len) { ret err[A.Error].err{A.Error.invalid{}}; }
+
+    if (layer.len == 0) { ret err[A.Error].ok{}; }
+    val err_grown: err[A.Error] = growth.reserve_usize[Entry](base.a, ?base.strings, ?base.cap, base.len + layer.len);
+    if (sel err_grown.err) { ret err_grown; }
+    var i: usize = 0;
+    for (i < layer.len) {
+        $if (role.CHECKED) { role.touched(role.INTERN_ADD, base::ptr); }
+        val e:          Entry              = layer.strings[i];
+        val res_insert: res[bool, A.Error] = map.insert_by_hashed[Entry, StrId](?base.dedup, e, str_id((base.base_len + base.len)::u32), entry_hash(?e));
+        if (sel res_insert.err) {
+            var k: usize = 0;
+            for (k < i) {
+                val moved: bool = map.remove_by[Entry, StrId](?layer.dedup, ?layer.strings[k]);
+                k = k + 1;
+            }
+            memory.move[Entry](layer.strings, ?layer.strings[i], layer.len - i);
+            layer.len      = layer.len - i;
+            layer.base_len = base.base_len + base.len;
+            ret err[A.Error].err{res_insert.err};
+        }
+        base.strings[base.len] = e;
+        base.len               = base.len + 1;
+        i                      = i + 1;
+    }
+    layer.len      = 0;
+    layer.base_len = base.base_len + base.len;
+    map.clear_by[Entry, StrId](?layer.dedup);
+    ret err[A.Error].ok{};
+}

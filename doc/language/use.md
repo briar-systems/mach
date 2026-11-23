@@ -1,8 +1,10 @@
-# `use` — imports
+# `use`: imports
 
 `use` brings an external symbol or module into the current scope under a
-local name. It is a private import; the imported name is not exposed to
-consumers of this module.
+local name. It is a private import. The imported name is not exposed to
+consumers of this module: a consumer that imports it through this module is
+refused with `visibility.not_exported`, whether it imports the name or writes it
+qualified through this module, as `module.name`, in a value or a type.
 
 ## Grammar
 
@@ -13,12 +15,15 @@ use ALIAS: PATH;            # binds ALIAS
 
 - The alias defaults to the path's leaf component when not given.
 - One name per line. No splat (`use foo.*` does not exist) and no
-  combined forms (`use foo.{a, b, c}` does not exist).
+  combined forms (`use foo.{a, b, c}` does not exist). Either is a syntax
+  error, `expected ';' after 'use' declaration`.
+- A bound name must be new in its scope. Binding a name twice, by leaf or by
+  alias, is refused with `name.duplicate`.
 
 The resolver binds whatever the path points to. A path ending at a **module**
-binds the module — access its members with qualified `module.member`. A path
+binds the module. Access its members with qualified `module.member`. A path
 ending at a **symbol** binds the symbol for bare use. Importing a module does
-**not** pull its members into scope unqualified; to use `usize` bare, import
+**not** pull its members into scope unqualified. To use `usize` bare, import
 the symbol, not its module.
 
 ## Examples
@@ -35,25 +40,26 @@ val c: usize      = 3;
 val d: my_usize   = 4;
 ```
 
-```mach fragment
-use mylib;                       # bare project id: binds mylib's public module
-```
+A path is always `<project id>.<source path>`. A one-segment path such as
+`use std;` names a project and no module, so it is refused like any path that
+names nothing, with `use.unresolved` (see
+[modules.md](modules.md#a-use-path-is-a-project-id-and-a-source-path)).
 
-A one-segment path equal to a resolvable project id binds that project's
-public module, the `entry` shared by its library artifacts marked
-`default = true` — see [modules.md](modules.md#bare-project-id-imports). A
-dependency that marks none has no public module and is imported by full
-path only; std 2.0.0 is one (`use std;` is refused naming the rule, while
-`use std.print;` needs no default artifact).
+## Unused imports
+
+A symbol import that nothing in the module names is reported with the
+warning `import.unused`. A module import is never reported, because it pulls
+its module into the build, which is an effect of its own. Only the root
+project's modules are checked, so a dependency's imports are never reported.
 
 ## Design rule
 
-A Mach module imports every dependency it directly names — including any
+A Mach module imports every dependency it directly names, including any
 dependency reached only through a re-export. There is no shortcut for
-"my surface uses these transitively; just give me the leaf." The dependency
+"my surface uses these transitively, just give me the leaf." The dependency
 graph is visible at the top of every file.
 
 ## See also
 
-- [fwd.md](fwd.md) — the public-re-export counterpart
-- [modules.md](modules.md) — how paths form module identifiers
+- [fwd.md](fwd.md): the public re-export counterpart
+- [modules.md](modules.md): how paths form module identifiers

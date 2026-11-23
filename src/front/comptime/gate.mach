@@ -1,0 +1,749 @@
+# comptime gates: which later phase a gate's condition depends on, and the verdict that
+# selects or discards its arm
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.stack;
+use mach.base.wide;
+use mach.front.ast;
+use ast_decl: mach.front.ast.decl;
+use ast_expr: mach.front.ast.expr;
+use ast_id:   mach.front.ast.id;
+use mach.front.comptime;
+use comptime_capability: mach.front.comptime.capability;
+use comptime_failure:    mach.front.comptime.failure;
+use mach.front.comptime.intrinsic;
+use comptime_scope: mach.front.comptime.scope;
+use comptime_value: mach.front.comptime.value;
+use A:              std.allocator;
+use T:              std.allocator.testing;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub def GateOutcome: u8;
+
+pub val GATE_INACTIVE:          GateOutcome = 0;
+pub val GATE_ACTIVE:            GateOutcome = 1;
+pub val GATE_REJECTED:          GateOutcome = 2;
+pub val GATE_FAILED:            GateOutcome = 3;
+pub val GATE_AWAITING_PHASE:    GateOutcome = 4;
+pub val GATE_AWAITING_INSTANCE: GateOutcome = 5;
+
+fun gate_eval_failure_is_transient(kind: comptime_failure.EvalFailKind) bool {
+    ret kind == comptime_failure.EVAL_FAIL_UNBOUND
+        || kind == comptime_failure.EVAL_FAIL_NEEDS_MEMBER
+        || kind == comptime_failure.EVAL_FAIL_NEEDS_LAYOUT;
+}
+
+# whether every arm of a chain, at any depth, declares nothing but directives and chains; a
+# chain nested deeper than the stack lets the walk descend is refused (`nesting`)
+pub fun comptime_if_declares_nothing(a: *ast.Ast, branches_start: u32, branches_len: u32) res[bool, fail.Fail] {
+    if (stack.exhausted()) { ret res[bool, fail.Fail].err{nesting()}; }
+    var bi: u32 = 0;
+    for (bi < branches_len) {
+        val branch_ix: u32 = branches_start + bi;
+        if (branch_ix::usize >= a.comptime_branches.len) { ret res[bool, fail.Fail].ok{false}; }
+        val br: *ast_decl.ComptimeBranch = ?a.comptime_branches.data[branch_ix];
+        var di: u32                      = 0;
+        for (di < br.body_len) {
+            val pool_ix: u32 = br.body_start + di;
+            if (pool_ix::usize >= a.decl_ids.len) { ret res[bool, fail.Fail].ok{false}; }
+            val res_nothing: res[bool, fail.Fail] = decl_declares_nothing(a, a.decl_ids.data[pool_ix]);
+            if (sel res_nothing.err) { ret res_nothing; }
+            if (!res_nothing.ok)     { ret res_nothing; }
+            di = di + 1;
+        }
+        bi = bi + 1;
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun decl_declares_nothing(a: *ast.Ast, did: ast_id.DeclId) res[bool, fail.Fail] {
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+    if (!sel opt_decl.some) { ret res[bool, fail.Fail].ok{false}; }
+    val d: *ast_decl.Decl = opt_decl.some;
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_DIRECTIVE) { ret res[bool, fail.Fail].ok{true}; }
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+        ret comptime_if_declares_nothing(a, d.data.comptime_if.branches_start, d.data.comptime_if.branches_len);
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# the refusal of a walk over nesting deeper than the stack lets it descend, which the phase
+# that asked reports against the node it asked about
+pub fun nesting() fail.Fail {
+    ret fail.user(diagnostic_kind.SYNTAX_NESTING_DEPTH, "input nests too deeply for a compile-time gate");
+}
+
+pub def GateProbe: u8;
+
+pub val GATE_PROBE_COMPTIME_PARAM:   GateProbe = 0;
+val     GATE_PROBE_LAYOUT_INTRINSIC: GateProbe = 1;
+pub val GATE_PROBE_TYPE_COMPARISON:  GateProbe = 2;
+val     GATE_PROBE_FIELD_DESCRIPTOR: GateProbe = 3;
+val     GATE_PROBE_EACH_LOOPVAR:     GateProbe = 4;
+val     GATE_PROBE_NODE_ACTION:      GateProbe = 5;
+
+val GATE_PROBE_COUNT: u32 = 5;
+
+pub def GateNodeVerdict: u8;
+
+pub val GATE_NODE_NO:    GateNodeVerdict = 0;
+val     GATE_NODE_YES:   GateNodeVerdict = 1;
+pub val GATE_NODE_PRUNE: GateNodeVerdict = 2;
+
+val GATE_PROBE_UNLISTED_KIND_MSG: str =
+    "this expression kind has no entry in the compile-time dependency visitor, so a gate that nests it cannot be scanned for dependencies";
+
+val GATE_PROBE_NO_OBSERVER_MSG: str =
+    "this phase did not supply the observer a compile-time dependency probe needs";
+
+# the observers a dependency probe asks of the phase walking a gate, each over the observer `T`
+# ---
+# expression:         an expression node as the phase reads it
+# comptime_param:     whether an identifier names a `$` parameter
+# each_loopvar:       whether an identifier names a `$each` loop variable
+# field_loopvar:      whether a field descriptor member reads a `$each` variable over `$fields`
+# field_type_operand: whether a comparison operand is a field descriptor's type
+# node_action:        the visit of a plain walk, which decides each node itself, nil for a probe
+pub rec GateProbes[T] {
+    expression:         fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail];
+    comptime_param:     fun(*T, ast_id.ExprId) bool;
+    each_loopvar:       fun(*T, ast_id.ExprId) bool;
+    field_loopvar:      fun(*T, ast_id.ExprId) bool;
+    field_type_operand: fun(*T, ast_id.ExprId) res[bool, fail.Fail];
+    node_action:        fun(*T, ast_id.ExprId, *ast_expr.Expr) res[GateNodeVerdict, fail.Fail];
+}
+
+# the observers of the dependency probes, with no node action
+# ---
+# ret: the observer set
+pub fun gate_probes[T](
+    comptime_param: fun(*T, ast_id.ExprId) bool,
+    each_loopvar: fun(*T, ast_id.ExprId) bool,
+    field_loopvar: fun(*T, ast_id.ExprId) bool,
+    field_type_operand: fun(*T, ast_id.ExprId) res[bool, fail.Fail],
+    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]) GateProbes[T] {
+    var p: GateProbes[T];
+    p.expression         = expression;
+    p.comptime_param     = comptime_param;
+    p.each_loopvar       = each_loopvar;
+    p.field_loopvar      = field_loopvar;
+    p.field_type_operand = field_type_operand;
+    p.node_action        = nil;
+    ret p;
+}
+
+fun gate_node_action_probes[T](action: fun(*T, ast_id.ExprId, *ast_expr.Expr) res[GateNodeVerdict, fail.Fail],
+    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]) GateProbes[T] {
+    var p: GateProbes[T] = gate_probes[T](nil, nil, nil, nil, expression);
+    p.node_action = action;
+    ret p;
+}
+
+# walk the condition `eid` with `action` deciding each node: a node it says yes to ends the walk,
+# one it prunes is not descended
+# ---
+# a:          the tree
+# source:     the tree's source text
+# obs:        the walk's own state, handed to both functions
+# action:     the visit of each node
+# expression: how the walk reads an expression node
+# eid:        the root of the walk
+# ret:        whether a node was said yes to, or the failure of the walk, a nesting refusal included
+pub fun gate_walk[T](a: *ast.Ast, source: str, obs: *T,
+    action: fun(*T, ast_id.ExprId, *ast_expr.Expr) res[GateNodeVerdict, fail.Fail],
+    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
+    eid: ast_id.ExprId) res[bool, fail.Fail] {
+    ret gate_depends_on[T](a, source, obs, gate_node_action_probes[T](action, expression), GATE_PROBE_NODE_ACTION, eid);
+}
+
+# whether any arm condition of a `$if` chain depends on what `probe` looks for
+# ---
+# a:              the tree
+# source:         the tree's source text
+# obs:            the observer the probes ask
+# probes:         the observers
+# probe:          which dependency to look for
+# branches_start: first arm in the comptime branch table
+# branches_len:   how many arms
+# ret:            whether a condition depends on it, or the failure of the walk
+pub fun gate_chain_depends_on[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
+    branches_start: u32, branches_len: u32) res[bool, fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < branches_len) {
+        val branch_ix: u32 = branches_start + bi;
+        if (branch_ix::usize >= a.comptime_branches.len) {
+            ret res[bool, fail.Fail].err{fail.message("comptime branch index out of range in the dependency visitor")};
+        }
+        val br: *ast_decl.ComptimeBranch = ?a.comptime_branches.data[branch_ix];
+        if (!ast_id.expr_is_nil(br.cond)) {
+            val res_depends: res[bool, fail.Fail] = gate_depends_on[T](a, source, obs, probes, probe, br.cond);
+            if (sel res_depends.err) { ret res_depends; }
+            if (res_depends.ok)      { ret res_depends; }
+        }
+        bi = bi + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+pub def GateScope: u8;
+
+pub val GATE_SCOPE_DECL:     GateScope = 0;
+pub val GATE_SCOPE_INSTANCE: GateScope = 1;
+
+val GATE_RUNTIME_MSG: str =
+    "a `$if` gate cannot read a parameter, a local or a `var`, because none has a value until the program runs";
+
+val GATE_U1_MSG: str =
+    "comptime branch condition must have type u1";
+
+val GATE_U1_FLOAT_MSG: str =
+    "comptime branch condition must have type u1, found float";
+
+val GATE_U1_STR_MSG: str =
+    "comptime branch condition must have type u1, found str";
+
+# what deciding one gate gave
+# ---
+# outcome: whether the arm is active, inactive, refused or waits on a later phase or an instance
+# fail:    the evaluation failure kind the verdict was decided from, EVAL_FAIL_NONE otherwise
+# diag:    the diagnostic kind a refusal is reported as, NONE for a verdict that reports nothing
+# message: the refusal's text, "" for a verdict that reports nothing
+# span:    where the refusal points, the condition or the run-time binding it reads
+# depends: the unbound name a failed gate waits on, STR_NIL when it waits on none
+# value:   the condition's value, where the verdict keeps it
+pub rec GateVerdict {
+    outcome: GateOutcome;
+    fail:    comptime_failure.EvalFailKind;
+    diag:    diagnostic_kind.Kind;
+    message: str;
+    span:    base_source.Span;
+    depends: intern.StrId;
+    value:   comptime_value.CTValue;
+}
+
+# what a failed gate says when the name it waits on is a constant nowhere the
+# module can see, which the caller frees
+pub fun never_decided_message(a: *A.Allocator, itn: *intern.Interner, depends: intern.StrId) res[str, fail.Fail] {
+    val opt_name: opt[str] = intern.get(itn, depends);
+    if (sel opt_name.none) { ret res[str, fail.Fail].err{fail.message("a gate waits on a name the interner does not hold")}; }
+    ret diagnostic.format(a, "this `$if` gate is never decided, because `{}` is not a compile-time constant anywhere this module can see", opt_name.some);
+}
+
+fun gate_verdict(outcome: GateOutcome, diag: diagnostic_kind.Kind, message: str, span: base_source.Span, depends: intern.StrId) GateVerdict {
+    var v: GateVerdict;
+    v.outcome         = outcome;
+    v.fail            = comptime_failure.EVAL_FAIL_NONE;
+    v.diag            = diag;
+    v.message         = message;
+    v.span            = span;
+    v.depends         = depends;
+    v.value.kind      = comptime_value.CT_KIND_INT;
+    v.value.int_width = 0;
+    v.value.data.w    = wide.zero();
+    ret v;
+}
+
+# a verdict that reports nothing, so it names no diagnostic kind
+fun gate_verdict_quiet(outcome: GateOutcome, span: base_source.Span) GateVerdict {
+    ret gate_verdict(outcome, diagnostic_kind.NONE, "", span, intern.STR_NIL);
+}
+
+fun gate_verdict_valued(outcome: GateOutcome, span: base_source.Span, value: comptime_value.CTValue) GateVerdict {
+    var v: GateVerdict = gate_verdict_quiet(outcome, span);
+    v.value = value;
+    ret v;
+}
+
+fun gate_failure_awaits_phase[T](cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], kind: comptime_failure.EvalFailKind) bool {
+    if (kind == comptime_failure.EVAL_FAIL_NEEDS_MEMBER) {
+        ret !comptime_capability.capabilities_have_member[T](cap_ctx, caps);
+    }
+    if (kind == comptime_failure.EVAL_FAIL_NEEDS_TYPES || kind == comptime_failure.EVAL_FAIL_NEEDS_LAYOUT) {
+        ret !comptime_capability.capabilities_have_types[T](cap_ctx, caps);
+    }
+    ret false;
+}
+
+fun gate_verdict_failed(outcome: GateOutcome, f: comptime_failure.EvalFail, span: base_source.Span, depends: intern.StrId) GateVerdict {
+    var v: GateVerdict = gate_verdict(outcome, f.diag, f.message, span, depends);
+    v.fail = f.kind;
+    ret v;
+}
+
+fun gate_u1_message(v: comptime_value.CTValue) str {
+    if (v.kind == comptime_value.CT_KIND_FLOAT) { ret GATE_U1_FLOAT_MSG; }
+    if (v.kind == comptime_value.CT_KIND_STR)   { ret GATE_U1_STR_MSG; }
+    ret GATE_U1_MSG;
+}
+
+rec GateNameProbe[T] {
+    cap_ctx:  *T;
+    caps:     comptime_capability.PhaseCapabilities[T];
+    c:        *comptime_scope.ComptimeCtx;
+    source:   str;
+    interner: *intern.Interner;
+    found:    intern.StrId;
+}
+
+fun gate_name_probe_node[T](g: *GateNameProbe[T], eid: ast_id.ExprId, e: *ast_expr.Expr) res[GateNodeVerdict, fail.Fail] {
+    if (!intern.str_is_nil(g.found))        { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_PRUNE}; }
+    if (e.kind != ast_expr.EXPR_KIND_IDENT) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+    val name:      intern.StrId                   = e.data.ident.name;
+    val opt_bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup(g.c, name);
+    if (sel opt_bound.some) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+    g.found = name;
+    ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_PRUNE};
+}
+
+fun gate_name_expression[T](g: *GateNameProbe[T], a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail] {
+    ret comptime_capability.read_expression[T](g.cap_ctx, g.caps, a, eid);
+}
+
+# the verdict of a gate whose condition a walk could not finish: a condition nested deeper
+# than the walk descends is refused at the gate, and any other failure is the phase's own
+fun walk_refused(c: *comptime_scope.ComptimeCtx, cond: ast_id.ExprId, cacheable: bool, f: fail.Fail, span: base_source.Span) res[GateVerdict, fail.Fail] {
+    val k: diagnostic_kind.Kind = fail.kind_of(f);
+    if (k == diagnostic_kind.NONE || k == diagnostic_kind.COMPILER_INTERNAL) { ret res[GateVerdict, fail.Fail].err{f}; }
+    if (cacheable)                                                           { comptime_scope.set_gate_state(c, cond, comptime_scope.GATE_STATE_REJECTED); }
+    ret res[GateVerdict, fail.Fail].ok{gate_verdict(GATE_REJECTED, k, fail.describe(f), span, intern.STR_NIL)};
+}
+
+# a run-time binding a gate reads, found by the phase's own question of each identifier
+rec GateRuntimeProbe[T] {
+    cap_ctx: *T;
+    caps:    comptime_capability.PhaseCapabilities[T];
+    found:   bool;
+    at:      base_source.Span;
+}
+
+fun gate_runtime_probe_node[T](g: *GateRuntimeProbe[T], eid: ast_id.ExprId, e: *ast_expr.Expr) res[GateNodeVerdict, fail.Fail] {
+    if (g.found)                                                          { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_PRUNE}; }
+    if (e.kind != ast_expr.EXPR_KIND_IDENT)                               { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+    if (g.caps.ident(g.cap_ctx, eid) != comptime_capability.NAME_RUNTIME) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+    g.found = true;
+    g.at    = e.span;
+    ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_PRUNE};
+}
+
+fun gate_runtime_expression[T](g: *GateRuntimeProbe[T], a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail] {
+    ret comptime_capability.read_expression[T](g.cap_ctx, g.caps, a, eid);
+}
+
+# the span of the first run-time binding `cond` reads, none when it reads none or the phase
+# cannot tell a run-time binding from a name it has not bound yet
+fun gate_runtime_binding[T](cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], a: *ast.Ast, source: str, cond: ast_id.ExprId) res[opt[base_source.Span], fail.Fail] {
+    if (!comptime_capability.capabilities_have_ident[T](cap_ctx, caps)) { ret res[opt[base_source.Span], fail.Fail].ok{opt[base_source.Span].none{}}; }
+    var g: GateRuntimeProbe[T];
+    g.cap_ctx = cap_ctx;
+    g.caps    = caps;
+    val res_matched: res[bool, fail.Fail] = gate_walk[GateRuntimeProbe[T]](a, source, ?g, gate_runtime_probe_node[T], gate_runtime_expression[T], cond);
+    if (sel res_matched.err) { ret res[opt[base_source.Span], fail.Fail].err{res_matched.err}; }
+    if (!g.found)            { ret res[opt[base_source.Span], fail.Fail].ok{opt[base_source.Span].none{}}; }
+    ret res[opt[base_source.Span], fail.Fail].ok{opt[base_source.Span].some{g.at}};
+}
+
+fun gate_unresolved_dependency[T](c: *comptime_scope.ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast, source: str, interner: *intern.Interner, cond: ast_id.ExprId) res[intern.StrId, fail.Fail] {
+    if (c == nil || interner == nil) { ret res[intern.StrId, fail.Fail].err{fail.message("gate dependency name has no active context")}; }
+    var g: GateNameProbe[T];
+    g.cap_ctx  = cap_ctx;
+    g.caps     = caps;
+    g.c        = c;
+    g.source   = source;
+    g.interner = interner;
+    g.found    = intern.STR_NIL;
+    val res_matched: res[bool, fail.Fail] = gate_walk[GateNameProbe[T]](a, source, ?g,
+        gate_name_probe_node[T], gate_name_expression[T], cond);
+    if (sel res_matched.err) { ret res[intern.StrId, fail.Fail].err{res_matched.err}; }
+    ret res[intern.StrId, fail.Fail].ok{g.found};
+}
+
+# decide a `$if` gate in the phase `caps` describes
+# a nil condition, a bare `$or`, is active. a condition the phase cannot decide yet waits on its
+# phase or its instance, and one that is no u1 constant is refused
+# ---
+# c:        the scope the condition is evaluated in, which caches a decided gate
+# cap_ctx:  the phase context
+# caps:     the phase's capabilities
+# a:        the tree
+# source:   the tree's source text
+# cond:     the condition
+# interner: the interner names are ids in
+# scope:    whether the gate is a declaration's or an instance's
+# cache:    whether the verdict is read from and written to the scope's gate cache
+# ret:      the verdict, or an internal failure
+pub fun evaluate_gate[T](
+    c: *comptime_scope.ComptimeCtx,
+    cap_ctx: *T,
+    caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    cond: ast_id.ExprId,
+    interner: *intern.Interner,
+    scope: GateScope,
+    cache: bool) res[GateVerdict, fail.Fail] {
+    var nil_span: base_source.Span;
+    nil_span.offset = 0;
+    nil_span.len    = 0;
+    if (ast_id.expr_is_nil(cond)) {
+        ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_ACTIVE, nil_span)};
+    }
+    val opt_cond: opt[*ast_expr.Expr] = ast.get_expr(a, cond);
+    if (!sel opt_cond.some) {
+        ret res[GateVerdict, fail.Fail].err{fail.message("comptime branch cond ExprId out of range")};
+    }
+    val span: base_source.Span = opt_cond.some.span;
+
+    val cacheable: bool = cache;
+    if (cacheable) {
+        val cached: comptime_scope.GateState = comptime_scope.gate_state(c, cond);
+        if (cached == comptime_scope.GATE_STATE_TRUE) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_ACTIVE, span)};
+        }
+        if (cached == comptime_scope.GATE_STATE_FALSE) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_INACTIVE, span)};
+        }
+        if (cached == comptime_scope.GATE_STATE_REJECTED) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_REJECTED, span)};
+        }
+    }
+    or (comptime_scope.gate_state(c, cond) == comptime_scope.GATE_STATE_REJECTED) {
+        ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_REJECTED, span)};
+    }
+
+    val res_evaluate: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[T](c, cap_ctx, caps, a, source, cond, interner);
+    if (sel res_evaluate.err) {
+        var f: comptime_failure.EvalFail = res_evaluate.err;
+        if (f.kind == comptime_failure.EVAL_FAIL_INTERNAL) { ret res[GateVerdict, fail.Fail].err{fail.message(f.message)}; }
+        if (f.kind == comptime_failure.EVAL_FAIL_NOT_INTEGER) {
+            if (cacheable) { comptime_scope.set_gate_state(c, cond, comptime_scope.GATE_STATE_REJECTED); }
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_REJECTED, f, span, intern.STR_NIL)};
+        }
+        if (f.kind == comptime_failure.EVAL_FAIL_NEEDS_INSTANCE) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_AWAITING_INSTANCE, f, span, intern.STR_NIL)};
+        }
+        # a typed phase is the last to bind constants, so what it cannot read stays unread
+        if (scope == GATE_SCOPE_INSTANCE && gate_eval_failure_is_transient(f.kind) && !comptime_capability.capabilities_have_types[T](cap_ctx, caps)) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_AWAITING_PHASE, f, span, intern.STR_NIL)};
+        }
+        if (gate_failure_awaits_phase[T](cap_ctx, caps, f.kind)) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_AWAITING_PHASE, f, span, intern.STR_NIL)};
+        }
+        # a fault in a value the gate has says its own cause; a gate with no value is refused
+        # under the gate's kinds, at the run-time binding it reads where the phase can tell one
+        if (!comptime_failure.no_value(f.kind, f.diag)) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_FAILED, f, span, intern.STR_NIL)};
+        }
+        val res_runtime: res[opt[base_source.Span], fail.Fail] = gate_runtime_binding[T](cap_ctx, caps, a, source, cond);
+        if (sel res_runtime.err) { ret walk_refused(c, cond, cacheable, res_runtime.err, span); }
+        if (sel res_runtime.ok.some) {
+            f.diag    = diagnostic_kind.GATE_RUNTIME_VALUE;
+            f.message = GATE_RUNTIME_MSG;
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_FAILED, f, res_runtime.ok.some, intern.STR_NIL)};
+        }
+        f.diag = diagnostic_kind.GATE_NOT_CONSTANT;
+        # only an unbound name is waited on, and the refusal names it
+        if (f.kind != comptime_failure.EVAL_FAIL_UNBOUND) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_FAILED, f, span, intern.STR_NIL)};
+        }
+        val res_depends: res[intern.StrId, fail.Fail] = gate_unresolved_dependency[T](c, cap_ctx, caps, a, source, interner, cond);
+        if (sel res_depends.err) { ret walk_refused(c, cond, cacheable, res_depends.err, span); }
+        ret res[GateVerdict, fail.Fail].ok{gate_verdict_failed(GATE_FAILED, f, span, res_depends.ok)};
+    }
+
+    val v: comptime_value.CTValue = res_evaluate.ok;
+    if (v.kind != comptime_value.CT_KIND_INT || (v.int_width != 0 && !comptime_value.is_u1(v))) {
+        if (cacheable) { comptime_scope.set_gate_state(c, cond, comptime_scope.GATE_STATE_REJECTED); }
+        var rej: GateVerdict = gate_verdict(GATE_REJECTED, diagnostic_kind.GATE_NOT_U1, gate_u1_message(v), span, intern.STR_NIL);
+        rej.value = v;
+        ret res[GateVerdict, fail.Fail].ok{rej};
+    }
+    # an untyped value is a u1 only where type checking has typed the condition as one
+    if (v.int_width == 0 && !comptime_capability.capabilities_have_types[T](cap_ctx, caps)) {
+        if (scope == GATE_SCOPE_INSTANCE) {
+            ret res[GateVerdict, fail.Fail].ok{gate_verdict_valued(GATE_AWAITING_PHASE, span, v)};
+        }
+        if (cacheable) { comptime_scope.set_gate_state(c, cond, comptime_scope.GATE_STATE_REJECTED); }
+        var untyped: GateVerdict = gate_verdict(GATE_REJECTED, diagnostic_kind.GATE_NOT_U1, GATE_U1_MSG, span, intern.STR_NIL);
+        untyped.value = v;
+        ret res[GateVerdict, fail.Fail].ok{untyped};
+    }
+    if (comptime_value.truth(v)) {
+        if (cacheable) { comptime_scope.set_gate_state(c, cond, comptime_scope.GATE_STATE_TRUE); }
+        ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_ACTIVE, span)};
+    }
+    if (cacheable) { comptime_scope.set_gate_state(c, cond, comptime_scope.GATE_STATE_FALSE); }
+    ret res[GateVerdict, fail.Fail].ok{gate_verdict_quiet(GATE_INACTIVE, span)};
+}
+
+# whether any arm condition of a `$if` chain depends on something only a later phase knows: a `$`
+# parameter, a layout intrinsic, a type comparison, a field descriptor or a `$each` variable
+# ---
+# a:              the tree
+# source:         the tree's source text
+# obs:            the observer the probes ask
+# probes:         the observers
+# branches_start: first arm in the comptime branch table
+# branches_len:   how many arms
+# ret:            whether the chain is deferred, or the failure of the walk
+pub fun gate_chain_defers[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T],
+    branches_start: u32, branches_len: u32) res[bool, fail.Fail] {
+    var pi: u32 = 0;
+    for (pi < GATE_PROBE_COUNT) {
+        val res_depends: res[bool, fail.Fail] = gate_chain_depends_on[T](a, source, obs, probes, pi::GateProbe, branches_start, branches_len);
+        if (sel res_depends.err) { ret res_depends; }
+        if (res_depends.ok)      { ret res_depends; }
+        pi = pi + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# whether the expression `eid` or any expression under it depends on what `probe` looks for
+# ---
+# a:      the tree
+# source: the tree's source text
+# obs:    the observer the probes ask
+# probes: the observers
+# probe:  which dependency to look for
+# eid:    the expression, EXPR_NIL for none
+# ret:    whether it depends on it, or the failure of the walk, a nesting refusal included
+pub fun gate_depends_on[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid: ast_id.ExprId) res[bool, fail.Fail] {
+    if (ast_id.expr_is_nil(eid))  { ret res[bool, fail.Fail].ok{false}; }
+    if (probes.expression == nil) { ret res[bool, fail.Fail].err{fail.message("gate dependency visitor has no expression reader")}; }
+    # the walk recurses as deep as the condition nests, so it asks for stack before it descends
+    if (stack.exhausted()) { ret res[bool, fail.Fail].err{nesting()}; }
+    val res_expr: res[ast_expr.Expr, comptime_failure.EvalFail] = probes.expression(obs, a, eid);
+    if (sel res_expr.err) {
+        ret res[bool, fail.Fail].err{fail.message(res_expr.err.message)};
+    }
+    var e_value: ast_expr.Expr  = res_expr.ok;
+    val e:       *ast_expr.Expr = ?e_value;
+
+    val res_here: res[GateNodeVerdict, fail.Fail] = gate_probe_node[T](a, source, obs, probes, probe, eid, e);
+    if (sel res_here.err) {
+        ret res[bool, fail.Fail].err{res_here.err};
+    }
+    val verdict: GateNodeVerdict = res_here.ok;
+    if (verdict == GATE_NODE_YES)   { ret res[bool, fail.Fail].ok{true}; }
+    if (verdict == GATE_NODE_PRUNE) { ret res[bool, fail.Fail].ok{false}; }
+
+    ret gate_depends_on_children[T](a, source, obs, probes, probe, e);
+}
+
+fun gate_probe_node[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
+    eid: ast_id.ExprId, e: *ast_expr.Expr) res[GateNodeVerdict, fail.Fail] {
+    if (probe == GATE_PROBE_COMPTIME_PARAM) {
+        if (e.kind != ast_expr.EXPR_KIND_IDENT) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+        if (probes.comptime_param == nil)       { ret res[GateNodeVerdict, fail.Fail].err{fail.message(GATE_PROBE_NO_OBSERVER_MSG)}; }
+        ret res[GateNodeVerdict, fail.Fail].ok{gate_node_if(probes.comptime_param(obs, eid))};
+    }
+    if (probe == GATE_PROBE_EACH_LOOPVAR) {
+        if (e.kind != ast_expr.EXPR_KIND_IDENT) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+        if (probes.each_loopvar == nil)         { ret res[GateNodeVerdict, fail.Fail].err{fail.message(GATE_PROBE_NO_OBSERVER_MSG)}; }
+        ret res[GateNodeVerdict, fail.Fail].ok{gate_node_if(probes.each_loopvar(obs, eid))};
+    }
+    if (probe == GATE_PROBE_FIELD_DESCRIPTOR) {
+        if (!intrinsic.is_field_descriptor_member(a, source, eid)) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+        if (probes.field_loopvar == nil)                           { ret res[GateNodeVerdict, fail.Fail].err{fail.message(GATE_PROBE_NO_OBSERVER_MSG)}; }
+        ret res[GateNodeVerdict, fail.Fail].ok{gate_node_if(probes.field_loopvar(obs, eid))};
+    }
+    if (probe == GATE_PROBE_LAYOUT_INTRINSIC) {
+        ret res[GateNodeVerdict, fail.Fail].ok{gate_node_if(intrinsic.is_layout_intrinsic_call(a, source, eid))};
+    }
+    if (probe == GATE_PROBE_TYPE_COMPARISON) {
+        if (e.kind == ast_expr.EXPR_KIND_BINARY
+            && (e.data.binary.op == ast_expr.BIN_EQ || e.data.binary.op == ast_expr.BIN_NEQ)) {
+            if (intrinsic.is_type_comparison(a, source, ?e.data.binary)) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_YES}; }
+            if (probes.field_type_operand == nil)                        { ret res[GateNodeVerdict, fail.Fail].err{fail.message(GATE_PROBE_NO_OBSERVER_MSG)}; }
+            val res_lhs: res[bool, fail.Fail] = probes.field_type_operand(obs, e.data.binary.lhs);
+            if (sel res_lhs.err) { ret res[GateNodeVerdict, fail.Fail].err{res_lhs.err}; }
+            if (res_lhs.ok)      { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_YES}; }
+            val res_rhs: res[bool, fail.Fail] = probes.field_type_operand(obs, e.data.binary.rhs);
+            if (sel res_rhs.err) { ret res[GateNodeVerdict, fail.Fail].err{res_rhs.err}; }
+            ret res[GateNodeVerdict, fail.Fail].ok{gate_node_if(res_rhs.ok)};
+        }
+        ret res[GateNodeVerdict, fail.Fail].ok{gate_node_if(intrinsic.is_type_query_call(a, source, eid))};
+    }
+    if (probe == GATE_PROBE_NODE_ACTION) {
+        if (probes.node_action == nil) { ret res[GateNodeVerdict, fail.Fail].err{fail.message(GATE_PROBE_NO_OBSERVER_MSG)}; }
+        ret probes.node_action(obs, eid, e);
+    }
+    ret res[GateNodeVerdict, fail.Fail].err{fail.message("unknown compile-time dependency probe")};
+}
+
+fun gate_node_if(matched: bool) GateNodeVerdict {
+    if (matched) { ret GATE_NODE_YES; }
+    ret GATE_NODE_NO;
+}
+
+fun gate_depends_on_children[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, e: *ast_expr.Expr) res[bool, fail.Fail] {
+    val k: ast_expr.ExprKind = e.kind;
+
+    if (k == ast_expr.EXPR_KIND_BINARY) {
+        ret gate_depends_on_pair[T](a, source, obs, probes, probe, e.data.binary.lhs, e.data.binary.rhs);
+    }
+    if (k == ast_expr.EXPR_KIND_UNARY) {
+        ret gate_depends_on[T](a, source, obs, probes, probe, e.data.unary.operand);
+    }
+    if (k == ast_expr.EXPR_KIND_SEL) {
+        ret gate_depends_on_pair[T](a, source, obs, probes, probe, e.data.sel.place, e.data.sel.case_desc);
+    }
+    if (k == ast_expr.EXPR_KIND_CALL || k == ast_expr.EXPR_KIND_GENERIC_INSTANCE) {
+        val res_depends: res[bool, fail.Fail] = gate_depends_on_pair[T](a, source, obs, probes, probe,
+            e.data.call.callee, e.data.call.index_callee);
+        if (sel res_depends.err) { ret res_depends; }
+        if (res_depends.ok)      { ret res_depends; }
+        ret gate_depends_on_list[T](a, source, obs, probes, probe, e.data.call.args_start, e.data.call.args_len);
+    }
+    if (k == ast_expr.EXPR_KIND_INDEX) {
+        val res_depends: res[bool, fail.Fail] = gate_depends_on_pair[T](a, source, obs, probes, probe,
+            e.data.index.object, e.data.index.index);
+        if (sel res_depends.err) { ret res_depends; }
+        if (res_depends.ok)      { ret res_depends; }
+        ret gate_depends_on[T](a, source, obs, probes, probe, e.data.index.count);
+    }
+    if (k == ast_expr.EXPR_KIND_MEMBER) {
+        ret gate_depends_on[T](a, source, obs, probes, probe, e.data.member.object);
+    }
+    if (k == ast_expr.EXPR_KIND_PROJECT) {
+        ret gate_depends_on_pair[T](a, source, obs, probes, probe, e.data.project.object, e.data.project.field);
+    }
+    if (k == ast_expr.EXPR_KIND_CAST) {
+        ret gate_depends_on[T](a, source, obs, probes, probe, e.data.cast.value);
+    }
+    if (k == ast_expr.EXPR_KIND_STRIP) {
+        ret gate_depends_on[T](a, source, obs, probes, probe, e.data.strip.value);
+    }
+    if (k == ast_expr.EXPR_KIND_SPREAD) {
+        ret gate_depends_on[T](a, source, obs, probes, probe, e.data.spread.inner);
+    }
+    if (k == ast_expr.EXPR_KIND_ARRAY_LIT) {
+        ret gate_depends_on_list[T](a, source, obs, probes, probe, e.data.array_lit.elems_start, e.data.array_lit.elems_len);
+    }
+    if (k == ast_expr.EXPR_KIND_VECTOR_LIT) {
+        ret gate_depends_on_list[T](a, source, obs, probes, probe, e.data.vector_lit.elems_start, e.data.vector_lit.elems_len);
+    }
+    if (k == ast_expr.EXPR_KIND_STRUCT_LIT) {
+        val res_elems: res[bool, fail.Fail] = gate_depends_on_list[T](a, source, obs, probes, probe, e.data.struct_lit.elems_start, e.data.struct_lit.elems_len);
+        if (sel res_elems.err) { ret res_elems; }
+        if (res_elems.ok)      { ret res_elems; }
+        var fi: u32 = 0;
+        for (fi < e.data.struct_lit.fields_len) {
+            val pool_ix: u32 = e.data.struct_lit.fields_start + fi;
+            if (pool_ix::usize >= a.field_inits.len) {
+                ret res[bool, fail.Fail].err{fail.message("struct literal field index out of range in the dependency visitor")};
+            }
+            val finit:       *ast_expr.FieldInit  = ?a.field_inits.data[pool_ix];
+            val res_depends: res[bool, fail.Fail] = gate_depends_on[T](a, source, obs, probes, probe, finit.value);
+            if (sel res_depends.err) { ret res_depends; }
+            if (res_depends.ok)      { ret res_depends; }
+            fi = fi + 1;
+        }
+        ret res[bool, fail.Fail].ok{false};
+    }
+    if (gate_expr_kind_is_leaf(k)) { ret res[bool, fail.Fail].ok{false}; }
+
+    ret res[bool, fail.Fail].err{fail.message(GATE_PROBE_UNLISTED_KIND_MSG)};
+}
+
+fun gate_expr_kind_is_leaf(k: ast_expr.ExprKind) bool {
+    ret k == ast_expr.EXPR_KIND_IDENT || k == ast_expr.EXPR_KIND_LIT_INT
+        || k == ast_expr.EXPR_KIND_LIT_FLOAT || k == ast_expr.EXPR_KIND_LIT_CHAR
+        || k == ast_expr.EXPR_KIND_LIT_STR || k == ast_expr.EXPR_KIND_LIT_NIL
+        || k == ast_expr.EXPR_KIND_COMPTIME_IDENT
+        || k == ast_expr.EXPR_KIND_TYPE_REF || k == ast_expr.EXPR_KIND_ERROR;
+}
+
+fun gate_depends_on_pair[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
+    first: ast_id.ExprId, second: ast_id.ExprId) res[bool, fail.Fail] {
+    val res_depends: res[bool, fail.Fail] = gate_depends_on[T](a, source, obs, probes, probe, first);
+    if (sel res_depends.err) { ret res_depends; }
+    if (res_depends.ok)      { ret res_depends; }
+    ret gate_depends_on[T](a, source, obs, probes, probe, second);
+}
+
+fun gate_depends_on_list[T](
+    a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
+    start: u32, len: u32) res[bool, fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= a.expr_ids.len) {
+            ret res[bool, fail.Fail].err{fail.message("expression list index out of range in the dependency visitor")};
+        }
+        val res_depends: res[bool, fail.Fail] = gate_depends_on[T](a, source, obs, probes, probe, a.expr_ids.data[pool_ix]);
+        if (sel res_depends.err) { ret res_depends; }
+        if (res_depends.ok)      { ret res_depends; }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+rec TypeQuestionProbe {
+    a:      *ast.Ast;
+    source: str;
+    found:  ast_id.ExprId;
+}
+
+fun type_question_node(q: *TypeQuestionProbe, eid: ast_id.ExprId, e: *ast_expr.Expr) res[GateNodeVerdict, fail.Fail] {
+    if (!ast_id.expr_is_nil(q.found))                         { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_PRUNE}; }
+    if (!intrinsic.is_type_question_call(q.a, q.source, eid)) { ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_NO}; }
+    q.found = eid;
+    ret res[GateNodeVerdict, fail.Fail].ok{GATE_NODE_PRUNE};
+}
+
+# the first call in an expression that asks a type question, EXPR_NIL when none does
+pub fun type_question(a: *ast.Ast, source: str, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail] {
+    var q:          TypeQuestionProbe    = TypeQuestionProbe{a: a, source: source, found: ast_id.EXPR_NIL};
+    val res_walked: res[bool, fail.Fail] = gate_walk[TypeQuestionProbe](a, source, ?q, type_question_node, comptime_capability.parsed_expression[TypeQuestionProbe], eid);
+    if (sel res_walked.err) { ret res[ast_id.ExprId, fail.Fail].err{res_walked.err}; }
+    ret res[ast_id.ExprId, fail.Fail].ok{q.found};
+}
+
+# a declaring gate may not ask a type question; `through` names the constants it asks it through,
+# as ` through `T` -> `S``, or is empty when the gate asks it itself
+pub fun type_question_message(interner: *intern.Interner, a: *ast.Ast, source: str, call: ast_id.ExprId, through: str) res[intern.StrId, fail.Fail] {
+    val callee:    base_source.Span           = comptime_callee_span(a, call);
+    val res_named: res[intern.StrId, A.Error] = intern.range_add(interner, source, callee.offset, callee.len);
+    if (sel res_named.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(res_named.err)}; }
+    val opt_text: opt[str] = intern.get(interner, res_named.ok);
+    if (sel opt_text.none) { ret res[intern.StrId, fail.Fail].err{fail.message("type question callee is not interned")}; }
+    val res_msg: res[str, fail.Fail] = diagnostic.format(interner.a,
+        "`{}` asks a type question{}, which this `$if` cannot answer because an arm declares something and the gate is decided before types are known. move the declarations out of the `$if` so it is decided during type checking",
+        opt_text.some, through);
+    if (sel res_msg.err) { ret res[intern.StrId, fail.Fail].err{res_msg.err}; }
+    val res_interned: res[intern.StrId, A.Error] = intern.add(interner, res_msg.ok);
+    str_free(interner.a, res_msg.ok);
+    if (sel res_interned.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(res_interned.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{res_interned.ok};
+}
+
+# the spelling of the intrinsic a comptime call names, `$size_of` for `$size_of(T)`
+fun comptime_callee_span(a: *ast.Ast, eid: ast_id.ExprId) base_source.Span {
+    var none: base_source.Span;
+    none.offset = 0;
+    none.len    = 0;
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(a, eid);
+    if (!sel opt_expr.some) { ret none; }
+    val node: *ast_expr.Expr = opt_expr.some;
+    if (node.kind != ast_expr.EXPR_KIND_CALL) { ret none; }
+    val opt_expr_callee: opt[*ast_expr.Expr] = ast.get_expr(a, node.data.call.callee);
+    if (!sel opt_expr_callee.some) { ret none; }
+    ret opt_expr_callee.some.span;
+}

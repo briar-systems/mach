@@ -1,106 +1,66 @@
+[mach](../../README.md) / [cli](../README.md) / [cmd](README.md) / **dep**
+
 # mach.cli.cmd.dep
 
-## fun run
+`mach dep` and its actions: list, add, remove, update, pull, outdated and verify
+
+each action's flags are read here and its work is the package manager's (mach.package).
+
+Source: [`src/cli/cmd/dep.mach`](../../../../src/cli/cmd/dep.mach)
+
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
+
+| Functions | |
+| :--- | :--- |
+| [`run`](#run) | `mach dep`: route to one action: list, add, remove, update, pull, verify or outdated, each a command over the dependency manager (mach.package) that renders what it reports |
+
+| Constants | |
+| :--- | :--- |
+| [`LIST`](#constants) | `mach dep list` |
+| [`ADD`](#constants) | `mach dep add` |
+| [`REMOVE`](#constants) | `mach dep remove` |
+| [`UPDATE`](#constants) | `mach dep update` |
+| [`PULL`](#constants) | `mach dep pull` |
+| [`OUTDATED`](#constants) | `mach dep outdated` |
+| [`VERIFY`](#constants) | `mach dep verify` |
+| [`ADD_POLICY`](#constants) | what mach holds `mach dep add` to beyond the parse |
+| [`UPDATE_POLICY`](#constants) | what mach holds `mach dep update` to beyond the parse |
+| [`VERIFY_POLICY`](#constants) | what mach holds `mach dep verify` to beyond the parse |
+| [`POLICY`](#constants) | what mach holds `mach dep` and its other actions to beyond the parse |
+| [`COMMAND`](#constants) | `mach dep` |
+
+---
+
+## Functions
+
+### run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
-`mach dep`: route to one action: list, add, remove, update, pull, verify, or the
-deprecated sync, which runs pull after a note
+`mach dep`: route to one action: list, add, remove, update, pull, verify or outdated, each a
+command over the dependency manager (mach.package) that renders what it reports
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: exit.OK, exit.USER for a malformed invocation, or the code `exit.of` maps the
-      action's printed failure to
+| Parameter | |
+| :--- | :--- |
+| `cx` | the call, its action read and its operands counted |
+| **returns** | exit.OK, the code `exit.of` maps the action's rendered failure to, or the failure that kept the action from starting |
 
-## fun pull_project
+## Constants
 
-```mach
-pub fun pull_project(root: str, quiet: bool) i64;
-```
-
-realize the dependency closure of a project: clone or link every declared dependency
-transitively, check each realized manifest's project id against its declared name, and
-report realized directories under dep/ that are no longer in the closure
-
-the closure is one walk over every edge kind: the root's declarations, then the
-declarations of each realized dependency, whether it was reached by a version range, a
-git ref or a path. the root's dep/ holds every identity once, and a version range any
-project in the closure declares is pinned there:
-
-- a range's pin is a committed gitlink. for a repository root it is the root's own
-  gitlink at dep/<id>; for a subproject, a project in a subdirectory of a repository, it
-  is the gitlink the enclosing repository commits under the subproject's prefix. pull
-  realizes the gitlink's commit on a fresh clone and restores a checkout that drifted
-  from it, and update stages the moved gitlink. a subproject with no gitlink for a
-  dependency gets a plain clone, as a project outside any repository does
-- a range a dependency declares resolves with the root's own (mach dep add, mach dep
-  update), whether the dependency was reached by a ref or a path: when the root holds no
-  checkout of the identity yet, it is seeded by the dependency's committed gitlink for it,
-  update --all moves it to the highest release every range admits, and a root declaration
-  of the same identity overrides it
-- a range with neither a gitlink nor a checkout under the root is refused here with
-  `run mach dep update <root> <id>`, which pins it whether the root or a dependency
-  declares it
-
-root: the project root directory
-quiet: suppress progress lines
-ret: exit.OK when realized, otherwise the code `exit.of` maps the printed failure to
-
-## fun verify_project
-
-```mach
-pub fun verify_project(root: str, release: bool) i64;
-```
-
-check that every dependency of a project is realized and consistent without changing
-anything; prints "ok" on success. a project root that is not a repository root is noted
-and verified from the realized checkouts. a realized directory under dep/ outside the
-closure is an error here, where pull reports and retains it
-
-root: the project root directory
-release: also refuse a root dependency selected by a branch, a commit or a path
-ret: exit.OK when verified, exit.USER for a directory outside the closure, otherwise the
-         code `exit.of` maps the printed failure to
-
-## fun pin_command
-
-```mach
-pub fun pin_command(a: *A.Allocator, root: str, id: str) str;
-```
-
-the command that pins and realizes a version-selected dependency with no checkout yet;
-pull's refusal and init's --no-deps hint both name it
-
-## fun unpinned_refusal
-
-```mach
-pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str;
-```
-
-## fun dep_outdated
-
-```mach
-pub fun dep_outdated(root: str, offline: bool) i64;
-```
-
-each version-selected identity's pinned release, the highest this compiler and every range
-accept, and the highest release published
-
-## fun add_release
-
-```mach
-pub fun add_release(root: str, name: str, url: str, quiet: bool, realize: bool) i64;
-```
-
-declare a git dependency at the caret range of the release resolution picks for the running
-compiler and realize the closure, as `mach dep add <root> <name> --git <url>` does
-
-root: the project root directory
-name: the dependency identity
-url: its git source
-quiet: suppress progress lines
-realize: check the release out; false only resolves the range and writes the table
-ret: exit.OK when added, otherwise the code `exit.of` maps the printed failure to
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `LIST` | `std.args.Command` | `std_args.Command{name: "list", aliases: args.NO_WORDS, help: "list declared dependencies and their state", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?PLAIN_FLAGS[0], size: 3}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep list` |
+| `ADD` | `std.args.Command` | `std_args.Command{name: "add", aliases: args.NO_WORDS, help: "declare a dependency", usage: "<path> <name> (--git <url> [--ref <ref> \| --range <range>] \| --path <dir>)", flags: Slice[*std_args.Flag]{data: ?ADD_FLAGS[0], size: 8}, commands: args.NO_COMMANDS, operand_min: 2, operand_max: 2, passthrough: false}` | `mach dep add` |
+| `REMOVE` | `std.args.Command` | `std_args.Command{name: "remove", aliases: args.NO_WORDS, help: "remove a dependency", usage: "<path> <name>", flags: Slice[*std_args.Flag]{data: ?REMOVE_FLAGS[0], size: 4}, commands: args.NO_COMMANDS, operand_min: 2, operand_max: 2, passthrough: false}` | `mach dep remove` |
+| `UPDATE` | `std.args.Command` | `std_args.Command{name: "update", aliases: args.NO_WORDS, help: "advance dependencies to their newest selected revisions", usage: "<path> (<name> \| --all)", flags: Slice[*std_args.Flag]{data: ?UPDATE_FLAGS[0], size: 6}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 2, passthrough: false}` | `mach dep update` |
+| `PULL` | `std.args.Command` | `std_args.Command{name: "pull", aliases: args.NO_WORDS, help: "realize dependencies at their pinned revisions", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?PLAIN_FLAGS[0], size: 3}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep pull` |
+| `OUTDATED` | `std.args.Command` | `std_args.Command{name: "outdated", aliases: args.NO_WORDS, help: "report pinned, compatible and latest releases", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?OUTDATED_FLAGS[0], size: 4}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep outdated` |
+| `VERIFY` | `std.args.Command` | `std_args.Command{name: "verify", aliases: args.NO_WORDS, help: "check the realized dependencies against the manifest", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?VERIFY_FLAGS[0], size: 4}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep verify` |
+| `ADD_POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: Slice[args.Conflict]{data: ?ADD_CONFLICTS[0], size: ADD_CONFLICTS_N}}` | what mach holds `mach dep add` to beyond the parse |
+| `UPDATE_POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach dep update` to beyond the parse |
+| `VERIFY_POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach dep verify` to beyond the parse |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach dep` and its other actions to beyond the parse |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "dep", aliases: args.NO_WORDS, help: "manage project dependencies", usage: "", flags: Slice[*std_args.Flag]{data: ?PLAIN_FLAGS[0], size: 3}, commands: Slice[*std_args.Command]{data: ?ACTIONS[0], size: ACTIONS_N}, operand_min: 0, operand_max: 0, passthrough: false}` | `mach dep` |
 

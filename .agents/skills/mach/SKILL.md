@@ -58,10 +58,10 @@ fwd impl.helpers;
 A surface module file `foo.mach` often coexists with a directory `foo/` containing modular implementation files. The surface file imports the splits and re-exports public items, allowing external consumers to write `use myproj.foo;` without coupling to internal file splits:
 
 ```mach
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     use impl: myproj.os.linux;
 }
-$or ($mach.build.os == $mach.os.windows) {
+$or ($mach.build.sys == $mach.sys.windows) {
     use impl: myproj.os.windows;
 }
 $or {
@@ -464,7 +464,7 @@ The `$` prefix accesses compile-time features, target inspection, reflection, an
 ### Target and Compiler State with `$mach.*`
 
 Compile-time constants inspection keys:
-- `$mach.build.os`: matches `$mach.os.linux`, `$mach.os.darwin`, `$mach.os.windows`, `$mach.os.freestanding`
+- `$mach.build.sys`: matches `$mach.sys.linux`, `$mach.sys.darwin`, `$mach.sys.windows`, `$mach.sys.freestanding`
 - `$mach.build.arch`: matches `$mach.arch.x86_64`, `$mach.arch.aarch64`, `$mach.arch.riscv64`
 - `$mach.build.mode`: matches `$mach.mode.debug`, `$mach.mode.release`
 - `$mach.build.pointer_width`: pointer size in bytes (8 on 64-bit systems)
@@ -481,10 +481,10 @@ Compile-time constants inspection keys:
 Code within unselected branches is discarded before type-checking and name resolution, making cross-platform code completely safe:
 
 ```mach
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     pub val PLATFORM: *u8 = "linux";
 }
-$or ($mach.build.os == $mach.os.windows) {
+$or ($mach.build.sys == $mach.sys.windows) {
     pub val PLATFORM: *u8 = "windows";
 }
 $or {
@@ -555,7 +555,7 @@ pub fun fast_calc(x: i64) i64 {
 - `#[packed]`: removes alignment padding from a record, union, or tag.
 - `#[section(".name")]`: places a function or global variable into a specific object file section.
 - `#[embed("path")]`: embeds the raw bytes of an external file at compile time into an uninitialized `val name: [_]u8;` array.
-- `#[library("name")]`: specifies the dynamic library name required for an external import.
+- `#[library("key")]`: names the `[link.<key>]` entry an external import comes from, by its table key (never a loader name such as `kernel32.dll`).
 - `#[deprecated]` or `#[deprecated("message")]`: emits a compile warning whenever the decorated symbol is used.
 - `#[scalar]`: opts a function out of automatic vectorization.
 - `#[naked]`: emits a function without prologue or epilogue code, intended for functions written entirely with inline assembly.

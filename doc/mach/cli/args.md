@@ -1,1689 +1,484 @@
+[mach](../README.md) / [cli](README.md) / **args**
+
 # mach.cli.args
 
-## fwd request.CliArgs
-
-```mach
-fwd request.CliArgs
-```
-
-forwards [`mach.lang.build.request.CliArgs`](../lang/build/request.md#rec-cliargs)
-
-## fwd request.is_object_path
-
-```mach
-fwd request.is_object_path
-```
-
-forwards [`mach.lang.build.request.is_object_path`](../lang/build/request.md#fun-is_object_path)
-
-## def OptionArity
-
-```mach
-pub def OptionArity: u8
-```
-
-whether an option is a bare flag, takes the next argv token, or takes a value
-attached to its own token after `=`
-
-## val ARITY_FLAG
-
-```mach
-pub val ARITY_FLAG: OptionArity = 0
-```
-
-the option stands alone
-
-## val ARITY_VALUE
-
-```mach
-pub val ARITY_VALUE: OptionArity = 1
-```
-
-the option consumes the next argv token as its value
-
-## val ARITY_ATTACHED
-
-```mach
-pub val ARITY_ATTACHED: OptionArity = 2
-```
-
-the option carries an optional value in its own token after `=`; it never
-consumes the next one, so `--emit-ir` and `--emit-ir=listing` both parse
-
-## rec FlagSpec
-
-```mach
-pub rec FlagSpec;
-```
-
-one command-line option as the schema tables declare it
-
-name: the spelling matched against an argv token, such as `--target` or `-o`
-value: help placeholder for the option's value; empty for ARITY_FLAG
-arity: how the option takes its value; the ARITY_* constants
-doc: one-line help text; schema_valid rejects an empty one
-default: help text for what applies when the option is absent; empty prints nothing
-repeatable: rendered as `repeatable` by help; parse_invocation records every occurrence either way
-conflicts: help text naming what this option cannot be combined with; nothing in this module enforces it
-implies: help text naming the option this one also switches on
-alias_of: the canonical spelling this option is an alias of, which must occur exactly once in the same schema; empty for a canonical option
-
-## val SEL_N
-
-```mach
-pub val SEL_N: usize = 8
-```
-
-row count of SEL
-
-## val SEL
-
-```mach
-pub val SEL: [SEL_N]FlagSpec = [SEL_N]FlagSpec;
-```
-
-the selection options `--artifact`, `--target`, `--profile` with their short
-forms `-a`, `-t`, `-p`, then `--all` and `-o`, consumed by build, check, run,
-test and doc. each selector takes an exact name or a glob and repeats; `--all`
-fills every selector not given with `*`. check hides `-o`, run hides `--all`,
-and doc accepts only `--artifact` and `--target`
-
-## val RDO_N
-
-```mach
-pub val RDO_N: usize = 4
-```
-
-row count of RDO
-
-## val RDO
-
-```mach
-pub val RDO: [RDO_N]FlagSpec = [RDO_N]FlagSpec;
-```
-
-the readout options `-v`, `-vv`, `--quiet`, `-q`, consumed by build, test,
-and doc; doc hides `-v` and `-vv`. `-q` is the alias of `--quiet`
-
-## val CGEN_N
-
-```mach
-pub val CGEN_N: usize = 5
-```
-
-row count of CGEN
-
-## val CGEN
-
-```mach
-pub val CGEN: [CGEN_N]FlagSpec = [CGEN_N]FlagSpec;
-```
-
-the codegen options `--pie`, `--subsystem`, `-g`,
-`--emit-asm`, `--emit-ir`, consumed by build and test; doc parses them with
-every row hidden. `--emit-ir` is the one attached-value row: bare it writes
-the ir-debug dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
-
-## val OPT_N
-
-```mach
-pub val OPT_N: usize = 2
-```
-
-row count of OPT
-
-## val OPT
-
-```mach
-pub val OPT: [OPT_N]FlagSpec = [OPT_N]FlagSpec;
-```
-
-the pipeline overrides `-O0` and `-O2`, consumed by build and test; there is
-no `-O1` row
-
-## val OPT_O1_REMOVED_ERROR
-
-```mach
-pub val OPT_O1_REMOVED_ERROR: str = "-O1 was removed
-```
-
-the user error mach build prints when argv contains `-O1`, which no schema
-table lists and which therefore parses as an unknown flag otherwise
-
-## val EMIT_N
-
-```mach
-pub val EMIT_N: usize = 1
-```
-
-row count of EMIT
-
-## val EMIT
-
-```mach
-pub val EMIT: [EMIT_N]FlagSpec = [EMIT_N]FlagSpec;
-```
-
-the `--emit <kind>` option, build only; its help text is request.EMIT_HELP
-
-## val JOBS_N
-
-```mach
-pub val JOBS_N: usize = 1
-```
-
-row count of JOBS
-
-## val JOBS
-
-```mach
-pub val JOBS: [JOBS_N]FlagSpec = [JOBS_N]FlagSpec;
-```
-
-the `--jobs <n>` option for build; test declares its own `--jobs` row in TEST_OWN
-
-## val LINKIN_N
-
-```mach
-pub val LINKIN_N: usize = 2
-```
-
-row count of LINKIN
-
-## val LINKIN
-
-```mach
-pub val LINKIN: [LINKIN_N]FlagSpec = [LINKIN_N]FlagSpec;
-```
-
-the repeatable link-input options `-L <dir>` and `-l <name>`, consumed by build and test
-
-## val BUILD_OWN_N
-
-```mach
-pub val BUILD_OWN_N: usize = 2
-```
-
-row count of BUILD_OWN
-
-## val BUILD_OWN
-
-```mach
-pub val BUILD_OWN: [BUILD_OWN_N]FlagSpec = [BUILD_OWN_N]FlagSpec;
-```
-
-the `--no-cache` and `--plan` options, build only. a build reads `obj/` as
-the object cache by default: a module whose object there carries the build's
-key is reused instead of lowered and generated. `--no-cache` forces an
-uncached build
-
-## val DIAG_N
-
-```mach
-pub val DIAG_N: usize = 1
-```
-
-row count of DIAG
-
-## val DIAG
-
-```mach
-pub val DIAG: [DIAG_N]FlagSpec = [DIAG_N]FlagSpec;
-```
-
-the `--diagnostics=<human|json>` option, consumed by build, check and test: how
-the diagnostics reach stderr. the value is attached, so a bare
-`--diagnostics` carries none and is refused by diagnostics_format
-
-## val RUN_OWN_N
-
-```mach
-pub val RUN_OWN_N: usize = 2
-```
-
-row count of RUN_OWN
-
-## val RUN_OWN
-
-```mach
-pub val RUN_OWN: [RUN_OWN_N]FlagSpec = [RUN_OWN_N]FlagSpec;
-```
-
-the `--runner <cmd>` and `--timeout <duration>` options, run only
-
-## val TEST_OWN_N
-
-```mach
-pub val TEST_OWN_N: usize = 8
-```
-
-row count of TEST_OWN
-
-## val TEST_OWN
-
-```mach
-pub val TEST_OWN: [TEST_OWN_N]FlagSpec = [TEST_OWN_N]FlagSpec;
-```
-
-the test-only options `--no-cache`, `--jobs`, `--filter`,
-`--include-deps`, `--list`, `--format`, `--runner`, `--timeout`.
-a test build reads `obj/` as the object cache by default, as a build does,
-and `--no-cache` forces an uncached one
-
-## val DOC_OWN_N
-
-```mach
-pub val DOC_OWN_N: usize = 1
-```
-
-row count of DOC_OWN
-
-## val DOC_OWN
-
-```mach
-pub val DOC_OWN: [DOC_OWN_N]FlagSpec = [DOC_OWN_N]FlagSpec;
-```
-
-the `--out <dir>` option, doc only
-
-## val INIT_N
-
-```mach
-pub val INIT_N: usize = 7
-```
-
-row count of INIT
-
-## val INIT
-
-```mach
-pub val INIT: [INIT_N]FlagSpec = [INIT_N]FlagSpec;
-```
-
-the init options `--name`, `--force`, `--lib`, `--no-deps`, `--no-git`, `--quiet`, `-q`;
-init does not use RDO, so its quiet rows are declared here
-
-## val INFO_N
-
-```mach
-pub val INFO_N: usize = 1
-```
-
-row count of INFO
-
-## val INFO
-
-```mach
-pub val INFO: [INFO_N]FlagSpec = [INFO_N]FlagSpec;
-```
-
-the `--version` option, info only
-
-## val QUIET_N
-
-```mach
-pub val QUIET_N: usize = 2
-```
-
-row count of QUIET
-
-## val QUIET
-
-```mach
-pub val QUIET: [QUIET_N]FlagSpec = [QUIET_N]FlagSpec;
-```
-
-the `--quiet` and `-q` options accepted by every dep action, through DEP_SCHEMA
-
-## val DEP_ADD_N
-
-```mach
-pub val DEP_ADD_N: usize = 5
-```
-
-row count of DEP_ADD
-
-## val DEP_ADD
-
-```mach
-pub val DEP_ADD: [DEP_ADD_N]FlagSpec = [DEP_ADD_N]FlagSpec;
-```
-
-the dep add options `--git <url>`, `--path <dir>`, `--ref <ref>`, `--version <range>`, `--offline`
-
-## val DEP_REMOVE_N
-
-```mach
-pub val DEP_REMOVE_N: usize = 1
-```
-
-row count of DEP_REMOVE
-
-## val DEP_REMOVE
-
-```mach
-pub val DEP_REMOVE: [DEP_REMOVE_N]FlagSpec = [DEP_REMOVE_N]FlagSpec;
-```
-
-the `--purge` option, dep remove only
-
-## val DEP_UPDATE_N
-
-```mach
-pub val DEP_UPDATE_N: usize = 3
-```
-
-row count of DEP_UPDATE
-
-## val DEP_UPDATE
-
-```mach
-pub val DEP_UPDATE: [DEP_UPDATE_N]FlagSpec = [DEP_UPDATE_N]FlagSpec;
-```
-
-the dep update options `--all`, `--lowest`, `--offline`
-
-## val DEP_OUTDATED_N
-
-```mach
-pub val DEP_OUTDATED_N: usize = 1
-```
-
-row count of DEP_OUTDATED
-
-## val DEP_VERIFY_N
-
-```mach
-pub val DEP_VERIFY_N: usize = 1
-```
-
-row count of DEP_VERIFY
-
-## val DEP_VERIFY
-
-```mach
-pub val DEP_VERIFY: [DEP_VERIFY_N]FlagSpec = [DEP_VERIFY_N]FlagSpec;
-```
-
-the `--release` option of dep verify
-
-## val DEP_OUTDATED
-
-```mach
-pub val DEP_OUTDATED: [DEP_OUTDATED_N]FlagSpec = [DEP_OUTDATED_N]FlagSpec;
-```
-
-the `--offline` option of dep outdated
-
-## fun flag_in_table
-
-```mach
-pub fun flag_in_table(tok: *u8, table: *FlagSpec, n: usize) bool;
-```
-
-whether tok is the name of some row in table
-
-tok: an argv token; nil is never in a table
-table: first row of the FlagSpec table
-n: row count of table
-ret: true when a row's name equals tok
-
-## def SemanticKey
-
-```mach
-pub def SemanticKey: u32
-```
-
-identity of one schema row across a command's tables: the command id times
-1000, plus the table's index within the schema times 100, plus the row's
-index, plus 500 when the table belongs to a dep action rather than the
-command. Two occurrences of the same option compare equal by key
-
-## def CommandId
-
-```mach
-pub def CommandId: u8
-```
-
-which command argv[1] named; the CMD_* constants
-
-## val CMD_BUILD
-
-```mach
-pub val CMD_BUILD: CommandId = 0
-```
-
-`mach build`
-
-## val CMD_RUN
-
-```mach
-pub val CMD_RUN: CommandId = 1
-```
-
-`mach run`
-
-## val CMD_TEST
-
-```mach
-pub val CMD_TEST: CommandId = 2
-```
-
-`mach test`
-
-## val CMD_CLEAN
-
-```mach
-pub val CMD_CLEAN: CommandId = 3
-```
-
-`mach clean`
-
-## val CMD_DEP
-
-```mach
-pub val CMD_DEP: CommandId = 4
-```
-
-`mach dep`, the one command with actions
-
-## val CMD_INIT
-
-```mach
-pub val CMD_INIT: CommandId = 5
-```
-
-`mach init`
-
-## val CMD_DOC
-
-```mach
-pub val CMD_DOC: CommandId = 6
-```
-
-`mach doc`
-
-## val CMD_INFO
-
-```mach
-pub val CMD_INFO: CommandId = 7
-```
-
-`mach info`
-
-## val CMD_HELP
-
-```mach
-pub val CMD_HELP: CommandId = 8
-```
-
-`mach help`
-
-## val CMD_CHECK
-
-```mach
-pub val CMD_CHECK: CommandId = 9
-```
-
-`mach check`
-
-## val CMD_FMT
-
-```mach
-pub val CMD_FMT: CommandId = 10
-```
-
-`mach fmt`
-
-## val CMD_N
-
-```mach
-pub val CMD_N: usize = 11
-```
-
-number of commands, the length of COMMANDS
-
-## val CMD_NONE
-
-```mach
-pub val CMD_NONE: CommandId = 255
-```
-
-no command recognized; the value of ParsedInvocation.command when has_command is false
-
-## def DepAction
-
-```mach
-pub def DepAction: u8
-```
-
-which dep action argv[2] named; the DEPACT_* constants
-
-## val DEPACT_LIST
-
-```mach
-pub val DEPACT_LIST: DepAction = 0
-```
-
-`mach dep list`
-
-## val DEPACT_ADD
-
-```mach
-pub val DEPACT_ADD: DepAction = 1
-```
-
-`mach dep add`
-
-## val DEPACT_REMOVE
-
-```mach
-pub val DEPACT_REMOVE: DepAction = 2
-```
-
-`mach dep remove`
-
-## val DEPACT_UPDATE
-
-```mach
-pub val DEPACT_UPDATE: DepAction = 3
-```
-
-`mach dep update`
-
-## val DEPACT_PULL
-
-```mach
-pub val DEPACT_PULL: DepAction = 4
-```
-
-`mach dep pull`
-
-## val DEPACT_VERIFY
-
-```mach
-pub val DEPACT_VERIFY: DepAction = 5
-```
-
-`mach dep verify`
-
-## val DEPACT_OUTDATED
-
-```mach
-pub val DEPACT_OUTDATED: DepAction = 6
-```
-
-`mach dep outdated`
-
-## val DEPACT_N
-
-```mach
-pub val DEPACT_N: usize = 7
-```
-
-number of dep actions, the length of DEP_ACTIONS
-
-## val DEPACT_NONE
-
-```mach
-pub val DEPACT_NONE: DepAction = 255
-```
-
-no action recognized, and the value passed to schema_lookup to search a command's own tables only
-
-## rec TableRef
-
-```mach
-pub rec TableRef;
-```
-
-one option table as a command or action schema references it
-
-table: first row of the FlagSpec table
-n: row count of table
-accepted: per-row acceptance parallel to table, or nil to accept every row; an unaccepted row is unknown to the parser and absent from help
-
-## val BUILD_SCHEMA_N
-
-```mach
-pub val BUILD_SCHEMA_N: usize = 9
-```
-
-length of BUILD_SCHEMA
-
-## val BUILD_SCHEMA
-
-```mach
-pub val BUILD_SCHEMA: [BUILD_SCHEMA_N]TableRef = [BUILD_SCHEMA_N]TableRef;
-```
-
-the option tables mach build accepts: SEL, RDO, CGEN, OPT, EMIT, JOBS, LINKIN, BUILD_OWN, DIAG, all fully visible
-
-## val CHECK_SEL_ACCEPTED
-
-```mach
-pub val CHECK_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool;
-```
-
-SEL rows check accepts: every row but `-o`, since nothing is written
-
-## val CHECK_SCHEMA_N
-
-```mach
-pub val CHECK_SCHEMA_N: usize = 3
-```
-
-length of CHECK_SCHEMA
-
-## val CHECK_SCHEMA
-
-```mach
-pub val CHECK_SCHEMA: [CHECK_SCHEMA_N]TableRef = [CHECK_SCHEMA_N]TableRef;
-```
-
-the option tables mach check accepts: SEL masked by CHECK_SEL_ACCEPTED, RDO and DIAG
-
-## val FMT_OWN_N
-
-```mach
-pub val FMT_OWN_N: usize = 1
-```
-
-length of FMT_OWN
-
-## val FMT_OWN
-
-```mach
-pub val FMT_OWN: [FMT_OWN_N]FlagSpec = [FMT_OWN_N]FlagSpec;
-```
-
-the options only mach fmt accepts
-
-## val FMT_SCHEMA_N
-
-```mach
-pub val FMT_SCHEMA_N: usize = 1
-```
-
-length of FMT_SCHEMA
-
-## val FMT_SCHEMA
-
-```mach
-pub val FMT_SCHEMA: [FMT_SCHEMA_N]TableRef = [FMT_SCHEMA_N]TableRef;
-```
-
-the option tables mach fmt accepts: FMT_OWN alone
-
-## val RUN_SEL_ACCEPTED
-
-```mach
-pub val RUN_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool;
-```
-
-SEL rows run accepts: every row but `--all`, since run executes one artifact
-
-## val RUN_SCHEMA_N
-
-```mach
-pub val RUN_SCHEMA_N: usize = 2
-```
-
-length of RUN_SCHEMA
-
-## val RUN_SCHEMA
-
-```mach
-pub val RUN_SCHEMA: [RUN_SCHEMA_N]TableRef = [RUN_SCHEMA_N]TableRef;
-```
-
-the option tables mach run accepts: SEL masked by RUN_SEL_ACCEPTED, and RUN_OWN
-
-## val TEST_SCHEMA_N
-
-```mach
-pub val TEST_SCHEMA_N: usize = 7
-```
-
-length of TEST_SCHEMA
-
-## val TEST_SCHEMA
-
-```mach
-pub val TEST_SCHEMA: [TEST_SCHEMA_N]TableRef = [TEST_SCHEMA_N]TableRef;
-```
-
-the option tables mach test accepts: SEL, RDO, CGEN, OPT, LINKIN, TEST_OWN, DIAG, all fully visible
-
-## val DOC_SEL_ACCEPTED
-
-```mach
-pub val DOC_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool;
-```
-
-SEL rows doc accepts: `--artifact`, `-a`, `--target`, `-t`, since doc renders one artifact
-
-## val DOC_RDO_ACCEPTED
-
-```mach
-pub val DOC_RDO_ACCEPTED: [RDO_N]bool = [RDO_N]bool;
-```
-
-RDO rows doc accepts: `--quiet` and `-q` only
-
-## val DOC_CGEN_ACCEPTED
-
-```mach
-pub val DOC_CGEN_ACCEPTED: [CGEN_N]bool = [CGEN_N]bool;
-```
-
-CGEN rows doc accepts: none
-
-## val DOC_SCHEMA_N
-
-```mach
-pub val DOC_SCHEMA_N: usize = 4
-```
-
-length of DOC_SCHEMA
-
-## val DOC_SCHEMA
-
-```mach
-pub val DOC_SCHEMA: [DOC_SCHEMA_N]TableRef = [DOC_SCHEMA_N]TableRef;
-```
-
-the option tables mach doc accepts: SEL, RDO, CGEN under the DOC_*_ACCEPTED masks, and DOC_OWN
-
-## val INFO_SCHEMA_N
-
-```mach
-pub val INFO_SCHEMA_N: usize = 1
-```
-
-length of INFO_SCHEMA
-
-## val INFO_SCHEMA
-
-```mach
-pub val INFO_SCHEMA: [INFO_SCHEMA_N]TableRef = [INFO_SCHEMA_N]TableRef;
-```
-
-the option tables mach info accepts: INFO
-
-## val INIT_SCHEMA_N
-
-```mach
-pub val INIT_SCHEMA_N: usize = 1
-```
-
-length of INIT_SCHEMA
-
-## val INIT_SCHEMA
-
-```mach
-pub val INIT_SCHEMA: [INIT_SCHEMA_N]TableRef = [INIT_SCHEMA_N]TableRef;
-```
-
-the option tables mach init accepts: INIT
-
-## val DEP_SCHEMA_N
-
-```mach
-pub val DEP_SCHEMA_N: usize = 1
-```
-
-length of DEP_SCHEMA
-
-## val DEP_SCHEMA
-
-```mach
-pub val DEP_SCHEMA: [DEP_SCHEMA_N]TableRef = [DEP_SCHEMA_N]TableRef;
-```
-
-the option tables every mach dep action accepts: QUIET; an action's own tables come from DEP_ACTIONS
-
-## val DEP_ADD_SCHEMA_N
-
-```mach
-pub val DEP_ADD_SCHEMA_N: usize = 1
-```
-
-length of DEP_ADD_SCHEMA
-
-## val DEP_ADD_SCHEMA
-
-```mach
-pub val DEP_ADD_SCHEMA: [DEP_ADD_SCHEMA_N]TableRef = [DEP_ADD_SCHEMA_N]TableRef;
-```
-
-the option tables specific to dep add: DEP_ADD
-
-## val DEP_REMOVE_SCHEMA_N
-
-```mach
-pub val DEP_REMOVE_SCHEMA_N: usize = 1
-```
-
-length of DEP_REMOVE_SCHEMA
-
-## val DEP_REMOVE_SCHEMA
-
-```mach
-pub val DEP_REMOVE_SCHEMA: [DEP_REMOVE_SCHEMA_N]TableRef = [DEP_REMOVE_SCHEMA_N]TableRef;
-```
-
-the option tables specific to dep remove: DEP_REMOVE
-
-## val DEP_UPDATE_SCHEMA_N
-
-```mach
-pub val DEP_UPDATE_SCHEMA_N: usize = 1
-```
-
-length of DEP_UPDATE_SCHEMA
-
-## val DEP_UPDATE_SCHEMA
-
-```mach
-pub val DEP_UPDATE_SCHEMA: [DEP_UPDATE_SCHEMA_N]TableRef = [DEP_UPDATE_SCHEMA_N]TableRef;
-```
-
-the option tables specific to dep update: DEP_UPDATE
-
-## val DEP_VERIFY_SCHEMA_N
-
-```mach
-pub val DEP_VERIFY_SCHEMA_N: usize = 1
-```
-
-length of DEP_VERIFY_SCHEMA
-
-## val DEP_VERIFY_SCHEMA
-
-```mach
-pub val DEP_VERIFY_SCHEMA: [DEP_VERIFY_SCHEMA_N]TableRef = [DEP_VERIFY_SCHEMA_N]TableRef;
-```
-
-the option tables specific to dep verify: DEP_VERIFY
-
-## val DEP_OUTDATED_SCHEMA_N
-
-```mach
-pub val DEP_OUTDATED_SCHEMA_N: usize = 1
-```
-
-length of DEP_OUTDATED_SCHEMA
-
-## val DEP_OUTDATED_SCHEMA
-
-```mach
-pub val DEP_OUTDATED_SCHEMA: [DEP_OUTDATED_SCHEMA_N]TableRef = [DEP_OUTDATED_SCHEMA_N]TableRef;
-```
-
-the option tables specific to dep outdated: DEP_OUTDATED
-
-## val DEP_ADD_CONSTRAINT_N
-
-```mach
-pub val DEP_ADD_CONSTRAINT_N: usize = 3
-```
-
-length of DEP_ADD_CONSTRAINT
-
-## val DEP_ADD_CONSTRAINT
-
-```mach
-pub val DEP_ADD_CONSTRAINT: [DEP_ADD_CONSTRAINT_N]str = [DEP_ADD_CONSTRAINT_N]str;
-```
-
-the constraint sentences help prints for dep add; the dep command enforces them, this module does not
-
-## val DEP_UPDATE_CONSTRAINT_N
-
-```mach
-pub val DEP_UPDATE_CONSTRAINT_N: usize = 1
-```
-
-length of DEP_UPDATE_CONSTRAINT
-
-## val DEP_UPDATE_CONSTRAINT
-
-```mach
-pub val DEP_UPDATE_CONSTRAINT: [DEP_UPDATE_CONSTRAINT_N]str = [DEP_UPDATE_CONSTRAINT_N]str;
-```
-
-the constraint sentence help prints for dep update; the dep command enforces it, this module does not
-
-## val CHECK_EXIT_N
-
-```mach
-pub val CHECK_EXIT_N: usize = 1
-```
-
-length of CHECK_EXIT
-
-## val CHECK_EXIT
-
-```mach
-pub val CHECK_EXIT: [CHECK_EXIT_N]exit.Note = [CHECK_EXIT_N]exit.Note;
-```
-
-the exit codes check documents beside exit.SHARED
-
-## val RUN_EXIT_N
-
-```mach
-pub val RUN_EXIT_N: usize = 2
-```
-
-length of RUN_EXIT
-
-## val RUN_EXIT
-
-```mach
-pub val RUN_EXIT: [RUN_EXIT_N]exit.Note = [RUN_EXIT_N]exit.Note;
-```
-
-the exit codes run documents beside exit.SHARED
-
-## val TEST_EXIT_N
-
-```mach
-pub val TEST_EXIT_N: usize = 1
-```
-
-length of TEST_EXIT
-
-## val TEST_EXIT
-
-```mach
-pub val TEST_EXIT: [TEST_EXIT_N]exit.Note = [TEST_EXIT_N]exit.Note;
-```
-
-the exit codes test documents beside exit.SHARED
-
-## val FMT_EXIT_N
-
-```mach
-pub val FMT_EXIT_N: usize = 1
-```
-
-length of FMT_EXIT
-
-## val FMT_EXIT
-
-```mach
-pub val FMT_EXIT: [FMT_EXIT_N]exit.Note = [FMT_EXIT_N]exit.Note;
-```
-
-the exit codes fmt documents beside exit.SHARED
-
-## val DEP_VERIFY_EXIT_N
-
-```mach
-pub val DEP_VERIFY_EXIT_N: usize = 1
-```
-
-length of DEP_VERIFY_EXIT
-
-## val DEP_VERIFY_EXIT
-
-```mach
-pub val DEP_VERIFY_EXIT: [DEP_VERIFY_EXIT_N]exit.Note = [DEP_VERIFY_EXIT_N]exit.Note;
-```
-
-the exit codes dep verify documents beside exit.SHARED
-
-## rec DepActionSpec
-
-```mach
-pub rec DepActionSpec;
-```
-
-one dep action record as DEP_ACTIONS declares it; help renders every field
-
-name: the action word after `dep`
-id: the DepAction value
-grammar: the argument grammar help appends after the action name, leading space included
-effect: one-sentence description
-exits: the action's own exit notes beside exit.SHARED; nil when exit_n is 0
-exit_n: length of exits
-tables: the action's own option tables, searched after DEP_SCHEMA; nil when table_n is 0
-table_n: length of tables
-constraints: constraint sentences for help; nil when constraint_n is 0
-constraint_n: length of constraints
-examples: example lines for help; nil when example_n is 0
-example_n: length of examples
-
-## val DEP_ACTIONS
-
-```mach
-pub val DEP_ACTIONS: [DEPACT_N]DepActionSpec = [DEPACT_N]DepActionSpec;
-```
-
-the seven dep action records: list, add, remove, update, outdated, pull, verify.
-Indexed by search, not by DepAction
-
-## val BUILD_CONSTRAINT_N
-
-```mach
-pub val BUILD_CONSTRAINT_N: usize = 6
-```
-
-length of BUILD_CONSTRAINT
-
-## val BUILD_CONSTRAINT
-
-```mach
-pub val BUILD_CONSTRAINT: [BUILD_CONSTRAINT_N]str = [BUILD_CONSTRAINT_N]str;
-```
-
-the constraint sentences help prints for build and check; the first is
-enforced by build_cli_invocation, the second by manifest.resolve_cells, the
-third and fourth by the build command, the fifth by the build plan's output
-path, the sixth by readout_allowed
-
-## val SELECTOR_CONSTRAINT
-
-```mach
-pub val SELECTOR_CONSTRAINT: str = "-a, -t and -p take an exact name, which must be declared, or a glob with * and ?, which must match
-```
-
-the rule every selector keeps, shared by the constraint tables
-
-## val TEST_CONSTRAINT_N
-
-```mach
-pub val TEST_CONSTRAINT_N: usize = 5
-```
-
-length of TEST_CONSTRAINT
-
-## val TEST_CONSTRAINT
-
-```mach
-pub val TEST_CONSTRAINT: [TEST_CONSTRAINT_N]str = [TEST_CONSTRAINT_N]str;
-```
-
-the constraint sentences help prints for test; enforced by
-build_cli_invocation, manifest.resolve_cells, the test command and readout_allowed
-
-## val CHECK_CONSTRAINT_N
-
-```mach
-pub val CHECK_CONSTRAINT_N: usize = 3
-```
-
-length of CHECK_CONSTRAINT
-
-## val CHECK_CONSTRAINT
-
-```mach
-pub val CHECK_CONSTRAINT: [CHECK_CONSTRAINT_N]str = [CHECK_CONSTRAINT_N]str;
-```
-
-the constraint sentences help prints for check
-
-## val RUN_CONSTRAINT_N
-
-```mach
-pub val RUN_CONSTRAINT_N: usize = 2
-```
-
-length of RUN_CONSTRAINT
-
-## val RUN_CONSTRAINT
-
-```mach
-pub val RUN_CONSTRAINT: [RUN_CONSTRAINT_N]str = [RUN_CONSTRAINT_N]str;
-```
-
-the constraint sentences help prints for run; the second is enforced by the run command
-
-## val DOC_CONSTRAINT_N
-
-```mach
-pub val DOC_CONSTRAINT_N: usize = 2
-```
-
-length of DOC_CONSTRAINT
-
-## val DOC_CONSTRAINT
-
-```mach
-pub val DOC_CONSTRAINT: [DOC_CONSTRAINT_N]str = [DOC_CONSTRAINT_N]str;
-```
-
-the constraint sentences help prints for doc; the second is enforced by the doc command
-
-## val INFO_CONSTRAINT_N
-
-```mach
-pub val INFO_CONSTRAINT_N: usize = 1
-```
-
-length of INFO_CONSTRAINT
-
-## val INFO_CONSTRAINT
-
-```mach
-pub val INFO_CONSTRAINT: [INFO_CONSTRAINT_N]str = [INFO_CONSTRAINT_N]str;
-```
-
-the constraint sentence help prints for info; the info command enforces it, this module does not
-
-## rec CommandSpec
-
-```mach
-pub rec CommandSpec;
-```
-
-one command record as COMMANDS declares it; parse_invocation reads
-pos_start, truncate_at_sep, has_action, and tables, help renders the rest
-
-name: the command word at argv[1]
-aliases: alternative command words; nil when alias_n is 0
-alias_n: length of aliases
-id: the CommandId value
-grammar: the argument grammar help appends after the name, leading space included
-summary: one-line description for the overview
-effect: one-sentence description for the command page
-exits: the command's own exit notes beside exit.SHARED; nil when exit_n is 0
-exit_n: length of exits
-terminator: help text for what follows `--`; empty when the command has none
-tables: the option tables the command accepts; nil when table_n is 0
-table_n: length of tables
-constraints: constraint sentences for help; nil when constraint_n is 0
-constraint_n: length of constraints
-pos_start: first argv index parse_invocation scans: 2 after the command word, 3 after a dep action word
-truncate_at_sep: stop scanning at the first `--`, so later tokens are neither options nor positionals
-has_action: argv[2] names a DepAction
-examples: example lines for help; nil when example_n is 0
-example_n: length of examples
-
-## val COMMANDS
-
-```mach
-pub val COMMANDS: [CMD_N]CommandSpec = [CMD_N]CommandSpec;
-```
-
-the ten command records in help order: build, check, run, test, clean, dep,
-init, doc, info, help. Indexed by search, not by CommandId
-
-## fun command_lookup
-
-```mach
-pub fun command_lookup(name: str) opt[CommandId];
-```
-
-the CommandId whose record has name as its name or one of its aliases
-
-name: a command word
-ret: some id, or none when no record matches
-
-## fun command_spec
-
-```mach
-pub fun command_spec(id: CommandId) *CommandSpec;
-```
-
-the COMMANDS record carrying id
-
-id: a CommandId
-ret: the record, or nil when no record carries id (CMD_NONE always)
-
-## fun dep_action_lookup
-
-```mach
-pub fun dep_action_lookup(name: str) opt[DepAction];
-```
-
-the DepAction whose record has name as its name; aliases are separate records with their own name
-
-name: an action word
-ret: some action, or none when no record matches
-
-## fun dep_action_spec
-
-```mach
-pub fun dep_action_spec(id: DepAction) *DepActionSpec;
-```
-
-the DEP_ACTIONS record carrying id
-
-id: a DepAction
-ret: the record, or nil when no record carries id (DEPACT_NONE always)
-
-## fun schema_for
-
-```mach
-pub fun schema_for(id: CommandId, action: DepAction, out: **TableRef, out_n: *usize, extra: **TableRef, extra_n: *usize);
-```
-
-the option tables a command and action accept. All four outputs are zeroed
-first; an unknown id leaves them zeroed, and extra is filled only when the
-command has actions, action is not DEPACT_NONE, and action has a record
-
-id: the command
-action: the dep action, or DEPACT_NONE
-out: receives the command's tables
-out_n: receives the length of out
-extra: receives the action's own tables
-extra_n: receives the length of extra
-
-## fun table_accepts
-
-```mach
-pub fun table_accepts(t: *TableRef, j: usize) bool;
-```
-
-## fun schema_valid
-
-```mach
-pub fun schema_valid() bool;
-```
-
-whether COMMANDS and DEP_ACTIONS are well formed: every record has a name,
-summary or effect, and exit notes that keep to exit.notes_valid; each count
-field is zero exactly when its pointer is nil; every option row has a name
-and doc; ids and names are unique; every alias resolves to its own record
-and collides with no name or other alias; every option spelling and every
-alias_of target occurs exactly once across a command's tables, and across
-the dep tables joined with each action's tables; the dep record has has_action. help refuses to
-render when this is false
-
-ret: true when every check passes
-
-## rec SchemaHit
-
-```mach
-pub rec SchemaHit;
-```
-
-the result of looking one argv token up in a schema
-
-found: the token names an option of the schema
-arity: the matched row's arity; ARITY_FLAG when not found
-key: the row's SemanticKey; 0 when not found
-value_off: byte offset of the attached value inside the token; 0 when the token carried none
-
-## fun schema_lookup
-
-```mach
-pub fun schema_lookup(id: CommandId, action: DepAction, tok: str) SchemaHit;
-```
-
-look tok up in the tables of id and action, the command's own tables before
-the action's
-
-id: the command
-action: the dep action, or DEPACT_NONE to search the command's tables only
-tok: an argv token
-ret: the hit; found false with arity ARITY_FLAG and key 0 when tok is not an option there
-
-## rec Occurrence
-
-```mach
-pub rec Occurrence;
-```
-
-one recognized option in argv
-
-key: the row's SemanticKey
-idx: argv index of the option token
-has_value: a value token followed within the scanned range, or an ARITY_ATTACHED option carried one after `=`
-value_idx: argv index of the value token, or idx when has_value is false
-value_off: byte offset of the value inside argv[value_idx]; non-zero only for an ARITY_ATTACHED option
-
-## rec ParsedInvocation
-
-```mach
-pub rec ParsedInvocation;
-```
-
-argv classified against the command schema by parse_invocation. The three
-arrays are argc long and owned by the invocation; dnit_invocation frees
-them
-
-argc: length of argv
-command: the recognized command, or CMD_NONE
-has_command: argv[1] named a command
-action: the recognized dep action, or DEPACT_NONE
-has_action: argv[2] named a dep action
-sep_idx: index of the first `--` when the command truncates there, else argc
-marks: true at every recognized option token and its value token; nil when parsing stopped before scanning
-occ: recognized options in argv order; nil when parsing stopped before scanning
-occ_len: length of occ in use
-positional_idx: argv index of the first positional, or argc when none
-positional_count: number of positionals
-positional_idxs: argv indices of the positionals in order; nil when parsing stopped before scanning
-has_positional: at least one positional
-unknown_idx: argv index of the first unrecognized token that starts with `-`, or argc when none
-has_unknown: at least one unrecognized flag-shaped token
-
-## fun dnit_invocation
-
-```mach
-pub fun dnit_invocation(a: *A.Allocator, inv: *ParsedInvocation);
-```
-
-free the arrays parse_invocation allocated; nil arrays are skipped
-
-a: the allocator parse_invocation was given
-inv: the invocation
-
-## fun parse_invocation
-
-```mach
-pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInvocation, outcome.Fail];
-```
-
-classify argv against the command schema: recognize the command at argv[1]
-and, for dep, the action at argv[2], then scan from the command's pos_start
-to the end or to the first `--` when the command truncates there. A
-recognized value option claims the next token as its value when one is
-in range. Every other token starting with `-` is unknown; the rest are
-positionals. `-O1` is not in any table and so parses as unknown
-
-a: allocator for the invocation's three arrays
-argc: length of argv
-argv: the argument vector, program name at argv[0]
-ret: the invocation. argc below 2, an unrecognized command word, or an unrecognized dep action word return early with has_command or has_action false and every array nil. err on allocation failure, or when the command has no record
-
-## fun invocation_flag
-
+the flags commands share, the policy a line is held to, and a build's typed arguments
+
+a build-shaped command's line becomes `CliArgs` here, each value typed as the request
+reads it. `run` reports a refused line or flag combination in the format `--report`
+selects, or runs the command's handler, and an option a previous major took is refused
+by name with what replaced it.
+
+Source: [`src/cli/args.mach`](../../../src/cli/args.mach)
+
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.cli.diagnostic`](diagnostic.md), [`mach.compile.entry`](../compile/entry.md), [`mach.compile.request`](../compile/request.md), [`mach.manifest.select`](../manifest/select.md), [`mach.manifest.setting`](../manifest/setting.md).
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`CliArgs`](#cliargs) | `rec` | the typed options of a build-shaped command: what it reports and selects, and what it sets over the profile it builds |
+| [`EntryArgs`](#entryargs) | `rec` | what an entry build's command line states: its entry, source roots, artifact kind, target narrowing and the levers its profile takes |
+| [`Removed`](#removed) | `rec` | a spelling an earlier version took, refused by name with what replaced it |
+| [`Conflict`](#conflict) | `rec` | two flags a command refuses together |
+| [`Policy`](#policy) | `rec` | what mach holds a command's line to beyond what std.args parses |
+| [`Call`](#call) | `rec` | what dispatch hands a command's handler; dispatch owns every member and outlives the call |
+
+| On `CliArgs` | |
+| :--- | :--- |
+| [`build_cli_invocation`](#build_cli_invocation) | the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors, and the overrides, each typed as the request reads it: `-o` and `-w` as raw argument pointers or nil, the LEVERS as given, `--threads` as a count or 0 when absent |
+| [`collect_link_inputs`](#collect_link_inputs) | fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs |
+
+| On `EntryArgs` | |
+| :--- | :--- |
+| [`entry_stated`](#entry_stated) | whether the command line states anything only an entry build takes |
+
+| On `Removed` | |
+| :--- | :--- |
+| [`removed_in`](#removed_in) | whether the removed spelling `row` stands in an invocation whose leading words after `mach` are `path`, as `dep add . regex`: a row for every command does, and a row for one command only within that command |
+
+| On `Policy` | |
+| :--- | :--- |
+| [`refusal`](#refusal) | a parsed line's refusal as a failure, in mach's words where mach knows more of the option than the parser and the parser's words otherwise |
+| [`run`](#run) | run a parsed line and report how it ended through one report, in the format `--report` selects, human when that format is itself malformed: its refusal when it holds one, then a flag combination the command refuses, otherwise the handler, given an arena this call owns |
+| [`refuse`](#refuse) | report a parsed line's refusal through one report, in the format `--report` selects, human when that format is itself malformed |
+
+| Functions | |
+| :--- | :--- |
+| [`operand`](#operand) | the operand at a position among a line's operands |
+| [`value`](#value) | the value a flag was last given |
+| [`values`](#values) | every value a flag was given, in argument order |
+| [`serve`](#serve) | run a handler over a parsed line whatever it is refused for, reporting through one report in the format `--report` selects, as `--help` does in place of the command it follows |
+| [`collect_selectors`](#collect_selectors) | the `-a`, `-t` and `-p` patterns and `--all` an invocation was given |
+| [`selection_hint`](#selection_hint) | a selection refusal whose unknown value names a path in the working directory, restated as the shell's expansion of an unquoted wildcard it almost always is; any other failure is returned as given |
+
+| Constants | |
+| :--- | :--- |
+| [`EMIT_KIND_ASM`](#constants) | masc's listing of each module, beside its object |
+| [`EMIT_KIND_IR`](#constants) | mirl's text of each module, beside its object |
+| [`EMIT_KIND_OBJ`](#constants) | the objects, with no link |
+| [`EMIT_KIND_EXE`](#constants) | the linked artifact |
+| [`EMIT_ERROR`](#constants) | the refusal of an `--emit` value no product is named by |
+| [`ARTIFACT`](#constants) | `--artifact <pattern>`, `-a`, a selector |
+| [`TARGET`](#constants) | `--target <pattern>`, `-t`, a selector, or an entry build's target |
+| [`PROFILE`](#constants) | `--profile <pattern>`, `-p`, a selector |
+| [`ALL`](#constants) | `--all`, which fills every selector not given with `*` |
+| [`OUTPUT`](#constants) | `-o <path>`, the linked artifact's path |
+| [`VERBOSE`](#constants) | `--verbose`, `-v`, once for each build phase's row and twice, as `-vv`, for each module or file as well; what each readout level shows is the readout contract, doc/language/readout.md |
+| [`QUIET`](#constants) | `--quiet`, `-q` |
+| [`SET`](#constants) | `--set <key=value>`, a manifest key over every table of its section |
+| [`VERIFY`](#constants) | `--verify`, mach's and mirl's verifiers over every lowered module |
+| [`OPTIMIZE`](#constants) | `--optimize`, `-O`, the profile's `optimize = true` for this invocation, and `--no-optimize`, its `optimize = false` |
+| [`DEBUG`](#constants) | `--debug`, the profile's `debug = true` for this invocation, and `--no-debug`, its `debug = false` |
+| [`SOURCE`](#constants) | `--source <name=dir>`, a source root of an entry build |
+| [`KIND`](#constants) | `--kind <product>`, `-k`, the product of an entry build's artifact, by mink's name for it |
+| [`LINKAGE`](#constants) | `--linkage <linkage>`, how an entry build's executable is linked, by mink's name for it |
+| [`ENV`](#constants) | `--env <name>` |
+| [`ABI`](#constants) | `--abi <name>` |
+| [`ISA`](#constants) | `--isa <selection>` |
+| [`EXT`](#constants) | `--ext <name>` |
+| [`CODE_MODEL`](#constants) | `--code-model <name>` |
+| [`WORK`](#constants) | `-w <path>`, the work directory |
+| [`EMIT`](#constants) | `--emit <kind>`, once per product |
+| [`THREADS`](#constants) | `--threads <n>` |
+| [`LIB_DIR`](#constants) | `--library-dir <dir>`, `-L` |
+| [`LIB`](#constants) | `--library <name>`, `-l` |
+| [`DEP_WARNINGS`](#constants) | `--dep-warnings` |
+| [`NO_CACHE`](#constants) | `--no-cache` |
+| [`REPORT`](#constants) | `--report <human\|json\|lines>`: how everything a command reports reaches stderr: human text, or its records |
+| [`PASSES`](#constants) | `--passes`: each module's report of the optimisation passes that changed each of its functions, which mirl writes |
+| [`PLAN`](#constants) | `--plan` |
+| [`HELP`](#constants) | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
+| [`VERSION`](#constants) | `--version`, the compiler's version alone on one line |
+| [`RUNNER`](#constants) | `--runner <cmd>` |
+| [`TIMEOUT`](#constants) | `--timeout <duration>` |
+| [`ALLOW_UNRUNNABLE`](#constants) | `--allow-unrunnable` |
+| [`OFFLINE`](#constants) | `--offline` |
+| [`REMOVED_N`](#constants) | row count of REMOVED |
+| [`REMOVED`](#constants) | the options a previous major took, each refused by name with what to write instead |
+| [`NO_WORDS`](#constants) | no words, for a command with no aliases |
+| [`NO_COMMANDS`](#constants) | no commands, for a command nothing is nested under |
+| [`NO_FLAGS`](#constants) | no flags |
+| [`NO_CONFLICTS`](#constants) | no conflicts of a command's own |
+
+---
+
+## CliArgs
+
 ```mach
-pub fun invocation_flag(cmd: CommandId, inv: *ParsedInvocation, flag: str) bool;
+pub rec CliArgs {
+    verbosity: u8;
+    quiet:     bool;
+    selectors: mach.manifest.select.Selectors;
+    overrides: mach.compile.request.Overrides;
+    settings:  Vector[mach.manifest.setting.Assignment];
+    emits:     u8;
+    entry:     EntryArgs;
+}
 ```
-
-whether flag occurred, looked up in cmd's own tables only, never an action's
 
-cmd: the command
-inv: the parsed invocation
-flag: the option spelling
-ret: true when some occurrence carries the flag's key
+the typed options of a build-shaped command: what it reports and selects, and
+what it sets over the profile it builds
 
-## fun invocation_value
+| Field | Type | |
+| :--- | :--- | :--- |
+| `verbosity` | `u8` | 0, 1 or 2 from `-v` and `-vv` |
+| `quiet` | `bool` | `--quiet` |
+| `selectors` | `mach.manifest.select.Selectors` | the `-a`, `-t` and `-p` patterns and `--all` |
+| `overrides` | `mach.compile.request.Overrides` | everything else the command sets, typed |
+| `settings` | `Vector[mach.manifest.setting.Assignment]` | every `--set`, in argv order |
+| `emits` | `u8` | the EMIT_KIND_* bits `--emit` names, 0 when it is absent |
+| `entry` | `EntryArgs` | what the command line states of an entry build |
 
-```mach
-pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) opt[*u8];
-```
+### build_cli_invocation
 
-## fun diagnostics_format
-
 ```mach
-pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diag.Format, outcome.Fail];
+pub fun build_cli_invocation(a: *std.allocator.Allocator, inv: *std.args.Parsed) res[CliArgs, mach.base.fail.Fail]
 ```
 
-the diagnostics format `--diagnostics=<human|json>` selects for a command
-that takes the DIAG table; human when the option is absent
+the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors,
+and the overrides, each typed as the request reads it: `-o` and `-w` as raw argument
+pointers or nil, the LEVERS as given, `--threads` as a count or 0 when absent.
+include_deps is false for the command to set, and link_tokens and lib_dirs are
+left empty for collect_link_inputs
 
-cmd: the command
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: the format, or a user failure for a bare `--diagnostics` or any other value
+| Parameter | |
+| :--- | :--- |
+| `a` | backs the selector patterns and the name lists |
+| `inv` | the invocation |
+| **returns** | the arguments; err when a vector cannot grow or a value names nothing its flag takes |
 
-## fun readout_allowed
+### collect_link_inputs
 
 ```mach
-pub fun readout_allowed(c: *request.CliArgs, format: cli_diag.Format) err[outcome.Fail];
+pub fun collect_link_inputs(a: *std.allocator.Allocator, c: *CliArgs, inv: *std.args.Parsed) err[mach.base.fail.Fail]
 ```
 
-`-v` and `-vv` render the phase readout to stderr as text, which a json run
-keeps to records
+fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every
+operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs. an operand
+input.token_is_path does not accept names no link input and is refused. both vectors are
+reinitialised first
 
-c: the command's arguments
-format: the diagnostics format
-ret: ok, or a user failure when a readout is asked for under json
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for the two vectors |
+| `c` | the arguments to fill |
+| `inv` | the invocation |
+| **returns** | ok, or err when an operand names no link input or a push fails |
 
-## fun invocation_values
+## EntryArgs
 
 ```mach
-pub fun invocation_values(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) res[Vector[str], outcome.Fail];
+pub rec EntryArgs {
+    file:      str;
+    sources:   Vector[str];
+    kind:      str;
+    linkage:   str;
+    target:    str;
+    narrowing: mach.compile.entry.Narrowing;
+    exts:      Vector[str];
+    optimize:  bool;
+    debug:     bool;
+}
 ```
 
-every value given to flag or to an alias of it, in argv order
+what an entry build's command line states: its entry, source roots, artifact kind, target
+narrowing and the levers its profile takes
 
-a: backs the vector
-cmd: the command
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-flag: the canonical spelling
-ret: the values; err when an occurrence has no value
+| Field | Type | |
+| :--- | :--- | :--- |
+| `file` | `str` | the entry operand, nil for a project build |
+| `sources` | `Vector[str]` | every `--source` value, `name=dir` as written |
+| `kind` | `str` | the `--kind` value, nil when absent |
+| `target` | `str` | the `-t` value, the target as `<sys>-<arch>`, nil when absent |
+| `narrowing` | `mach.compile.entry.Narrowing` | the narrowing flags, each as written |
+| `exts` | `Vector[str]` | every `--ext` value, in argv order |
+| `optimize` | `bool` | the profile an entry build states optimizes |
+| `debug` | `bool` | the profile an entry build states emits debug information |
 
-## fun collect_selectors
+### entry_stated
 
 ```mach
-pub fun collect_selectors(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, outcome.Fail];
+pub fun entry_stated(e: *EntryArgs) bool
 ```
 
-the `-a`, `-t` and `-p` patterns and `--all` a command was given
+whether the command line states anything only an entry build takes
 
-a: backs the pattern vectors
-cmd: the command
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: the selectors; err when a selector has no value
+| Parameter | |
+| :--- | :--- |
+| `e` | the entry arguments |
+| **returns** | true when a source root, a kind, a linkage or a narrowing flag is given |
 
-## fun build_cli_invocation
+## Removed
 
 ```mach
-pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, outcome.Fail];
+pub rec Removed {
+    command: str;
+    name:    str;
+    use:     str;
+}
 ```
 
-the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2
-from `-v` and `-vv`, quiet from `--quiet` or `-q`, the CGEN flags, the
-selectors, `-o` and `--jobs` as raw argv pointers or nil, opt_set and
-opt_release from `-O0` and `-O2` with `-O0` winning when both occur,
-include_deps. link_tokens and lib_dirs are left empty for collect_link_inputs
+a spelling an earlier version took, refused by name with what replaced it
 
-a: backs the selector patterns
-cmd: the command
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: the arguments, or err when `-v` or `-vv` is combined with `--quiet` or `-q`
-      or a selector has no value
+| Field | Type | |
+| :--- | :--- | :--- |
+| `command` | `str` | the command it was removed from, its words after `mach` as `dep add`, "" for every command |
+| `name` | `str` | the spelling, `--name` or `-c` |
+| `use` | `str` | what to write instead |
 
-## fun collect_link_inputs
+### removed_in
 
 ```mach
-pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) err[outcome.Fail];
+pub fun removed_in(row: *Removed, path: str) bool
 ```
-
-fill c.link_tokens and c.lib_dirs in command-line order: every `-l` value and
-every bare positional after the first that request.is_object_path accepts go
-to link_tokens, every `-L` value to lib_dirs. Both vectors are reinitialised
-with a first
 
-a: allocator for the two vectors
-c: the arguments to fill
-cmd: the command
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: ok, or err when a push fails
+whether the removed spelling `row` stands in an invocation whose leading words after `mach` are
+`path`, as `dep add . regex`: a row for every command does, and a row for one command only
+within that command
 
-## rec InitInvocation
+## Conflict
 
 ```mach
-pub rec InitInvocation;
+pub rec Conflict {
+    flag:  *std.args.Flag;
+    other: *std.args.Flag;
+}
 ```
 
-the typed arguments of mach init
+two flags a command refuses together
 
-has_dir: a positional directory was given
-dir_idx: argv index of that directory
-has_name: `--name` occurred with a value
-name_idx: argv index of the name value
-force: `--force`
-is_lib: `--lib`
-no_deps: `--no-deps`
-no_git: `--no-git`
-quiet: `--quiet` or `-q`
+## Policy
 
-## fun build_init_invocation
-
 ```mach
-pub fun build_init_invocation(inv: *ParsedInvocation, argv: **u8) InitInvocation;
+pub rec Policy {
+    refused:   Slice[*std.args.Flag];
+    refusal:   str;
+    conflicts: Slice[Conflict];
+}
 ```
 
-read the init arguments out of a parsed invocation; the directory is the
-first positional
+what mach holds a command's line to beyond what std.args parses
 
-inv: the parsed invocation
-argv: the argument vector inv was parsed from; not read
-ret: the arguments
+| Field | Type | |
+| :--- | :--- | :--- |
+| `refused` | `Slice[*std.args.Flag]` | flags it recognizes only to refuse, by refusal |
+| `refusal` | `str` | why it refuses them |
+| `conflicts` | `Slice[Conflict]` | pairs of its flags it refuses together |
 
-## fun removed_option_message
+### refusal
 
 ```mach
-pub fun removed_option_message(tok: str) opt[str];
+pub fun refusal(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy) mach.base.fail.Fail
 ```
 
-the removal message for an option that used to exist, so every command refuses it the same way
+a parsed line's refusal as a failure, in mach's words where mach knows more of the option than
+the parser and the parser's words otherwise
 
-tok: the flag-shaped token
-ret: the message when `tok` names a removed option
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the text |
+| `inv` | the parsed line, which holds a refusal |
+| `policy` | the matched command's policy |
+| **returns** | a user failure of the refusal's kind |
 
-## fun unknown_flag
+### run
 
 ```mach
-pub fun unknown_flag(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, cmd: str) opt[outcome.Fail];
+pub fun run(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy, handler: fun(*Call) res[i64, mach.base.fail.Fail]) i64
 ```
 
-the refusal of the first unrecognized flag-shaped token: `cli.flag_unknown`, or
-`cli.flag_removed` with the removal message when the token names a removed option
+run a parsed line and report how it ended through one report, in the format `--report`
+selects, human when that format is itself malformed: its refusal when it holds one, then a flag
+combination the command refuses, otherwise the handler, given an arena this call owns. a
+failure the handler returns is reported here
 
-a: owns the message
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-cmd: the command name the message names
-ret: the refusal, or none when every token was recognized
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the refusal's text |
+| `inv` | the parsed line |
+| `policy` | the matched command's policy |
+| `handler` | what runs |
+| **returns** | the exit code |
 
-## fun reject_unknown_from_invocation
+### refuse
 
 ```mach
-pub fun reject_unknown_from_invocation(inv: *ParsedInvocation, argv: **u8, cmd: str) bool;
+pub fun refuse(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy) i64
 ```
 
-print the refusal `unknown_flag` names for the first unrecognized flag-shaped token
+report a parsed line's refusal through one report, in the format `--report` selects, human
+when that format is itself malformed
 
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-cmd: the command name printed in the message
-ret: true when an unknown token was reported, false when there was none
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the refusal's text |
+| `inv` | the parsed line, which holds a refusal |
+| `policy` | the matched command's policy |
+| **returns** | the exit code |
 
-## rec InfoInvocation
+## Call
 
 ```mach
-pub rec InfoInvocation;
+pub rec Call {
+    a:       *std.allocator.Allocator;
+    backing: *std.allocator.Allocator;
+    spans:   *std.allocator.heap.Pool;
+    inv:     *std.args.Parsed;
+    report:  *mach.cli.diagnostic.Report;
+    environ: std.process.exec.Environment;
+    # the texts the command's sessions read, which the failure it returns is located in
+    sources: *mach.base.source.SourceMap;
+}
 ```
-
-the typed arguments of mach info
-
-show_version: `--version` occurred
-show_targets: the sole positional was `targets`
-invalid_verb: a positional other than `targets` was given, or more than one positional
-
-## fun build_info_invocation
 
-```mach
-pub fun build_info_invocation(inv: *ParsedInvocation, argv: **u8) InfoInvocation;
-```
+what dispatch hands a command's handler; dispatch owns every member and outlives the call
 
-read the info arguments out of a parsed invocation
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*std.allocator.Allocator` | an arena dispatch releases once the handler returns, for what lives as long as the command |
+| `backing` | `*std.allocator.Allocator` | the heap under a, for what the command frees itself before it returns |
+| `spans` | `*std.allocator.heap.Pool` | the spans every heap of the command draws from and gives back to |
+| `inv` | `*std.args.Parsed` | the parsed command line |
+| `report` | `*mach.cli.diagnostic.Report` | where the command reports a failure it goes on past or that carries an origin, in the format `--report` selected |
+| `environ` | `std.process.exec.Environment` | the environment the command runs in, which the processes it starts inherit |
 
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: the arguments; `--version` together with `targets` sets both flags and is left for the command to refuse
+## Functions
 
-## rec CleanInvocation
+### operand
 
 ```mach
-pub rec CleanInvocation;
+pub fun operand(inv: *std.args.Parsed, n: usize) *u8
 ```
 
-the typed arguments of mach clean
+the operand at a position among a line's operands
 
-has_project: a positional project path was given
-project_idx: argv index of that path
+| Parameter | |
+| :--- | :--- |
+| `inv` | the parsed line |
+| `n` | the position, 0 the first |
+| **returns** | the operand, or nil when there are not that many |
 
-## fun build_clean_invocation
+### value
 
 ```mach
-pub fun build_clean_invocation(inv: *ParsedInvocation) CleanInvocation;
+pub fun value(inv: *std.args.Parsed, flag: *std.args.Flag) opt[*u8]
 ```
 
-read the clean arguments out of a parsed invocation; the project is the first positional
+the value a flag was last given
 
-inv: the parsed invocation
-ret: the arguments
+| Parameter | |
+| :--- | :--- |
+| `inv` | the parsed line |
+| `flag` | a flag that takes a value |
+| **returns** | the value, or none when the flag did not occur or occurred without one |
 
-## rec DocInvocation
+### values
 
 ```mach
-pub rec DocInvocation;
+pub fun values(a: *std.allocator.Allocator, inv: *std.args.Parsed, flag: *std.args.Flag) res[Vector[str], mach.base.fail.Fail]
 ```
 
-the typed arguments of mach doc
+every value a flag was given, in argument order
 
-has_out: `--out` occurred with a value
-out_idx: argv index of the out value
-quiet: `--quiet` or `-q`
-has_project: a positional project path was given
-project_idx: argv index of that path
+| Parameter | |
+| :--- | :--- |
+| `a` | backs the vector |
+| `inv` | the parsed line |
+| `flag` | the flag |
+| **returns** | the values, empty for a flag the command does not take; err when the vector cannot grow |
 
-## fun build_doc_invocation
+### serve
 
 ```mach
-pub fun build_doc_invocation(inv: *ParsedInvocation) DocInvocation;
+pub fun serve(inv: *std.args.Parsed, handler: fun(*Call) res[i64, mach.base.fail.Fail]) i64
 ```
 
-read the doc arguments out of a parsed invocation; the project is the first
-positional, and the last occurrence of a value option wins
+run a handler over a parsed line whatever it is refused for, reporting through one report in
+the format `--report` selects, as `--help` does in place of the command it follows
 
-inv: the parsed invocation
-ret: the arguments
+| Parameter | |
+| :--- | :--- |
+| `inv` | the parsed line |
+| `handler` | what runs |
+| **returns** | the exit code |
 
-## rec DepInvocation
+### collect_selectors
 
 ```mach
-pub rec DepInvocation;
+pub fun collect_selectors(a: *std.allocator.Allocator, inv: *std.args.Parsed) res[mach.manifest.select.Selectors, mach.base.fail.Fail]
 ```
 
-argv-backed dependency operands and options from the shared parser.
+the `-a`, `-t` and `-p` patterns and `--all` an invocation was given
 
-## fun build_dep_invocation
-
-```mach
-pub fun build_dep_invocation(inv: *ParsedInvocation, argv: **u8) DepInvocation;
-```
+| Parameter | |
+| :--- | :--- |
+| `a` | backs the pattern vectors |
+| `inv` | the invocation |
+| **returns** | the selectors; err when a vector cannot grow |
 
-## rec RunInvocation
+### selection_hint
 
 ```mach
-pub rec RunInvocation;
+pub fun selection_hint(a: *std.allocator.Allocator, selectors: *mach.manifest.select.Selectors, f: mach.base.fail.Fail) mach.base.fail.Fail
 ```
-
-the typed arguments of mach run beside its selectors; each value option is an index into argv
 
-has_output: `-o` occurred with a value
-output_idx: argv index of the output value
-output_seen: `-o` occurred at all, with or without a value
-has_runner: `--runner` occurred with a value
-runner_idx: argv index of the runner value
-has_timeout: `--timeout` occurred with a value
-timeout_idx: argv index of the timeout value
+a selection refusal whose unknown value names a path in the working directory,
+restated as the shell's expansion of an unquoted wildcard it almost always is;
+any other failure is returned as given
 
-## fun build_run_invocation
-
-```mach
-pub fun build_run_invocation(inv: *ParsedInvocation) RunInvocation;
-```
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the restated message |
+| `selectors` | the patterns the command was given |
+| `f` | the failure resolving them |
 
-read the run arguments out of a parsed invocation; the last occurrence of a
-value option wins, and a trailing `-o` without a value sets output_seen only
+## Constants
 
-inv: the parsed invocation
-ret: the arguments
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `EMIT_KIND_ASM` | `u8` | `1` | masc's listing of each module, beside its object |
+| `EMIT_KIND_IR` | `u8` | `2` | mirl's text of each module, beside its object |
+| `EMIT_KIND_OBJ` | `u8` | `4` | the objects, with no link |
+| `EMIT_KIND_EXE` | `u8` | `8` | the linked artifact |
+| `EMIT_ERROR` | `str` | `"--emit expects asm, ir, obj or exe"` | the refusal of an `--emit` value no product is named by |
+| `ARTIFACT` | `std.args.Flag` | `std_args.Flag{long: "artifact", short: 'a', value: "pattern", repeat: true, negatable: false, help: "select artifacts by name or glob (default: the default selection)"}` | `--artifact <pattern>`, `-a`, a selector |
+| `TARGET` | `std.args.Flag` | `std_args.Flag{long: "target", short: 't', value: "pattern", repeat: true, negatable: false, help: "which targets: a name or glob of the manifest's targets in a project, a <sys>-<arch> in an entry build (default: the host's)"}` | `--target <pattern>`, `-t`, a selector, or an entry build's target |
+| `PROFILE` | `std.args.Flag` | `std_args.Flag{long: "profile", short: 'p', value: "pattern", repeat: true, negatable: false, help: "select profiles by name or glob (default: the default profile)"}` | `--profile <pattern>`, `-p`, a selector |
+| `ALL` | `std.args.Flag` | `std_args.Flag{long: "all", short: 0, value: nil, repeat: false, negatable: false, help: "select every artifact, target and profile no selector narrows"}` | `--all`, which fills every selector not given with `*` |
+| `OUTPUT` | `std.args.Flag` | `std_args.Flag{long: "output", short: 'o', value: "path", repeat: false, negatable: false, help: "write the linked artifact to this path"}` | `-o <path>`, the linked artifact's path |
+| `VERBOSE` | `std.args.Flag` | `std_args.Flag{long: "verbose", short: 'v', value: nil, repeat: true, negatable: false, help: "show each phase as it closes, -vv each module too"}` | `--verbose`, `-v`, once for each build phase's row and twice, as `-vv`, for each module or file as well; what each readout level shows is the readout contract, doc/language/readout.md |
+| `QUIET` | `std.args.Flag` | `std_args.Flag{long: "quiet", short: 'q', value: nil, repeat: false, negatable: false, help: "suppress non-error output"}` | `--quiet`, `-q` |
+| `SET` | `std.args.Flag` | `std_args.Flag{long: "set", short: 0, value: "key=value", repeat: true, negatable: false, help: "set a manifest key for this invocation"}` | `--set <key=value>`, a manifest key over every table of its section |
+| `VERIFY` | `std.args.Flag` | `std_args.Flag{long: "verify", short: 0, value: nil, repeat: false, negatable: false, help: "run the module and code generation verifiers"}` | `--verify`, mach's and mirl's verifiers over every lowered module |
+| `OPTIMIZE` | `std.args.Flag` | `std_args.Flag{long: "optimize", short: 'O', value: nil, repeat: false, negatable: true, help: "optimize, or not with --no-optimize (default: the profile's)"}` | `--optimize`, `-O`, the profile's `optimize = true` for this invocation, and `--no-optimize`, its `optimize = false` |
+| `DEBUG` | `std.args.Flag` | `std_args.Flag{long: "debug", short: 0, value: nil, repeat: false, negatable: true, help: "emit debug information, or not with --no-debug (default: the profile's)"}` | `--debug`, the profile's `debug = true` for this invocation, and `--no-debug`, its `debug = false` |
+| `SOURCE` | `std.args.Flag` | `std_args.Flag{long: "source", short: 0, value: "name=dir", repeat: true, negatable: false, help: "bind a module prefix to a directory (default: the entry's directory)"}` | `--source <name=dir>`, a source root of an entry build |
+| `KIND` | `std.args.Flag` | `std_args.Flag{long: "kind", short: 'k', value: "bin\|static\|shared\|object\|module", repeat: false, negatable: false, help: "the product to make (default: bin)"}` | `--kind <product>`, `-k`, the product of an entry build's artifact, by mink's name for it |
+| `LINKAGE` | `std.args.Flag` | `std_args.Flag{long: "linkage", short: 0, value: "pie\|dynamic\|static", repeat: false, negatable: false, help: "how the executable links (default: the target's)"}` | `--linkage <linkage>`, how an entry build's executable is linked, by mink's name for it |
+| `ENV` | `std.args.Flag` | `std_args.Flag{long: "env", short: 0, value: "name", repeat: false, negatable: false, help: "the environment (default: the target's)"}` | `--env <name>` |
+| `ABI` | `std.args.Flag` | `std_args.Flag{long: "abi", short: 0, value: "name", repeat: false, negatable: false, help: "the calling convention (default: the target's)"}` | `--abi <name>` |
+| `ISA` | `std.args.Flag` | `std_args.Flag{long: "isa", short: 0, value: "selection", repeat: false, negatable: false, help: "the instruction set (default: the target's)"}` | `--isa <selection>` |
+| `EXT` | `std.args.Flag` | `std_args.Flag{long: "ext", short: 0, value: "name", repeat: true, negatable: false, help: "add an instruction set extension, once each"}` | `--ext <name>` |
+| `CODE_MODEL` | `std.args.Flag` | `std_args.Flag{long: "code-model", short: 0, value: "name", repeat: false, negatable: false, help: "the code model (default: the target's)"}` | `--code-model <name>` |
+| `WORK` | `std.args.Flag` | `std_args.Flag{long: "work-dir", short: 'w', value: "path", repeat: false, negatable: false, help: "the work directory (default: the project's)"}` | `-w <path>`, the work directory |
+| `EMIT` | `std.args.Flag` | `std_args.Flag{long: "emit", short: 0, value: "asm\|ir\|obj\|exe", repeat: true, negatable: false, help: "a product to write, once each (default: exe)"}` | `--emit <kind>`, once per product |
+| `THREADS` | `std.args.Flag` | `std_args.Flag{long: "threads", short: 0, value: "n", repeat: false, negatable: false, help: "how many threads a build compiles and links on, and test processes run at once (default: host CPUs)"}` | `--threads <n>` |
+| `LIB_DIR` | `std.args.Flag` | `std_args.Flag{long: "library-dir", short: 'L', value: "dir", repeat: true, negatable: false, help: "add a library search directory"}` | `--library-dir <dir>`, `-L` |
+| `LIB` | `std.args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
+| `DEP_WARNINGS` | `std.args.Flag` | `std_args.Flag{long: "dep-warnings", short: 0, value: nil, repeat: false, negatable: false, help: "also show dependencies' warnings, each under its own allow and #[expect]"}` | `--dep-warnings` |
+| `NO_CACHE` | `std.args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |
+| `REPORT` | `std.args.Flag` | `std_args.Flag{long: "report", short: 0, value: "human\|json\|lines", repeat: false, negatable: false, help: "report as human text, NDJSON records or tab-separated record lines (default: human)"}` | `--report <human\|json\|lines>`: how everything a command reports reaches stderr: human text, or its records |
+| `PASSES` | `std.args.Flag` | `std_args.Flag{long: "passes", short: 0, value: nil, repeat: false, negatable: false, help: "print each optimization pass that changed each function, and what it did"}` | `--passes`: each module's report of the optimisation passes that changed each of its functions, which mirl writes |
+| `PLAN` | `std.args.Flag` | `std_args.Flag{long: "plan", short: 0, value: nil, repeat: false, negatable: false, help: "print the build plan without building"}` | `--plan` |
+| `HELP` | `std.args.Flag` | `std_args.Flag{long: "help", short: 'h', value: nil, repeat: false, negatable: false, help: "show help"}` | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
+| `VERSION` | `std.args.Flag` | `std_args.Flag{long: "version", short: 0, value: nil, repeat: false, negatable: false, help: "print the version"}` | `--version`, the compiler's version alone on one line |
+| `RUNNER` | `std.args.Flag` | `std_args.Flag{long: "runner", short: 0, value: "cmd", repeat: false, negatable: false, help: "run through this command (default: the target's)"}` | `--runner <cmd>` |
+| `TIMEOUT` | `std.args.Flag` | `std_args.Flag{long: "timeout", short: 0, value: "duration", repeat: false, negatable: false, help: "stop after a duration such as 30s"}` | `--timeout <duration>` |
+| `ALLOW_UNRUNNABLE` | `std.args.Flag` | `std_args.Flag{long: "allow-unrunnable", short: 0, value: nil, repeat: false, negatable: false, help: "succeed when nothing selected can run on this host"}` | `--allow-unrunnable` |
+| `OFFLINE` | `std.args.Flag` | `std_args.Flag{long: "offline", short: 0, value: nil, repeat: false, negatable: false, help: "resolve from releases already fetched"}` | `--offline` |
+| `REMOVED_N` | `usize` | `20` | row count of REMOVED |
+| `REMOVED` | `[REMOVED_N]Removed` | `[REMOVED_N]Removed{ Removed{command: "", name: "-g", use: "--debug"}, Removed{command: "", name: "-d", use: "--debug"}, Removed{command: "", name: "-s", use: "--source"}, Removed{command: "", name: "-e", use: "--emit"}, Removed{command: "", name: "-O0", use: "--no-optimize"}, Removed{command: "", name: "-O2", use: "-O or --optimize"}, Removed{command: "", name: "--emit-asm", use: "--emit asm"}, Removed{command: "", name: "--emit-ir", use: "--emit ir"}, Removed{command: "", name: "--jobs", use: "--threads"}, Removed{command: "", name: "--pie", use: "--linkage pie, or the linkage key of a bin artifact"}, Removed{command: "", name: "--simd", use: "--set simd=<mode>"}, Removed{command: "", name: "--arch", use: "-t <sys>-<arch>"}, Removed{command: "", name: "--sys", use: "-t <sys>-<arch>"}, Removed{command: "", name: "--of", use: "the target's system, which implies the object format"}, Removed{command: "", name: "--platform", use: "--set platform=<name>"}, Removed{command: "", name: "--subsystem", use: "--set subsystem=<name>"}, Removed{command: "", name: "--base", use: "--set base=<address>"}, Removed{command: "", name: "--stack-reserve", use: "--set stack_reserve=<bytes>"}, Removed{command: "", name: "--stack-commit", use: "--set stack_commit=<bytes>"}, Removed{command: "dep add", name: "--version", use: "--range"}, }` | the options a previous major took, each refused by name with what to write instead |
+| `NO_WORDS` | `Slice[str]` | `Slice[str]{data: nil, size: 0}` | no words, for a command with no aliases |
+| `NO_COMMANDS` | `Slice[*std.args.Command]` | `Slice[*std_args.Command]{data: nil, size: 0}` | no commands, for a command nothing is nested under |
+| `NO_FLAGS` | `Slice[*std.args.Flag]` | `Slice[*std_args.Flag]{data: nil, size: 0}` | no flags |
+| `NO_CONFLICTS` | `Slice[Conflict]` | `Slice[Conflict]{data: nil, size: 0}` | no conflicts of a command's own |
 

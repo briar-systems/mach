@@ -11,7 +11,7 @@ evaluating the destination on the left side.
 
 ## Literals
 
-See [literals.md](literals.md) — numeric, char, string, and `nil` forms.
+See [literals.md](literals.md) for the numeric, char, string, and `nil` forms.
 
 ## Names
 
@@ -53,9 +53,12 @@ A tag value names its type and its case, and carries a positional payload only
 when the case declares one. Omitting a required payload, supplying a payload to a
 payloadless case, supplying more than one, naming the payload, or writing the
 tag type before a brace (`Type{...}`, which names no case) is a compile error.
+The keys are `tag.payload_missing`, `tag.payload_unexpected`,
+`tag.payload_count`, `tag.payload_named` and `tag.constructor_form`.
 
 Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same brace shape, but
-require one positional initializer per lane. See [types.md](types.md#simd-vectors).
+require one positional initializer per lane. Too few or too many is refused as
+`vector.literal_length`. See [types.md](types.md#simd-vectors).
 
 ## Field, index, and tag access
 
@@ -77,14 +80,15 @@ fun main(argc: i64, argv: **u8) i64 {
 ```
 
 An index the compiler can fold is bounds-checked against a statically known
-length, such as a fixed array length `N` or a vector lane count. See
+length, such as a fixed array length `N` or a vector lane count, and an index
+past it is refused as `index.out_of_bounds`. See
 [types.md](types.md).
 
 For tagged values:
 
-- `sel tag_val.case` tests whether that case is currently selected. It reads only the discriminator and is an ordinary `bool`.
-- `tag_val.case` accesses the payload of that case. It is legal only inside a lexical guard for that place and case; an unguarded payload access is a compile error.
-- `TypeName.case` alone is a case selector, not a value. It cannot be stored or passed.
+- `sel tag_val.case` tests whether that case is currently selected. It reads only the discriminator and has type `u1`, the type of std's `bool`.
+- `tag_val.case` accesses the payload of that case. It is legal only inside a lexical guard for that place and case. An unguarded payload access is refused as `tag.payload_unguarded`.
+- `TypeName.case` alone is a case selector, not a value. It cannot be stored, assigned or passed, and using it as a value is refused as `tag.selector_value`.
 
 See [tag.md](tag.md) for the guard rules. There is no other operator over a
 tag: failure handling is an ordinary `if`/`or` chain over `sel`, and the
@@ -99,11 +103,11 @@ sum(3, 10i64, 20i64, 30i64)     # variadic pack call (see variadics.md)
 ```
 
 A call to a pack-tailed function is monomorphized per distinct trailing
-type-list; `g(va...)` forwards a whole pack — see
+type-list, and `g(va...)` forwards a whole pack. See
 [variadics.md](variadics.md).
 
 For comptime parameters, the value is passed positionally like a runtime
-argument — the function signature determines whether it must be comptime:
+argument. The function signature determines whether it must be comptime:
 
 ```mach fragment
 checked_add(MODE_FAST, 1, 2)    # MODE_FAST is comptime-knowable
@@ -112,9 +116,13 @@ checked_add(MODE_FAST, 1, 2)    # MODE_FAST is comptime-knowable
 ## Operators
 
 See [operators.md](operators.md). Operators combine expressions into larger
-expressions; precedence follows the usual C-family conventions.
+expressions. The binding order is the precedence table in
+[grammar.md](grammar.md#operator-precedence). Comparison binds tighter than
+`&`, `^` and `|`, so a bit test is parenthesized, as `(x & 0x0f) != 0`.
+Written without the parentheses, `x & 0x0f != 0` gives `&` the u1 of
+`0x0f != 0`, and the refusal of that u1 notes that the comparison was read first.
 
 ## See also
 
-- [statements.md](statements.md) — how expressions appear inside statements
-- [fun.md](fun.md) — function declarations and signatures
+- [statements.md](statements.md) for how expressions appear inside statements
+- [fun.md](fun.md) for function declarations and signatures

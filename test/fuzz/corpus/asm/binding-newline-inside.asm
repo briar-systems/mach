@@ -1,2 +1,0 @@
-mov rax, {a
-b}

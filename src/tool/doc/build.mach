@@ -1,0 +1,1115 @@
+# the document model of a project, built from the syntax trees of its source files
+#
+# nothing here runs name resolution or knows a target: every `$if` arm is read, an
+# import alias is what the file's `use` lines bind (a `use` in an arm binding under
+# that arm's condition), and a `fwd` is followed by its alias and name into the tree
+# of the module it names. nothing reads source text except the spans the syntax tree
+# gives
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.memory;
+use std.text.string.str_dup_range;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.front.ast;
+use ast_decl:   mach.front.ast.decl;
+use ast_expr:   mach.front.ast.expr;
+use ast_id:     mach.front.ast.id;
+use ast_module: mach.front.ast.module;
+use ast_stmt:   mach.front.ast.stmt;
+use ast_type:   mach.front.ast.type;
+use mach.front.decorator;
+use front_doc:      mach.front.doc;
+use manifest_model: mach.manifest.model;
+use mach.tool.doc.model;
+use mink.catalog.output;
+
+# one parsed source file of the project: its module's dotted path, its syntax tree and
+# its source text
+pub rec Source {
+    path: str;
+    tree: *ast.Ast;
+    text: str;
+}
+
+# the build's state: every allocation is the arena's, and the first refusal is latched
+# so the walk need not thread one out of every step
+rec Builder {
+    a:      *A.Allocator;
+    failed: bool;
+    fault:  A.Error;
+}
+
+# a name some `use` of the module binds, the path it names, and the arms it is bound in
+rec Binding {
+    name:    str;
+    path:    str;
+    clauses: Vector[model.Clause];
+}
+
+# an import alias at `offset` in the source, `len` bytes long, naming the module at `path`
+rec Cut {
+    offset: usize;
+    len:    usize;
+    path:   str;
+}
+
+# a `fwd` waiting for every module to be in the model: its entry, its path as written and
+# the arms it sits in
+rec Pending {
+    entry:   u32;
+    path:    str;
+    clauses: Vector[model.Clause];
+}
+
+# what a module's walk leaves for `link`: its bindings, its forwards and the module paths
+# its signatures name
+rec Linked {
+    bindings: Vector[Binding];
+    pending:  Vector[Pending];
+    mentions: Vector[str];
+}
+
+# the walk of one module's declarations
+# ---
+# owners:   for each entry, the name of the type it belongs to, "" for none
+# own:      for each entry, whether its doc is a declaration's own rather than its `$if`'s
+# types:    the names of the public types the module declares
+# private:  the names of the types it keeps private
+# bindings: every `use` of the module, in every arm
+# clauses:  the arms around the walk's place, outermost first
+# pending:  the module's forwards
+# mentions: the module paths its signatures name
+rec Walk {
+    b:        *Builder;
+    src:      *Source;
+    m:        *model.Module;
+    owners:   Vector[str];
+    own:      Vector[bool];
+    types:    Vector[str];
+    private:  Vector[str];
+    bindings: Vector[Binding];
+    clauses:  Vector[model.Clause];
+    pending:  Vector[Pending];
+    mentions: Vector[str];
+}
+
+# the model of the project whose parsed files `sources` holds
+# ---
+# a:       the arena the model lives in
+# m:       the project's manifest
+# itn:     the interner the manifest's names are in
+# sources: every source file under the project's source root, sorted here by path
+# out:     the model
+# ret:     ok, or the allocator's refusal
+pub fun build(a: *A.Allocator, m: *manifest_model.Manifest, itn: *intern.Interner, sources: *Vector[Source], out: *model.Project) err[fail.Fail] {
+    var b: Builder = Builder{a: a, failed: false, fault: A.Error.exhausted{}};
+    out.id        = intern.text(itn, m.id);
+    out.version   = intern.text(itn, m.version);
+    out.artifacts = collections_vector.init[model.Artifact](a);
+    out.deps      = collections_vector.init[str](a);
+    out.modules   = collections_vector.init[model.Module](a);
+    out.dirs      = collections_vector.init[model.Dir](a);
+    sort.sort_by[Source](sources.data, sources.len, source_order);
+
+    val src_dir: str            = intern.text(itn, m.src);
+    var walks:   Vector[Linked] = collections_vector.init[Linked](a);
+    var k:       usize          = 0;
+    for (k < sources.len) {
+        var w: Walk = walk_make(?b, ?sources.data[k]);
+        keep[model.Module](?b, ?out.modules, module_of(?w, out.id, src_dir));
+        keep[Linked](?b, ?walks, Linked{bindings: w.bindings, pending: w.pending, mentions: w.mentions});
+        k = k + 1;
+    }
+    if (b.failed) { ret err[fail.Fail].err{fail.refused(b.fault)}; }
+    link(?b, out, ?walks);
+    directories(?b, out);
+
+    var ai: u32 = 0;
+    for (ai < m.artifact_count) {
+        val ad:    *manifest_model.ArtifactDef = ?m.artifacts[ai];
+        val entry: str                         = entry_path(?b, out.id, intern.text(itn, ad.entry));
+        keep[model.Artifact](?b, ?out.artifacts, model.Artifact{name: intern.text(itn, ad.name), kind: kind_text(ad.kind), entry: entry, module: module_by_path(out, entry)});
+        ai = ai + 1;
+    }
+    var di: u32 = 0;
+    for (di < m.dep_count) {
+        keep[str](?b, ?out.deps, intern.text(itn, m.deps[di].name));
+        di = di + 1;
+    }
+    if (b.failed) { ret err[fail.Fail].err{fail.refused(b.fault)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun source_order(x: *Source, y: *Source) i64 {
+    ret str_compare(x.path, y.path);
+}
+
+# the manifest's spelling of an artifact kind; every executable is spelled alike
+fun kind_text(k: output.Spelled) str {
+    if (sel k.row) { ret k.row.spelled; }
+    ret output.DYNAMIC.spelled;
+}
+
+# latch the first refusal of the allocator
+fun refuse(b: *Builder, e: A.Error) {
+    if (!b.failed) { b.fault = e; }
+    b.failed = true;
+}
+
+# push `x` onto `v`, latching a refusal
+fun keep[T](b: *Builder, v: *Vector[T], x: T) {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[T](v, x);
+    if (sel res_pushed.err) { refuse(b, res_pushed.err); }
+}
+
+# `len` bytes of `s` from `offset` copied into the arena, "" after a latched refusal
+fun dup(b: *Builder, s: str, offset: usize, len: usize) str {
+    val res_dup: res[str, A.Error] = str_dup_range(b.a, s, offset, len);
+    if (sel res_dup.err) {
+        refuse(b, res_dup.err);
+        ret "";
+    }
+    ret res_dup.ok;
+}
+
+fun span_text(b: *Builder, src: *Source, span: base_source.Span) str {
+    ret dup(b, src.text, span.offset, span.len);
+}
+
+# `head` and `tail` joined by `sep`, a byte or 0 for none
+fun join(b: *Builder, head: str, sep: u8, tail: str) str {
+    val hl: usize = str_len(head);
+    val tl: usize = str_len(tail);
+    var n:  usize = hl + tl;
+    if (sep != 0) { n = n + 1; }
+    val res_buf: res[*u8, A.Error] = A.allocate[u8](b.a, n + 1);
+    if (sel res_buf.err) {
+        refuse(b, res_buf.err);
+        ret "";
+    }
+    val buf: *u8 = res_buf.ok;
+    memory.raw_copy(buf, head::*u8, hl);
+    var at: usize = hl;
+    if (sep != 0) {
+        buf[at] = sep;
+        at      = at + 1;
+    }
+    memory.raw_copy(?buf[at], tail::*u8, tl);
+    buf[n] = 0;
+    ret buf::str;
+}
+
+# `s` with every `from` byte replaced by `to`
+fun replaced(b: *Builder, s: str, from: u8, to: u8) str {
+    val out: str   = dup(b, s, 0, str_len(s));
+    var i:   usize = 0;
+    for (out[i] != 0) {
+        if (out[i] == from) { out[i] = to; }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# the offset just past the last `sep` in `s`, 0 when it has none
+fun after_last(s: str, sep: u8) usize {
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (s[i] != 0) {
+        if (s[i] == sep) { at = i + 1; }
+        i = i + 1;
+    }
+    ret at;
+}
+
+# the doc comment at `span` of the source, an empty one when `span` is empty
+fun doc_of(b: *Builder, src: *Source, span: base_source.Span) model.Doc {
+    var d: model.Doc = model.Doc{summary: "", paragraphs: collections_vector.init[str](b.a), components: collections_vector.init[model.Component](b.a)};
+    if (span.len == 0) { ret d; }
+    var pit:   front_doc.ParagraphIter = front_doc.paragraph_iter(src.text, span);
+    var para:  base_source.Span;
+    var first: bool                    = true;
+    for (front_doc.paragraph_next(?pit, ?para)) {
+        val res_text: res[str, A.Error] = front_doc.prose(b.a, src.text, para);
+        if (sel res_text.err) {
+            refuse(b, res_text.err);
+            ret d;
+        }
+        if (first) { d.summary = dup(b, res_text.ok, 0, front_doc.summary_len(res_text.ok)); }
+        keep[str](b, ?d.paragraphs, res_text.ok);
+        first = false;
+    }
+    var cit: front_doc.DocComponentIter = front_doc.component_iter(src.text, span);
+    var c:   front_doc.DocComponent;
+    for (front_doc.component_next(?cit, ?c)) {
+        val res_desc: res[str, A.Error] = front_doc.flowed(b.a, src.text, c.desc_span);
+        if (sel res_desc.err) {
+            refuse(b, res_desc.err);
+            ret d;
+        }
+        keep[model.Component](b, ?d.components, model.Component{name: span_text(b, src, c.name_span), text: res_desc.ok});
+    }
+    ret d;
+}
+
+fun walk_make(b: *Builder, src: *Source) Walk {
+    ret Walk{
+        b:        b, src: src, m: nil, owners: collections_vector.init[str](b.a), own: collections_vector.init[bool](b.a),
+        types:    collections_vector.init[str](b.a), private: collections_vector.init[str](b.a),
+        bindings: collections_vector.init[Binding](b.a), clauses: collections_vector.init[model.Clause](b.a),
+        pending:  collections_vector.init[Pending](b.a), mentions: collections_vector.init[str](b.a)
+    };
+}
+
+# the model of the walk's module, its entries walked and grouped
+fun module_of(w: *Walk, id: str, src_dir: str) model.Module {
+    val b:    *Builder     = w.b;
+    val src:  *Source      = w.src;
+    val skip: usize        = str_len(id) + 1;
+    val rel:  str          = replaced(b, (?src.path[skip])::str, '.', '/');
+    var m:    model.Module = model.Module{
+        path:     src.path, rel: rel, leaf: (?src.path[after_last(src.path, '.')])::str, file: join(b, join(b, src_dir, '/', rel), 0, ".mach"),
+        dir:      model.NONE, declares: false, entries: collections_vector.init[model.Entry](b.a), groups: collections_vector.init[model.Group](b.a),
+        mentions: collections_vector.init[u32](b.a)
+    };
+    var none: base_source.Span;
+    none.offset = 0;
+    none.len    = 0;
+    val opt_root: opt[*ast_module.Module] = ast.get_module(src.tree, src.tree.root_module);
+    if (sel opt_root.none) {
+        m.doc = doc_of(b, src, none);
+        ret m;
+    }
+    val root: *ast_module.Module = opt_root.some;
+    m.doc      = doc_of(b, src, root.doc);
+    m.declares = declares(src.tree, root.decls_start, root.decls_len);
+    w.m        = ?m;
+    type_names(w, root.decls_start, root.decls_len);
+    bind(w, root.decls_start, root.decls_len);
+    walk(w, root.decls_start, root.decls_len, none);
+    group(w);
+    w.m = nil;
+    ret m;
+}
+
+# whether a declaration list declares anything: a `use` declares nothing, it binds
+fun declares(a: *ast.Ast, start: u32, len: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids.data[start + i]);
+        if (sel opt_d.some) {
+            if (opt_d.some.kind != ast_decl.DECL_KIND_USE) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the clause of one branch of a `$if`, the conditions of the branches before it being
+# `prior`, to which its own is then added
+fun clause_of(w: *Walk, br: *ast_decl.ComptimeBranch, prior: *Vector[str]) model.Clause {
+    var cond:     str                 = "";
+    val opt_cond: opt[*ast_expr.Expr] = ast.get_expr(w.src.tree, br.cond);
+    if (sel opt_cond.some) { cond = span_text(w.b, w.src, opt_cond.some.span); }
+    var before: Vector[str] = collections_vector.init[str](w.b.a);
+    var pi:     usize       = 0;
+    for (pi < prior.len) {
+        keep[str](w.b, ?before, prior.data[pi]);
+        pi = pi + 1;
+    }
+    keep[str](w.b, prior, cond);
+    ret model.Clause{text: cond, prior: before};
+}
+
+fun clauses_copy(b: *Builder, from: *Vector[model.Clause]) Vector[model.Clause] {
+    var v: Vector[model.Clause] = collections_vector.init[model.Clause](b.a);
+    var i: usize                = 0;
+    for (i < from.len) {
+        keep[model.Clause](b, ?v, from.data[i]);
+        i = i + 1;
+    }
+    ret v;
+}
+
+# every `use` of a declaration list and of the arms in it, each with the arms it sits in
+fun bind(w: *Walk, start: u32, len: u32) {
+    val a: *ast.Ast = w.src.tree;
+    var i: u32      = 0;
+    for (i < len) {
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids.data[start + i]);
+        if (sel opt_d.some) {
+            val d: *ast_decl.Decl = opt_d.some;
+            if (d.kind == ast_decl.DECL_KIND_USE) {
+                val u:    ast_decl.DeclUse = d.data.use_;
+                val path: str              = span_text(w.b, w.src, u.path);
+                var name: str              = (?path[after_last(path, '.')])::str;
+                if (u.alias.len > 0) { name = span_text(w.b, w.src, u.alias); }
+                keep[Binding](w.b, ?w.bindings, Binding{name: name, path: path, clauses: clauses_copy(w.b, ?w.clauses)});
+            }
+            or (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+                var prior: Vector[str] = collections_vector.init[str](w.b.a);
+                var bi:    u32         = 0;
+                for (bi < d.data.comptime_if.branches_len) {
+                    val br: *ast_decl.ComptimeBranch = ?a.comptime_branches.data[d.data.comptime_if.branches_start + bi];
+                    keep[model.Clause](w.b, ?w.clauses, clause_of(w, br, ?prior));
+                    bind(w, br.body_start, br.body_len);
+                    collections_vector.pop[model.Clause](?w.clauses);
+                    bi = bi + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun clause_same(x: *model.Clause, y: *model.Clause) bool {
+    if (!str_equals(x.text, y.text) || x.prior.len != y.prior.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.prior.len) {
+        if (!str_equals(x.prior.data[i], y.prior.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `outer` is the arms around `inner` or some of the outermost of them
+fun clauses_enclose(outer: *Vector[model.Clause], inner: *Vector[model.Clause]) bool {
+    if (outer.len > inner.len) { ret false; }
+    var i: usize = 0;
+    for (i < outer.len) {
+        if (!clause_same(?outer.data[i], ?inner.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bindings of `name` a place inside the arms `at` reads: the innermost one around it
+# when one is, or else every binding of the name in any arm
+fun bindings_of(b: *Builder, bindings: *Vector[Binding], name: str, at: *Vector[model.Clause], out: *Vector[u32]) {
+    var best:  u32   = model.NONE;
+    var depth: usize = 0;
+    var i:     usize = 0;
+    for (i < bindings.len) {
+        val x: *Binding = ?bindings.data[i];
+        if (str_equals(x.name, name) && clauses_enclose(?x.clauses, at) && (best == model.NONE || x.clauses.len >= depth)) {
+            best  = i::u32;
+            depth = x.clauses.len;
+        }
+        i = i + 1;
+    }
+    if (best != model.NONE) {
+        keep[u32](b, out, best);
+        ret;
+    }
+    i = 0;
+    for (i < bindings.len) {
+        if (str_equals(bindings.data[i].name, name)) { keep[u32](b, out, i::u32); }
+        i = i + 1;
+    }
+}
+
+# walk a declaration list: each public declaration and `fwd`, and each `$if` arm with
+# its condition
+fun walk(w: *Walk, start: u32, len: u32, around: base_source.Span) {
+    val a: *ast.Ast = w.src.tree;
+    var i: u32      = 0;
+    for (i < len) {
+        val did:   ast_id.DeclId       = a.decl_ids.data[start + i];
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+        if (sel opt_d.some) {
+            val d: *ast_decl.Decl = opt_d.some;
+            if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+                var inner: base_source.Span = around;
+                if (d.doc.len > 0) { inner = d.doc; }
+                var prior: Vector[str] = collections_vector.init[str](w.b.a);
+                var bi:    u32         = 0;
+                for (bi < d.data.comptime_if.branches_len) {
+                    val br: *ast_decl.ComptimeBranch = ?a.comptime_branches.data[d.data.comptime_if.branches_start + bi];
+                    keep[model.Clause](w.b, ?w.clauses, clause_of(w, br, ?prior));
+                    walk(w, br.body_start, br.body_len, inner);
+                    collections_vector.pop[model.Clause](?w.clauses);
+                    bi = bi + 1;
+                }
+            }
+            or (documented(a, d)) {
+                arm_add(w, did, d, around);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# whether a declaration is an entry: a public one or a `fwd`, never one marked `#[testing]`
+fun documented(a: *ast.Ast, d: *ast_decl.Decl) bool {
+    if (kind_of(d) == model.NONE || decorator.has(a, d, decorator.TESTING)) { ret false; }
+    ret d.kind == ast_decl.DECL_KIND_FWD || (d.flags & ast_decl.DECL_FLAG_PUB) != 0;
+}
+
+# add a declaration as an arm of the entry of its name, making the entry on its first arm. the
+# entry's doc is the first doc comment one of its declarations carries, or else that of the `$if`
+# around its first declaration
+fun arm_add(w: *Walk, did: ast_id.DeclId, d: *ast_decl.Decl, around: base_source.Span) {
+    val b:    *Builder = w.b;
+    val a:    *ast.Ast = w.src.tree;
+    var name: str      = "";
+    if (d.kind == ast_decl.DECL_KIND_FWD) {
+        val f: ast_decl.DeclFwd = d.data.fwd_;
+        if (f.alias.len > 0) { name = span_text(b, w.src, f.alias); }
+        or {
+            val path: str = span_text(b, w.src, f.path);
+            name = (?path[after_last(path, '.')])::str;
+        }
+    }
+    or {
+        name = span_text(b, w.src, ast.decl_name_span(a, did));
+    }
+
+    var cuts: Vector[Cut] = collections_vector.init[Cut](b.a);
+    decl_cuts(w, d, ?cuts);
+    sort.sort_by[Cut](cuts.data, cuts.len, cut_order);
+
+    var ei: usize = 0;
+    for (ei < w.m.entries.len && !str_equals(w.m.entries.data[ei].name, name)) { ei = ei + 1; }
+    if (ei == w.m.entries.len) {
+        var e: model.Entry = model.Entry{
+            name:       name, kind: kind_of(d)::model.Kind, external: (d.flags & ast_decl.DECL_FLAG_EXT) != 0, doc: doc_of(b, w.src, around),
+            deprecated: false, deprecation: "", arms: collections_vector.init[model.Arm](b.a), elements: collections_vector.init[model.Element](b.a),
+            providers:  collections_vector.init[model.Provider](b.a), owner: model.NONE
+        };
+        elements(w, d, ?e, ?cuts);
+        keep[model.Entry](b, ?w.m.entries, e);
+        keep[str](b, ?w.owners, owner_of(w, d));
+        keep[bool](b, ?w.own, false);
+    }
+    if (b.failed) { ret; }
+    val e: *model.Entry = ?w.m.entries.data[ei];
+    if (d.doc.len > 0 && !w.own.data[ei]) {
+        e.doc          = doc_of(b, w.src, d.doc);
+        w.own.data[ei] = true;
+    }
+
+    var arm: model.Arm = model.Arm{clauses: clauses_copy(b, ?w.clauses), decorators: collections_vector.init[str](b.a), signature: text_empty(b), value: ""};
+    var di:  u32       = 0;
+    for (di < d.decorators_len) {
+        val dec: *ast_decl.Decorator = ?a.decorators.data[d.decorators_start + di];
+        if (dec.id != decorator.DEPRECATED) { keep[str](b, ?arm.decorators, span_text(b, w.src, dec.span)); }
+        or {
+            e.deprecated = true;
+            if (dec.args_len > 0) {
+                val opt_arg: opt[*ast_expr.Expr] = ast.get_expr(a, a.expr_ids.data[dec.args_start]);
+                if (sel opt_arg.some) {
+                    if (opt_arg.some.kind == ast_expr.EXPR_KIND_LIT_STR) {
+                        val v: View = ast.lit_str_value(a, opt_arg.some);
+                        e.deprecation = dup(b, v.data::str, 0, v.len);
+                    }
+                }
+            }
+        }
+        di = di + 1;
+    }
+    arm.signature = text_of(w, signature_span(a, w.src.text, d), ?cuts);
+    if (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        val opt_init: opt[*ast_expr.Expr] = ast.get_expr(a, d.data.bind.init);
+        if (sel opt_init.some) { arm.value = span_text(b, w.src, opt_init.some.span); }
+    }
+    keep[model.Arm](b, ?e.arms, arm);
+    if (d.kind == ast_decl.DECL_KIND_FWD) {
+        keep[Pending](b, ?w.pending, Pending{entry: ei::u32, path: span_text(b, w.src, d.data.fwd_.path), clauses: clauses_copy(b, ?w.clauses)});
+    }
+}
+
+fun text_empty(b: *Builder) model.Text {
+    ret model.Text{pieces: collections_vector.init[model.Piece](b.a)};
+}
+
+fun cut_order(x: *Cut, y: *Cut) i64 {
+    if (x.offset < y.offset) { ret -1; }
+    if (x.offset > y.offset) { ret 1; }
+    ret 0;
+}
+
+# the text of `span` in pieces, each cut in it marked with the module it names. a span
+# that begins inside an indented block loses that indentation from its later lines, so
+# it reads as if declared at the left margin
+fun text_of(w: *Walk, span: base_source.Span, cuts: *Vector[Cut]) model.Text {
+    var t:   model.Text = text_empty(w.b);
+    val end: usize      = span.offset + span.len;
+    var col: usize      = 0;
+    for (col < span.offset && w.src.text[span.offset - col - 1] != '\n') { col = col + 1; }
+    var at: usize = span.offset;
+    var i:  usize = 0;
+    for (i < cuts.len) {
+        val c: *Cut = ?cuts.data[i];
+        if (c.offset >= at && c.offset + c.len <= end) {
+            if (c.offset > at) { keep[model.Piece](w.b, ?t.pieces, model.Piece{text: dedented(w.b, w.src.text, at, c.offset - at, col), path: ""}); }
+            keep[model.Piece](w.b, ?t.pieces, model.Piece{text: dup(w.b, w.src.text, c.offset, c.len), path: c.path});
+            at = c.offset + c.len;
+        }
+        i = i + 1;
+    }
+    if (end > at) { keep[model.Piece](w.b, ?t.pieces, model.Piece{text: dedented(w.b, w.src.text, at, end - at, col), path: ""}); }
+    ret t;
+}
+
+# `len` bytes of `s` from `at`, with up to `col` spaces dropped after each line break
+fun dedented(b: *Builder, s: str, at: usize, len: usize, col: usize) str {
+    if (col == 0) { ret dup(b, s, at, len); }
+    val res_buf: res[*u8, A.Error] = A.allocate[u8](b.a, len + 1);
+    if (sel res_buf.err) {
+        refuse(b, res_buf.err);
+        ret "";
+    }
+    var n:    usize = 0;
+    var skip: usize = 0;
+    var i:    usize = 0;
+    for (i < len) {
+        val c: u8 = s[at + i];
+        if (skip > 0 && c == ' ') { skip = skip - 1; }
+        or {
+            skip = 0;
+            if (c == '\n') { skip = col; }
+            res_buf.ok[n] = c;
+            n             = n + 1;
+        }
+        i = i + 1;
+    }
+    res_buf.ok[n] = 0;
+    ret res_buf.ok::str;
+}
+
+# the text of a type with its cuts marked, empty for no type
+fun type_text(w: *Walk, tid: ast_id.TypeId, cuts: *Vector[Cut]) model.Text {
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(w.src.tree, tid);
+    if (sel opt_ty.none) { ret text_empty(w.b); }
+    ret text_of(w, opt_ty.some.span, cuts);
+}
+
+fun element_add(w: *Walk, e: *model.Entry, name: str, ty: model.Text) {
+    keep[model.Element](w.b, ?e.elements, model.Element{name: name, ty: ty});
+}
+
+# an element `[T]` for each generic name of a declaration
+fun generics_add(w: *Walk, e: *model.Entry, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        val name: str = span_text(w.b, w.src, w.src.tree.generic_names.data[start + i]);
+        element_add(w, e, join(w.b, join(w.b, "[", 0, name), 0, "]"), text_empty(w.b));
+        i = i + 1;
+    }
+}
+
+# an element for each parameter or field, `$name` for a comptime one
+fun typed_add(w: *Walk, e: *model.Entry, start: u32, len: u32, cuts: *Vector[Cut]) {
+    var i: u32 = 0;
+    for (i < len) {
+        val tn:   *ast_decl.TypedName = ?w.src.tree.typed_names.data[start + i];
+        var name: str                 = span_text(w.b, w.src, tn.name);
+        if (tn.comptime) { name = join(w.b, "$", 0, name); }
+        element_add(w, e, name, type_text(w, tn.ty, cuts));
+        i = i + 1;
+    }
+}
+
+# what the component lines of a declaration can name, in declaration order
+fun elements(w: *Walk, d: *ast_decl.Decl, e: *model.Entry, cuts: *Vector[Cut]) {
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        generics_add(w, e, d.data.fun_.generics_start, d.data.fun_.generics_len);
+        typed_add(w, e, d.data.fun_.params_start, d.data.fun_.params_len, cuts);
+    }
+    or (d.kind == ast_decl.DECL_KIND_REC) {
+        generics_add(w, e, d.data.rec_.generics_start, d.data.rec_.generics_len);
+        typed_add(w, e, d.data.rec_.fields_start, d.data.rec_.fields_len, cuts);
+    }
+    or (d.kind == ast_decl.DECL_KIND_UNI) {
+        generics_add(w, e, d.data.uni_.generics_start, d.data.uni_.generics_len);
+        typed_add(w, e, d.data.uni_.fields_start, d.data.uni_.fields_len, cuts);
+    }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        element_add(w, e, e.name, type_text(w, d.data.bind.ty, cuts));
+    }
+    or (d.kind == ast_decl.DECL_KIND_TAG) {
+        generics_add(w, e, d.data.tag_.generics_start, d.data.tag_.generics_len);
+        var i: u32 = 0;
+        for (i < d.data.tag_.cases_len) {
+            val c: *ast_decl.TagCase = ?w.src.tree.tag_cases.data[d.data.tag_.cases_start + i];
+            element_add(w, e, span_text(w.b, w.src, c.name), type_text(w, c.payload, cuts));
+            i = i + 1;
+        }
+    }
+}
+
+# record a cut for the import alias a type's dotted name spells at its head, and the
+# module path every dotted name names, which the page may link
+fun type_cuts(w: *Walk, tid: ast_id.TypeId, cuts: *Vector[Cut]) {
+    val a:      *ast.Ast            = w.src.tree;
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_ty.none) { ret; }
+    val t: *ast_type.Type = opt_ty.some;
+    if (t.kind == ast_type.TYPE_KIND_NAMED) {
+        val span: base_source.Span = t.data.named.name;
+        val name: str              = span_text(w.b, w.src, span);
+        var dot:  usize            = 0;
+        for (name[dot] != 0 && name[dot] != '.') { dot = dot + 1; }
+        if (name[dot] == '.') {
+            var found: Vector[u32] = collections_vector.init[u32](w.b.a);
+            bindings_of(w.b, ?w.bindings, dup(w.b, name, 0, dot), ?w.clauses, ?found);
+            if (found.len == 1) {
+                val path: str = w.bindings.data[found.data[0]].path;
+                keep[Cut](w.b, cuts, Cut{offset: span.offset, len: dot, path: path});
+                keep[str](w.b, ?w.mentions, path);
+            }
+            or (found.len == 0) {
+                keep[str](w.b, ?w.mentions, dup(w.b, name, 0, after_last(name, '.') - 1));
+            }
+        }
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            type_cuts(w, a.type_ids.data[t.data.named.args_start + i], cuts);
+            i = i + 1;
+        }
+    }
+    or (t.kind == ast_type.TYPE_KIND_PTR)             { type_cuts(w, t.data.ptr.pointee, cuts); }
+    or (t.kind == ast_type.TYPE_KIND_SECRET)          { type_cuts(w, t.data.secret.inner, cuts); }
+    or (t.kind == ast_type.TYPE_KIND_ARRAY)           { type_cuts(w, t.data.array.element, cuts); }
+    or (t.kind == ast_type.TYPE_KIND_POINTEE_OF)      { type_cuts(w, t.data.pointee_of.inner, cuts); }
+    or (t.kind == ast_type.TYPE_KIND_DISCRIMINANT_OF) { type_cuts(w, t.data.discriminant_of.inner, cuts); }
+    or (t.kind == ast_type.TYPE_KIND_FUN) {
+        var i: u32 = 0;
+        for (i < t.data.fun_.params_len) {
+            type_cuts(w, a.type_ids.data[t.data.fun_.params_start + i], cuts);
+            i = i + 1;
+        }
+        type_cuts(w, t.data.fun_.ret_type, cuts);
+    }
+    or (t.kind == ast_type.TYPE_KIND_REC) { typed_cuts(w, t.data.rec_.fields_start, t.data.rec_.fields_len, cuts); }
+    or (t.kind == ast_type.TYPE_KIND_UNI) { typed_cuts(w, t.data.uni_.fields_start, t.data.uni_.fields_len, cuts); }
+}
+
+# the cuts of every type a run of typed names spells
+fun typed_cuts(w: *Walk, start: u32, len: u32, cuts: *Vector[Cut]) {
+    var i: u32 = 0;
+    for (i < len) {
+        type_cuts(w, w.src.tree.typed_names.data[start + i].ty, cuts);
+        i = i + 1;
+    }
+}
+
+# the cuts of every type a declaration's signature spells
+fun decl_cuts(w: *Walk, d: *ast_decl.Decl, cuts: *Vector[Cut]) {
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        typed_cuts(w, d.data.fun_.params_start, d.data.fun_.params_len, cuts);
+        type_cuts(w, d.data.fun_.return_type, cuts);
+    }
+    or (d.kind == ast_decl.DECL_KIND_REC) { typed_cuts(w, d.data.rec_.fields_start, d.data.rec_.fields_len, cuts); }
+    or (d.kind == ast_decl.DECL_KIND_UNI) { typed_cuts(w, d.data.uni_.fields_start, d.data.uni_.fields_len, cuts); }
+    or (d.kind == ast_decl.DECL_KIND_TAG) {
+        type_cuts(w, d.data.tag_.disc, cuts);
+        var i: u32 = 0;
+        for (i < d.data.tag_.cases_len) {
+            type_cuts(w, w.src.tree.tag_cases.data[d.data.tag_.cases_start + i].payload, cuts);
+            i = i + 1;
+        }
+    }
+    or (d.kind == ast_decl.DECL_KIND_DEF)                                     { type_cuts(w, d.data.def_.ty, cuts); }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) { type_cuts(w, d.data.bind.ty, cuts); }
+}
+
+# the module of this project a dotted path lies in, the longest prefix of it that is one,
+# with the length of that prefix in `len`; NONE when no prefix is
+fun module_within(b: *Builder, out: *model.Project, path: str, len: *usize) u32 {
+    var cut: usize = str_len(path);
+    for (cut > 0) {
+        val mi: u32 = module_by_path(out, dup(b, path, 0, cut));
+        if (mi != model.NONE) {
+            @len = cut;
+            ret mi;
+        }
+        var i: usize = cut;
+        for (i > 0 && path[i - 1] != '.') { i = i - 1; }
+        if (i == 0) { ret model.NONE; }
+        cut = i - 1;
+    }
+    ret model.NONE;
+}
+
+# what each page mentions and what each `fwd` takes its declaration from, once every
+# module is in the model
+fun link(b: *Builder, out: *model.Project, walks: *Vector[Linked]) {
+    var mi: usize = 0;
+    for (mi < out.modules.len) {
+        val m: *model.Module = ?out.modules.data[mi];
+        val l: *Linked       = ?walks.data[mi];
+        var k: usize         = 0;
+        for (k < l.mentions.len) {
+            val to: u32 = module_by_path(out, l.mentions.data[k]);
+            if (to != model.NONE && to != mi::u32) { insert_sorted(b, ?m.mentions, to); }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < l.pending.len) {
+            providers_add(b, out, ?m.entries.data[l.pending.data[k].entry], ?l.bindings, ?l.pending.data[k]);
+            k = k + 1;
+        }
+        mi = mi + 1;
+    }
+}
+
+# the providers of one `fwd`: the module each binding of its alias names, under the arms of
+# the forward and of that binding, or its path as written when no `use` binds its head
+fun providers_add(b: *Builder, out: *model.Project, e: *model.Entry, bindings: *Vector[Binding], f: *Pending) {
+    var dot: usize = 0;
+    for (f.path[dot] != 0 && f.path[dot] != '.') { dot = dot + 1; }
+    var found: Vector[u32] = collections_vector.init[u32](b.a);
+    if (f.path[dot] == '.') { bindings_of(b, bindings, dup(b, f.path, 0, dot), ?f.clauses, ?found); }
+    if (found.len == 0) {
+        provider_add(b, out, e, f.clauses, f.path);
+        ret;
+    }
+    var i: usize = 0;
+    for (i < found.len) {
+        val x:       *Binding             = ?bindings.data[found.data[i]];
+        var clauses: Vector[model.Clause] = clauses_copy(b, ?f.clauses);
+        if (!clauses_enclose(?x.clauses, ?f.clauses)) {
+            var k: usize = 0;
+            for (k < x.clauses.len) {
+                keep[model.Clause](b, ?clauses, x.clauses.data[k]);
+                k = k + 1;
+            }
+        }
+        provider_add(b, out, e, clauses, join(b, x.path, 0, (?f.path[dot])::str));
+        i = i + 1;
+    }
+}
+
+# add one provider of the path `target` to a `fwd` entry unless it has one of that path
+fun provider_add(b: *Builder, out: *model.Project, e: *model.Entry, clauses: Vector[model.Clause], target: str) {
+    var i: usize = 0;
+    for (i < e.providers.len) {
+        if (str_equals(e.providers.data[i].target, target)) { ret; }
+        i = i + 1;
+    }
+    var len:    usize = 0;
+    val module: u32   = module_within(b, out, target, ?len);
+    var entry:  u32   = model.NONE;
+    if (module != model.NONE && target[len] == '.') { entry = entry_by_name(?out.modules.data[module], (?target[len + 1])::str); }
+    keep[model.Provider](b, ?e.providers, model.Provider{clauses: clauses, target: target, module: module, entry: entry});
+}
+
+# the names of the types the declarations in a list declare, in every arm
+fun type_names(w: *Walk, start: u32, len: u32) {
+    val a: *ast.Ast = w.src.tree;
+    var i: u32      = 0;
+    for (i < len) {
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids.data[start + i]);
+        if (sel opt_d.some) {
+            val d: *ast_decl.Decl = opt_d.some;
+            if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+                var bi: u32 = 0;
+                for (bi < d.data.comptime_if.branches_len) {
+                    val br: *ast_decl.ComptimeBranch = ?a.comptime_branches.data[d.data.comptime_if.branches_start + bi];
+                    type_names(w, br.body_start, br.body_len);
+                    bi = bi + 1;
+                }
+            }
+            or (kind_of(d) != model.NONE && model.is_type(kind_of(d)::model.Kind)) {
+                val name: str = span_text(w.b, w.src, ast.decl_name_span(a, a.decl_ids.data[start + i]));
+                if ((d.flags & ast_decl.DECL_FLAG_PUB) != 0 && !decorator.has(a, d, decorator.TESTING)) { keep[str](w.b, ?w.types, name); }
+                or                                                                                      { keep[str](w.b, ?w.private, name); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# the entry kind a declaration documents as, NONE for one that is never documented
+fun kind_of(d: *ast_decl.Decl) u32 {
+    if (d.kind == ast_decl.DECL_KIND_FUN) { ret model.KIND_FUN::u32; }
+    if (d.kind == ast_decl.DECL_KIND_REC) { ret model.KIND_REC::u32; }
+    if (d.kind == ast_decl.DECL_KIND_UNI) { ret model.KIND_UNI::u32; }
+    if (d.kind == ast_decl.DECL_KIND_TAG) { ret model.KIND_TAG::u32; }
+    if (d.kind == ast_decl.DECL_KIND_DEF) { ret model.KIND_DEF::u32; }
+    if (d.kind == ast_decl.DECL_KIND_VAL) { ret model.KIND_VAL::u32; }
+    if (d.kind == ast_decl.DECL_KIND_VAR) { ret model.KIND_VAR::u32; }
+    if (d.kind == ast_decl.DECL_KIND_FWD) { ret model.KIND_FWD::u32; }
+    ret model.NONE;
+}
+
+# the span of a declaration as written without its decorators, its body or its value
+fun signature_span(a: *ast.Ast, text: str, d: *ast_decl.Decl) base_source.Span {
+    var lo: usize = d.span.offset;
+    if (d.decorators_len > 0) {
+        val last: *ast_decl.Decorator = ?a.decorators.data[d.decorators_start + d.decorators_len - 1];
+        lo = last.span.offset + last.span.len;
+    }
+    var hi: usize = d.span.offset + d.span.len;
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        val opt_body: opt[*ast_stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+        if (sel opt_body.some) { hi = opt_body.some.span.offset; }
+    }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        val opt_ty: opt[*ast_type.Type] = ast.get_type(a, d.data.bind.ty);
+        if (sel opt_ty.some) { hi = opt_ty.some.span.offset + opt_ty.some.span.len; }
+        or                   { hi = d.data.bind.name.offset + d.data.bind.name.len; }
+    }
+    for (lo < hi && is_layout(text[lo])) { lo = lo + 1; }
+    for (hi > lo && (is_layout(text[hi - 1]) || text[hi - 1] == ';')) { hi = hi - 1; }
+    var s: base_source.Span;
+    s.offset = lo;
+    s.len    = hi - lo;
+    ret s;
+}
+
+fun is_layout(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+fun listed(v: *Vector[str], name: str) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (str_equals(v.data[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the public type of this module a type names directly, "" for none
+fun local_named(w: *Walk, t: *ast_type.Type) str {
+    if (t.kind != ast_type.TYPE_KIND_NAMED) { ret ""; }
+    val name: str = span_text(w.b, w.src, t.data.named.name);
+    if (listed(?w.types, name)) { ret name; }
+    ret "";
+}
+
+# the public type of this module that a type names through any pointer, secrecy mark,
+# array or generic argument, the first in source order; "" for none
+fun named_within(w: *Walk, tid: ast_id.TypeId) str {
+    val a:      *ast.Ast            = w.src.tree;
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_ty.none) { ret ""; }
+    val t:    *ast_type.Type = opt_ty.some;
+    val name: str            = local_named(w, t);
+    if (str_len(name) > 0) { ret name; }
+    if (t.kind == ast_type.TYPE_KIND_NAMED) {
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            val inner: str = named_within(w, a.type_ids.data[t.data.named.args_start + i]);
+            if (str_len(inner) > 0) { ret inner; }
+            i = i + 1;
+        }
+    }
+    if (t.kind == ast_type.TYPE_KIND_PTR)    { ret named_within(w, t.data.ptr.pointee); }
+    if (t.kind == ast_type.TYPE_KIND_SECRET) { ret named_within(w, t.data.secret.inner); }
+    if (t.kind == ast_type.TYPE_KIND_ARRAY)  { ret named_within(w, t.data.array.element); }
+    ret "";
+}
+
+# the public type of this module that a return type names through `res`, `opt`, `err` and
+# pointers; "" for none
+fun named_returned(w: *Walk, tid: ast_id.TypeId) str {
+    val a:      *ast.Ast            = w.src.tree;
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_ty.none) { ret ""; }
+    val t:    *ast_type.Type = opt_ty.some;
+    val name: str            = local_named(w, t);
+    if (str_len(name) > 0)                  { ret name; }
+    if (t.kind == ast_type.TYPE_KIND_PTR)   { ret named_returned(w, t.data.ptr.pointee); }
+    if (t.kind != ast_type.TYPE_KIND_NAMED) { ret ""; }
+    val whole: str = span_text(w.b, w.src, t.data.named.name);
+    val leaf:  str = (?whole[after_last(whole, '.')])::str;
+    if (!str_equals(leaf, "res") && !str_equals(leaf, "opt") && !str_equals(leaf, "err")) { ret ""; }
+    var i: u32 = 0;
+    for (i < t.data.named.args_len) {
+        val inner: str = named_returned(w, a.type_ids.data[t.data.named.args_start + i]);
+        if (str_len(inner) > 0) { ret inner; }
+        i = i + 1;
+    }
+    ret "";
+}
+
+# the type a declaration belongs to: a function's first parameter that names one of the
+# module's types, or else its return type; a binding's declared type; "" for none
+fun owner_of(w: *Walk, d: *ast_decl.Decl) str {
+    val a: *ast.Ast = w.src.tree;
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        var i: u32 = 0;
+        for (i < d.data.fun_.params_len) {
+            val name: str = named_within(w, a.typed_names.data[d.data.fun_.params_start + i].ty);
+            if (str_len(name) > 0) { ret name; }
+            i = i + 1;
+        }
+        ret named_returned(w, d.data.fun_.return_type);
+    }
+    if (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        val opt_ty: opt[*ast_type.Type] = ast.get_type(a, d.data.bind.ty);
+        if (sel opt_ty.some) { ret local_named(w, opt_ty.some); }
+    }
+    ret "";
+}
+
+# group the module's entries: each public type with what belongs to it, in declaration
+# order, then what belongs to none by kind
+fun group(w: *Walk) {
+    val m: *model.Module = w.m;
+    var i: usize         = 0;
+    for (i < m.entries.len) {
+        val owner: str = w.owners.data[i];
+        if (str_len(owner) > 0) {
+            var t: usize = 0;
+            for (t < m.entries.len && !(model.is_type(m.entries.data[t].kind) && str_equals(m.entries.data[t].name, owner))) { t = t + 1; }
+            if (t < m.entries.len) { m.entries.data[i].owner = t::u32; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.entries.len) {
+        if (model.is_type(m.entries.data[i].kind)) { group_add(w, i::u32, m.entries.data[i].kind); }
+        i = i + 1;
+    }
+    group_add(w, model.NONE, model.KIND_FUN);
+    group_add(w, model.NONE, model.KIND_VAL);
+    group_add(w, model.NONE, model.KIND_VAR);
+    group_add(w, model.NONE, model.KIND_FWD);
+}
+
+# add the group of the type entry `owner`, or of the entries of `kind` no type owns. a type's
+# group is added even when empty, and an empty group of no type is not
+fun group_add(w: *Walk, owner: u32, kind: model.Kind) {
+    val m: *model.Module = w.m;
+    var g: model.Group   = model.Group{owner: owner, kind: kind, members: collections_vector.init[u32](w.b.a)};
+    var i: usize         = 0;
+    for (i < m.entries.len) {
+        val e: *model.Entry = ?m.entries.data[i];
+        if (owner != model.NONE && e.owner == owner)                        { keep[u32](w.b, ?g.members, i::u32); }
+        if (owner == model.NONE && e.owner == model.NONE && e.kind == kind) { keep[u32](w.b, ?g.members, i::u32); }
+        i = i + 1;
+    }
+    if (owner == model.NONE && g.members.len == 0) { ret; }
+    keep[model.Group](w.b, ?m.groups, g);
+}
+
+# the module whose path is `path`, NONE when the model has none
+fun module_by_path(out: *model.Project, path: str) u32 {
+    var lo: usize = 0;
+    var hi: usize = out.modules.len;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        val c:   i64   = str_compare(out.modules.data[mid].path, path);
+        if (c == 0) { ret mid::u32; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret model.NONE;
+}
+
+# the entry of a module that is named `name`, NONE when the module has none
+fun entry_by_name(m: *model.Module, name: str) u32 {
+    var i: usize = 0;
+    for (i < m.entries.len) {
+        if (str_equals(m.entries.data[i].name, name)) { ret i::u32; }
+        i = i + 1;
+    }
+    ret model.NONE;
+}
+
+# insert `x` into the ascending `v` unless it holds it
+fun insert_sorted(b: *Builder, v: *Vector[u32], x: u32) {
+    var i: usize = 0;
+    for (i < v.len && v.data[i] < x) { i = i + 1; }
+    if (i < v.len && v.data[i] == x) { ret; }
+    keep[u32](b, v, x);
+    if (b.failed) { ret; }
+    var j: usize = v.len - 1;
+    for (j > i) {
+        v.data[j] = v.data[j - 1];
+        j         = j - 1;
+    }
+    v.data[i] = x;
+}
+
+fun dir_by_rel(out: *model.Project, rel: str) u32 {
+    var i: usize = 0;
+    for (i < out.dirs.len) {
+        if (str_equals(out.dirs.data[i].rel, rel)) { ret i::u32; }
+        i = i + 1;
+    }
+    ret model.NONE;
+}
+
+fun dir_order(x: *model.Dir, y: *model.Dir) i64 {
+    ret str_compare(x.rel, y.rel);
+}
+
+# the directories of the source tree: every one holding a module, its root module and
+# its contents
+fun directories(b: *Builder, out: *model.Project) {
+    keep[model.Dir](b, ?out.dirs, dir_make(b, "", model.NONE));
+    var mi: usize = 0;
+    for (mi < out.modules.len) {
+        val rel: str   = out.modules.data[mi].rel;
+        var i:   usize = 0;
+        for (rel[i] != 0) {
+            if (rel[i] == '/') {
+                val sub: str = dup(b, rel, 0, i);
+                if (dir_by_rel(out, sub) == model.NONE) { keep[model.Dir](b, ?out.dirs, dir_make(b, sub, model.NONE)); }
+            }
+            i = i + 1;
+        }
+        mi = mi + 1;
+    }
+    if (b.failed) { ret; }
+    sort.sort_by[model.Dir](out.dirs.data, out.dirs.len, dir_order);
+
+    var di: usize = 1;
+    for (di < out.dirs.len) {
+        val d:   *model.Dir = ?out.dirs.data[di];
+        val cut: usize      = after_last(d.rel, '/');
+        d.leaf = (?d.rel[cut])::str;
+        var up: str = "";
+        if (cut > 0) { up = dup(b, d.rel, 0, cut - 1); }
+        d.parent = dir_by_rel(out, up);
+        keep[u32](b, ?out.dirs.data[d.parent].dirs, di::u32);
+        di = di + 1;
+    }
+    mi = 0;
+    for (mi < out.modules.len) {
+        val m:   *model.Module = ?out.modules.data[mi];
+        val cut: usize         = after_last(m.rel, '/');
+        var up:  str           = "";
+        if (cut > 0) { up = dup(b, m.rel, 0, cut - 1); }
+        m.dir = dir_by_rel(out, up);
+        keep[u32](b, ?out.dirs.data[m.dir].modules, mi::u32);
+        val own: u32 = dir_by_rel(out, m.rel);
+        if (own != model.NONE) { out.dirs.data[own].root = mi::u32; }
+        mi = mi + 1;
+    }
+}
+
+# a directory of no modules and no subdirectories, its leaf set to `rel` until directories fills it
+fun dir_make(b: *Builder, rel: str, parent: u32) model.Dir {
+    ret model.Dir{rel: rel, leaf: rel, parent: parent, root: model.NONE, modules: collections_vector.init[u32](b.a), dirs: collections_vector.init[u32](b.a)};
+}
+
+# the module path of an artifact's entry file, `bin/main.mach` in project `mach` being
+# `mach.bin.main`
+fun entry_path(b: *Builder, id: str, entry: str) str {
+    var n: usize = str_len(entry);
+    if (n > 5 && str_equals((?entry[n - 5])::str, ".mach")) { n = n - 5; }
+    ret join(b, id, '.', replaced(b, dup(b, entry, 0, n), '/', '.'));
+}

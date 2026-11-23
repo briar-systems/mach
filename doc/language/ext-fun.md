@@ -1,8 +1,9 @@
 # `ext fun` — external function
 
 `ext fun` declares a function with C ABI as a forward reference — body-less.
-The linker resolves the symbol at link time. This is the only body-less
-function form Mach allows.
+The linker resolves the symbol at link time. Apart from an `#[intrinsic]`
+function (see [gpu.md](gpu.md)), this is the only body-less function form Mach
+allows.
 
 ## Grammar
 
@@ -10,8 +11,12 @@ function form Mach allows.
 ext fun NAME(args) RET;
 ```
 
-- No body block. The declaration ends with a semicolon.
+- No body block. The declaration ends with a semicolon. A body is refused with
+  `ext.fun_body`.
 - Argument and return types must be representable in C.
+- No type parameters and no `$` comptime parameters. Each instance would be a
+  function of its own that no foreign library exports, so either is refused with
+  `ext.generic`.
 - `pub ext fun` exposes the import to other modules; without `pub`, the
   import is file-private.
 
@@ -38,15 +43,21 @@ ext fun fcntl(fd: i32, cmd: i32, ...) i32;
   It is not a named parameter and has no type.
 - **`ext` only.** A mach-bodied `fun` has no C-variadic form — its variadic is the
   comptime pack `va: ...`, an ordinary *named* parameter with an entirely different
-  meaning (see [variadics.md](variadics.md)). A bare `...` in a non-`ext` parameter
-  list is an error that names the pack.
+  meaning (see [variadics.md](variadics.md)). In a non-`ext` parameter list a bare
+  `...` is not a parameter, and the parser reports the missing parameter name
+  (`syntax.expected_name`). The other way round, a pack on an `ext fun`
+  (`ext fun f(va: ...)`) is refused with `pack.bodyless`, whose note names the
+  C-variadic spelling.
 - **At least one fixed parameter** must precede the `...`, as in C. Every psABI
-  defines its variadic rule relative to the named arguments.
+  defines its variadic rule relative to the named arguments. `ext fun f(...)` is
+  refused with `variadic.no_fixed_param`.
 - Only the **call** side exists. Mach cannot *define* a C-variadic function: there
-  is no `va_list` and no `va_arg`, so such a declaration cannot carry a body.
+  is no `va_list` and no `va_arg`, so such a declaration cannot carry a body
+  (`ext.fun_body`).
 
 The declared parameters are the *fixed* arity. A call must supply all of them and
-may supply any number of further arguments, including none.
+may supply any number of further arguments, including none. A call short of the
+fixed arity is refused with `call.arity` (`expected at least 1 argument, found 0`).
 
 ### Naming the signature as a type
 
@@ -81,21 +92,27 @@ A tail argument has no declared parameter type to check against, so it is checke
 against the C variadic contract directly. C applies **default argument promotions**
 there: an integer narrower than `int` arrives as an `int`, and a `float` arrives as
 a `double`. Mach inserts no implicit conversions anywhere and makes no exception
-here — a narrow argument is **rejected**, naming the cast:
+here. A narrow argument is **rejected** with `call.c_variadic_promotion`, naming
+the cast:
 
 ```mach fragment
 var c: u8  = 65;
 var f: f32 = 1.5;
 
-log(fmt, c);                 # error: cast it to `i32` / `u32`
-log(fmt, f);                 # error: cast it to `f64`
+log(fmt, c);                 # error: write the cast `x::i32` or `x::u32`
+log(fmt, f);                 # error: write the cast `x::f64`
 log(fmt, c::i32, f::f64);    # correct
 ```
+
+The first error reads ``error[call.c_variadic_promotion] `u8` is promoted to a
+32-bit integer in a C-variadic argument. write the cast `x::i32` or `x::u32` ``.
+A character literal is a `u8` and is refused the same way.
 
 An argument of 32 bits or wider passes as written: `i32`/`u32`, `i64`/`u64`, `f64`,
 any pointer, and a record or vector passed by value. A **secret** (`^T`) may not
 enter a variadic tail: the callee is foreign code that prints or logs the value, so
-it is an observation boundary — declassify with `:>T` first.
+it is an observation boundary. Declassify it with `:>T` first. The refusal is
+`secret.variadic`.
 
 ### Per-target argument passing
 
@@ -116,7 +133,7 @@ The *fixed* parameters diverge on Apple arm64 too, on a separate axis: a fixed
 argument that lands on the stack there takes its **natural size and alignment**,
 where AAPCS64 rounds every stack argument up to an 8-byte slot. Past the eight GP
 registers, `(…, int i, short j, long long k)` occupies `[sp+0]`, `[sp+4]`, `[sp+8]`
-on `darwin-aarch64` and `[sp+0]`, `[sp+8]`, `[sp+16]` on `linux-arm64`. A record
+on `darwin-aarch64` and `[sp+0]`, `[sp+8]`, `[sp+16]` on `linux-aarch64`. A record
 that is not a homogeneous float or vector aggregate is the exception: Apple arm64
 gives it a slot aligned to at least 8 bytes and rounded up to a multiple of 8, as
 AAPCS64 does. Mach applies each target's own rule, so nothing in a declaration has
@@ -171,7 +188,9 @@ fun trace(level: i32, text: *u8, args: VaList) i64 {
 The declaration carries no size of its own. The selected target declares what a
 `va_list` is on that platform, and the same source text binds correctly on every
 one of them. A target that declares none refuses the declaration by name rather
-than guessing.
+than guessing, with `abi_type.unavailable` (on `vulkan-spirv`: ``the `va_list` of
+calling convention `shader` has no layout (mirl carries no convention of the
+target)``).
 
 ### Mach can forward one and never read one
 
@@ -187,6 +206,11 @@ fun make() VaList { … }     # refused: a return position
 fun peek(ap: *VaList) { … } # refused: behind a pointer
 val raw: ptr = args :~ ptr; # refused: a cast in either direction
 ```
+
+Each is `abi_type.opaque`: ``a `va_list` cannot be read, constructed or stored.
+receive it as a parameter and pass it to the C function that consumes it``. A
+union field, a tag payload, an array parameter and a secret parameter are refused
+the same way.
 
 Reading one needs `va_arg`, and mach cannot have `va_arg`: it has no runtime
 variadics, so it has no callee that walks its own argument tail. That is not a gap
@@ -209,10 +233,11 @@ x86-64 it is a pointer into shared state that the callee advances. Forward it on
 | **System V x86-64** | `__va_list_tag[1]`, an array type, so a parameter decays to one pointer |
 | **Apple arm64** | `char *` |
 | **Microsoft x64** and **Windows arm64** | `char *` |
-| **RISC-V lp64d** | `void *` |
+| **RISC-V**, every ABI | `void *` |
+| **WebAssembly** (`wasi-wasm32`, `freestanding-wasm32`) | `void *` |
 | **AAPCS64 linux** | a 32-byte, 8-aligned composite |
 
-On the first four, spelling the parameter `ptr` is already ABI-correct. On
+On every row but the last, spelling the parameter `ptr` is already ABI-correct. On
 AAPCS64-linux it is not, and the way it fails is the reason this type exists rather
 than a documented caveat: AAPCS64 passes a composite over 16 bytes indirectly, with
 the **caller** owning the copy, so a `ptr` forwards the received pointer instead of
@@ -235,18 +260,14 @@ ext fun consume(w: Wide) i64;
 This is the platform convention, and mach has no second one. A Mach→Mach call, a
 call through a `fun` value, a callback C invokes and an exported symbol reached by
 `dlsym` are all the same edge, so a C caller and a mach caller hand a mach callee the
-same thing, and a C callee and a mach callee do the same thing with it. Mach used to
-copy an incoming aggregate into storage of its own at entry as well, which made two
-copies of every such argument; [mach#3418][3418] ruled that out and
-[mach#3416][3416] removed it.
+same thing, and a C callee and a mach callee do the same thing with it.
+A mach callee copies nothing at entry: a second copy of every such argument would
+be wasted, since the caller already owns one.
 
 What the language guarantees on top of the convention is the capture point, not a
 second copy: reading an aggregate captures its value where it is read, so a later
 argument cannot change what an earlier one passed
 (see [expressions.md](expressions.md)).
-
-[3418]: https://github.com/briar-systems/mach/issues/3418
-[3416]: https://github.com/briar-systems/mach/issues/3416
 
 ## 128-bit integers and `__int128`
 
@@ -267,8 +288,8 @@ Win64 row is the convention GCC (mingw-w64) and Clang share: LLVM 18 made
 `i128` match `__int128` ("Changes to the X86 Backend", LLVM 18.1 release
 notes), and the Clang change that gave `fp128` the same treatment describes it
 as "identical to `i128`" and "the same as GCC": passed on the stack by
-reference and returned in `xmm0` ([llvm/llvm-project#115052][115052]). The
-corpus verifies each row against a clang `-O0` probe (`test/link/cases`).
+reference and returned in `xmm0` ([llvm/llvm-project#115052][115052]). Each row
+was taken from a clang `-O0` probe.
 
 The mach side of a 128-bit return on Win64 goes through a 16-byte frame slot:
 the two lanes are stored and `XMM0` is loaded from it (`movups`), because no
@@ -334,7 +355,7 @@ write, `::f64` (see
 ext fun printf(fmt: *u8, ...) i32;
 
 fun show(h: f16) i32 {
-    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64`; write the cast
+    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64` in a C-variadic argument. write the cast `x::f64`
 }
 ```
 
@@ -358,10 +379,13 @@ Override the symbol outright with the `symbol` decorator:
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
-An overridden name is taken **literally**: it is the object symbol, so no
-platform prefix is applied to it and you spell the exact name the object carries
-(`_write` on Darwin, `write` elsewhere). That is what lets inline asm and the
-runtime entry points name a symbol exactly.
+An overridden name is the C name, and the target's C symbol prefix is applied
+to it just as it is to a declaration's own name: `#[symbol("write")]` binds the
+`_write` a Darwin object carries and the `write` it carries elsewhere, and
+`#[symbol("main")]` defines the entry every target's runtime calls. Writing the
+prefix yourself does not work: on Darwin `#[symbol("_write")]` binds `__write`.
+The prefix is only ever added, never stripped, as for a manifest claim. Inline
+asm names the object symbol, so it spells the prefix (`call _main` on Darwin).
 
 Common reasons to rename:
 
@@ -369,25 +393,122 @@ Common reasons to rename:
 - The target's calling convention or ABI decorates symbol names and you
   need to match the decorated form.
 
+## One symbol, one signature
+
+A module may declare a function it also defines, by giving the `ext fun` and the
+definition one symbol. Its object holds one function under that symbol, so every
+`ext fun` of the symbol states the definition's signature, and two `ext fun`s of one
+symbol state the same one. A pair whose signatures differ is refused with
+`ext.signature` at the later of the two, with the earlier one pointed at:
+
+```mach error which `sink` defines as `fun(i64, ptr) i64`
+#[symbol("sink")]
+fun sink(a: i64, p: ptr) i64 {
+    ret a + (p :~ i64);
+}
+
+#[symbol("sink")]
+ext fun c_sink(a: i64, p: *u8) i64; # error: `c_sink` declares the symbol `sink` as `fun(i64, *u8) i64`, which `sink` defines as `fun(i64, ptr) i64`. an `ext fun` states the signature of the definition it names
+```
+
+The signature is the Mach function type: the parameter types in order, the result
+type and whether a C-variadic `...` ends it. Parameter names are no part of it, an
+alias is the type it names, and a constant-time mode is no part of it either, since
+a declaration with no body states none. It is never what the types lower to: `*u8`
+and `ptr` differ although both are one pointer, and so do `VaList` and `ptr`, which
+are both one pointer on System V x86-64 and differ on AAPCS64 linux. Deciding on the
+Mach types keeps one answer for one source on every target.
+
+The rule holds within one module, and across every module of an artifact that a
+target compiles whole as one unit, as SPIR-V does (see [gpu.md](gpu.md)), since
+those modules also become one object. Modules compiled apart each hold their own
+declaration, and the link joins them by name.
+
+## One symbol, one meaning
+
+The rule above holds what a module states for one symbol to one signature. Beside
+it stands a rule for what a module refers to by a symbol. A module that defines a
+symbol refers to no other module's declaration by it, since its object holds one
+function or global under the name and the reference would reach the module's own
+definition, never the declaration it names. The reference is refused with
+`name.clash`, with the module's definition and the other module's declaration
+pointed at:
+
+```mach fragment
+# file: src/other.mach
+#[constant_time("soft")]
+pub fun gsoft[T](a: ^T) ^T {
+    ret a + 3;
+}
+
+# file: src/evil.mach
+#[symbol("example.other.gsoft$u64")]
+pub fun evil(a: u64) u64 {
+    ret a + 1000;
+}
+
+# file: src/main.mach
+use example.other;
+use example.evil;
+
+# this module's object holds its own copy of `other.gsoft[u64]`, under that symbol
+#[constant_time("soft")]
+fun f(a: ^u64) ^u64 {
+    ret other.gsoft[u64](a);
+}
+
+fun g(n: u64) u64 {
+    ret evil.evil(n); # error: `example.evil.evil` has the symbol `example.other.gsoft$u64`, which this module defines as an instance of `example.other.gsoft`. a module refers to no other module's declaration by a symbol it defines
+}
+```
+
+What a module defines is each function and global it declares with a body, each
+test, and each instance or copy its object compiles, including an instance made
+only because another instance it compiles calls it. Either may come first in the
+module. Its own `ext fun` of its own definition means the definition, and the rule
+above holds the two to one signature. Another module's declaration is a second
+meaning even when it is an `ext fun` stating the same signature, and even where the
+link would bind it to this module's definition. A module that defines nothing under
+the symbol may refer to other modules' declarations of it, and the link decides what
+it names. The modules a target compiles whole as one unit count as one module.
+
+A `#[weak]` definition takes no part in the rule, either as the module's own
+definition or as the declaration referred to: a weak definition is replaced at link
+by the definition another module gives, so it is not this module's meaning of the
+symbol. A module may define a default and call another module's replacement of it,
+or the reverse, and the link binds the two (see
+[decorators.md](decorators.md#weakstr--a-definition-as-a-link-time-default)).
+
+An `ext fun` naming another module's definition is not checked against it. Where
+its signature differs, the source is wrong about the definition, and every call
+goes through the `ext fun` as written, at every optimisation level.
+
+The refusal comes from a build, not from `mach check`, because the instances a
+module's object compiles are known only once the object is made.
+
 ## Library attribution
 
 On a two-level dynamic format — PE (Windows) or Mach-O (Darwin) — the `library`
 decorator pins an `ext` import to the dependency that exports it:
 
 ```mach
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
-- The value names a link dependency's stable logical identity. A `[link.X]`
-  requirement supplies it through `library = "..."`, defaulting to `X`; a bare
-  command-line `-l name` uses `name`. The dependency's exact canonical loader
-  name (`libfoo.so.3`, an `LC_ID_DYLIB` install name, or `foo.dll`) is also
-  accepted for compatibility. The named library **must** be among the link's
-  dependencies; pinning to one that is not is a hard link error
+- The value names a link dependency by its identity: the table key of a
+  `[link.X]` entry, `X`, or the `name` of a command-line `-l name`. A loader
+  name (`libfoo.so.3`, an `LC_ID_DYLIB` install name, or `foo.dll`) does not
+  bind: an import attributed to the loader name of an entry is refused
+  (`import '<sym>' is attributed to '<loader>', the loader name of link entry
+  '<key>'. #[library] names a link entry by its table key, so write
+  #[library("<key>")]`). An import that a linked import library declares is
+  attributed to the key of the entry that links that import library, never to
+  the DLL name the import library records. The named library **must** be
+  among the link's dependencies; pinning to one that is not is a hard link error
   (`import '<sym>' pinned to library '<lib>' not among the link's dependencies`),
-  never a silent fallback. A logical identity that equals a different
-  dependency's loader name is rejected as ambiguous.
+  never a silent fallback. A key that equals a different dependency's loader
+  name is rejected as ambiguous.
 - An `ext` import with no `library` is unattributed. PE and Mach-O require every
   dynamic import to identify its provider, so an unattributed import is a hard
   link error on those targets.
@@ -416,8 +537,8 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
 under the renamed symbol within the named library.
 
 ```mach
-# imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach
-#[library("ws2_32.dll")]
+# imported as `socket` from the ws2_32 entry, called as `ws2_socket` in Mach
+#[library("ws2_32")]
 #[symbol("socket")]
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
@@ -442,6 +563,19 @@ On a format whose loader resolves imports by global search (ELF), an import is
 not bound to a single dependency, so `library` has no effect on the emitted
 binary — the value is still validated against the link's dependencies, but every
 dependency is searched at load time regardless.
+
+On wasm an import names the module its host supplies it from. `library` naming a
+`[link.<key>]` entry of `kind = "module"` imports the function from that module,
+under its link name (see [manifest.md](manifest.md#import-modules)). An import no
+entry attributes comes from the module the system supplies, `wasi_snapshot_preview1`
+on `wasi`. A freestanding `wasm32` target's system supplies none, so there an import
+nothing defines and no entry attributes is a hard link error naming the function.
+
+```mach
+# imported as host.report by a module of a freestanding wasm32 target
+#[library("host")]
+ext fun report(n: i32);
+```
 
 ## Vector arguments and the C ABI
 
@@ -522,7 +656,11 @@ link time, either **statically** by an external precompiled object/archive or
 **dynamically** by a shared library bound at load time. Provide those inputs to
 `mach build` either on the command line or through the project manifest. An
 undefined `ext` symbol that no static object defines and no shared library can
-bind is a link error.
+bind is a link error when code the link keeps refers to it. The link drops what
+nothing reaches from the program's roots before it judges undefined symbols, so
+an `ext fun` called only from functions nothing calls needs no definition: a
+binding module may declare functions a given provider lacks, and a program that
+never calls them links without them.
 
 ### Command line
 
@@ -536,7 +674,7 @@ mach build . path/to/libfoo.so
 mach build . path/to/libfoo.dylib
 mach build . foo.dll
 
-# search dir + library name: static candidates first, then the target's .so/.dylib spelling
+# search dir + library name, found by mink as a shared library
 mach build . -L build/libs -l foo
 
 # link against a system shared library (libc) dynamically
@@ -545,60 +683,86 @@ mach build . -l c
 
 - A bare argument that contains a `/`, ends in `.o` (object) or `.a` (archive),
   or names a `.so`, `.dylib`, or `.dll` is treated as an explicit input. A
-  relative path is tried first against the working directory, then against the
-  project root.
-- `-l <name>` resolves to an object, archive, or shared library: each `-L <dir>`
-  is searched for `lib<name>.o`, `<name>.o`, `lib<name>.a`, then `<name>.a`;
-  finally the working directory is searched for the same four names (loose
-  objects preferred over archives). Only if no static candidate exists does it
-  fall back to the selected target's shared spelling: `lib<name>.so[.N]` for
-  ELF or `lib<name>[.<N>].dylib` for Mach-O. A resolved `@rpath/` dylib carries
-  its selected directory into the executable as `LC_RPATH`. `-L` and `-l` may
-  each be repeated.
+  relative path is read against the working directory, where it was typed, and
+  nowhere else. A manifest's `local` path is anchored at the project that
+  declares it instead (see
+  [manifest.md](manifest.md#linkname--link-requirements)). Any other argument
+  after the project is refused, since a library named without a path is
+  `-l <name>`.
+- `-l <name>` is handed to mink's library search, which finds it as the link
+  runs. The directories are each `-L <dir>` in order, then the working
+  directory, then the system's library directories the target's host row in
+  mink's catalog states. A `-l` name is a shared library and nothing else: a
+  static library is skipped, and a search that finds no shared library is
+  refused. Link a static library by its path, or by a `[link.X]` entry with
+  `kind = "static"`. mach keeps no search of its own. `-L` and `-l` may each be
+  repeated.
+- A library is searched for by name only where the target's environment
+  provides system libraries. On Linux that is `env = "gnu"` in the target, or
+  `--env gnu` on an entry build. A target that states no `env` refuses `-l c` (``the target states no environment that provides system libraries, so
+  `c` has nowhere to be found (linux)``).
 
 ### Manifest
 
 Artifacts name typed `[link.X]` requirements. Use `system` for a named library,
 `framework` for a Darwin framework, or `local` for an object/archive/shared
-library path. Filters select the applicable target:
+library path. A `system` entry naming a library by a bare name is shared unless
+it says `kind = "static"`, with no fallback in either direction (see
+[manifest.md](manifest.md#linkname--link-requirements)). Filters select the
+applicable target:
 
 ```toml
 [link.foo-unix]
 source  = "system"
 name    = "foo"
-library = "foo"
-os      = ["linux", "darwin"]
-isa     = "*"
-abi     = "*"
+sys      = ["linux", "darwin"]
+arch     = ["*"]
+abi     = ["*"]
 export  = false
 
 [link.foo-win]
 source  = "system"
 name    = "foo.dll"
-library = "foo"
-os      = "windows"
-isa     = "*"
-abi     = "*"
+sys      = ["windows"]
+arch     = ["*"]
+abi     = ["*"]
 export  = false
 ```
 
-Both entries expose the logical name `foo`, so `#[library("foo")]` is portable
-across the mutually exclusive target filters. Manifest and command-line inputs
-are both included; a name that cannot be resolved is a hard error.
+The entries are mutually exclusive, so the binding selects the key with a
+constant under `$if` and writes one attribution:
+
+```mach
+use std.types.string.str;
+
+$if ($mach.build.sys == $mach.sys.windows) {
+    val FOO: str = "foo-win";
+}
+$or {
+    val FOO: str = "foo-unix";
+}
+
+#[library(FOO)]
+ext fun foo_init() i32;
+```
+
+Manifest and command-line inputs are both included; a name that cannot be
+resolved is a hard error.
 
 ### Scope
 
 Loose `.o` relocatable objects and static `.a` archives are linked **statically**.
 An archive contributes only the members that define a symbol left undefined by
 the objects and members before it, selected to a fixed point within that
-archive, so a vendored archive costs the binary exactly the members it uses
-(`mach help build` states the resolution rules). A shared `.so`, `.dylib`, framework,
+archive, so a vendored archive costs the binary exactly the members it uses.
+A shared `.so`, `.dylib`, framework,
 or `.dll` is a **dynamic** dependency: its format-specific canonical loader name
-is recorded and undefined `ext` functions become run-time imports. A shared
-input is validated before it is recorded: a `.so` that is not a loadable ELF
-shared object for the selected architecture (a linker script, a
-foreign-architecture file) is refused (`'<file>' is not a loadable ELF shared
-object for the selected architecture`). A static definition always wins over a
+is recorded and undefined `ext` functions become run-time imports. A file no
+object format reads is read as a GNU linker script where the target's system
+uses them, as glibc's `libc.so` is: its `GROUP` and `INPUT` entries enter the
+link in order, and each file it names is checked for the link's architecture as
+it is read. A file the link names that is for another architecture, a shared
+library among them, is refused. A static definition always wins over a
 same-named dynamic import.
 
 ## See also

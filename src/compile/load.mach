@@ -1,0 +1,660 @@
+# loading a project's modules: the load walk, reloads after an edit, and the emit order
+#
+# the walk is the front end's loader (mach.front.load), which calls back here for module
+# rows, parses and comptime contexts. `target_context` is the comptime context a build's
+# target and options give every module.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mach.base.diagnostic;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.source.provider;
+use mach.base.source.provider.disk;
+use mach.base.source.provider.overlay;
+use cache_record: mach.compile.cache.record;
+use mach.compile.readahead;
+use mach.compile.request;
+use mach.front.ast;
+use comptime_path: mach.front.comptime.path;
+use mach.front.expect;
+use front_load: mach.front.load;
+use mach.front.parser.state;
+use mach.report.readout;
+use mach.session;
+use mach.session.query;
+use collections_vector: std.collections.vector;
+
+use mach.base.fail;
+use mach.base.growth;
+use mach.compile.frontend;
+use mach.compile.project;
+use comptime_scope: mach.front.comptime.scope;
+use report_phase:   mach.report.phase;
+use mach.session.module;
+use target_facts: mach.target.facts;
+use mach.target.resolved;
+
+# the fully qualified name of a target's entry module, under the project id
+# ---
+# p:   project whose id prefixes the name
+# t:   target entry whose entrypoint names the module
+# ret: the interned name, or a failure when the entrypoint or id is not interned or the name cannot be composed
+pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) res[intern.StrId, fail.Fail] {
+    val opt_interner_entry: opt[str] = intern.get(p.s.interner, t.entrypoint);
+    if (sel opt_interner_entry.none) { ret res[intern.StrId, fail.Fail].err{fail.message("entrypoint StrId not interned")}; }
+    val ep_text: str = opt_interner_entry.some;
+
+    val opt_id_text: opt[str] = intern.get(p.s.interner, p.config.id);
+    if (sel opt_id_text.none) { ret res[intern.StrId, fail.Fail].err{fail.message("project id StrId not interned")}; }
+
+    ret module.compose_fqn(p.alloc, p.s.interner, opt_id_text.some, ep_text);
+}
+
+# two paths joined
+# ---
+# alloc: allocator for the result
+# a:     the leading path
+# b:     the path joined onto it
+# ret:   the joined path, owned by the caller in `alloc`, or the allocation failure
+pub fun join_path(alloc: *A.Allocator, a: str, b: str) res[str, fail.Fail] {
+    val res_join: res[types_path.Path, A.Error] = types_path.join(alloc, a, b);
+    if (sel res_join.err) { ret res[str, fail.Fail].err{fail.refused(res_join.err)}; }
+    ret res[str, fail.Fail].ok{res_join.ok};
+}
+
+# the comptime context of a build for `t` under `req`, whose back end states `facts`: every
+# fact comptime reads from the target and the build options, and nothing of a project, so
+# the build and the editor fold the same program the same way
+pub fun target_context(alloc: *A.Allocator, t: *resolved.Target, facts: target_facts.Facts, req: *request.BuildRequest,
+    compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime_scope.ComptimeCtx {
+    var build_mode_id: u32 = comptime_path.MODE_DEBUG;
+    if (request.is_release(req)) { build_mode_id = comptime_path.MODE_RELEASE; }
+    # a build is position independent exactly when the executable it links is
+    var build_pie: u32 = 0;
+    if (resolved.pie(t)) { build_pie = 1; }
+    ret comptime_scope.init(alloc, facts, comptime_scope.build_facts(build_mode_id, build_pie, compiler_name, compiler_ver));
+}
+
+# the comptime context a module of `artifact` evaluates in under the cell's target, what
+# `$bin.name` reads; the load adds what the module's own source says
+fun artifact_context(p: *project.Project, artifact: intern.StrId) res[comptime_scope.ComptimeCtx, fail.Fail] {
+    if (p == nil || p.target_entry == nil) {
+        ret res[comptime_scope.ComptimeCtx, fail.Fail].err{fail.message("driver: module context requires an opened project and request")};
+    }
+    var ctx: comptime_scope.ComptimeCtx = target_context(p.alloc, ?p.target, p.back.facts, ?p.req, p.compiler_name, p.compiler_ver);
+    ctx.env.laying              = p.back.laying;
+    ctx.env.build.project_id    = p.config.id;
+    ctx.env.build.project_ver   = p.config.version;
+    ctx.env.build.os_name       = p.target_entry.os_name;
+    ctx.env.build.isa_name      = p.target_entry.isa_name;
+    ctx.env.build.abi_name      = p.target_entry.abi_name;
+    ctx.env.build.platform_name = p.target_entry.platform_name;
+    ctx.env.build.bin_name      = artifact;
+    val res_kind: res[intern.StrId, fail.Fail] = artifact_kind(p, artifact);
+    if (sel res_kind.err) { ret res[comptime_scope.ComptimeCtx, fail.Fail].err{res_kind.err}; }
+    ctx.env.build.bin_kind = res_kind.ok;
+    ret res[comptime_scope.ComptimeCtx, fail.Fail].ok{ctx};
+}
+
+# the kind of the artifact named `artifact` as the manifest spells it, what `$bin.kind` reads:
+# the cell's own or one the union walk loads, STR_NIL for a build of no artifact
+pub fun artifact_kind(p: *project.Project, artifact: intern.StrId) res[intern.StrId, fail.Fail] {
+    if (intern.str_is_nil(artifact))                  { ret res[intern.StrId, fail.Fail].ok{intern.STR_NIL}; }
+    if (intern.str_same(p.config.bin_name, artifact)) { ret res[intern.StrId, fail.Fail].ok{p.config.bin_kind}; }
+    var i: u32 = 0;
+    for (i < p.union_entry_count) {
+        if (intern.str_same(p.union_entries[i].artifact, artifact)) { ret project.kind_name(p, p.union_entries[i].kind); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < p.foreign_entry_count) {
+        if (intern.str_same(p.foreign_entries[i].artifact, artifact)) { ret project.kind_name(p, p.foreign_entries[i].kind); }
+        i = i + 1;
+    }
+    ret res[intern.StrId, fail.Fail].err{fail.message("driver: a module's artifact is none the project declares")};
+}
+
+# the packages the cell compiles, as the disk provider reads them: the root project first, then
+# each dependency of the closure
+fun packages_set(p: *project.Project) err[fail.Fail] {
+    disk.packages_clear(?p.disk);
+    val err_root: err[fail.Fail] = disk.package_add(?p.disk, disk.Package{
+        id:     p.config.id, version: p.config.version, dir: p.config.project_root, src: p.config.dir_src, root: true,
+        warned: request.shows_warnings(?p.req, true)
+    });
+    if (sel err_root.err) { ret err_root; }
+    var k: u32 = 0;
+    for (k < p.config.dep_count) {
+        val dep:       *project.DepEntry = ?p.config.deps[k];
+        val err_added: err[fail.Fail]    = disk.package_add(?p.disk, disk.Package{
+            id:     dep.project_id, version: dep.manifest.version, dir: dep.vendor_root, src: dep.project_dir_src, root: false,
+            warned: request.shows_warnings(?p.req, false)
+        });
+        if (sel err_added.err) { ret err_added; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# one entry of the load, run in one query operation, which the walk's parses and every syntax it
+# reads belong to; a parse that fails in it is the root whose diagnostics the entry presents
+# ---
+# p:         the project
+# operation: the operation the entry runs in
+# failed:    the parse of each module whose parse failed in the entry
+# ahead:     the files read and parsed ahead of the walk, when `reading` (on more than one thread)
+rec Walk {
+    p:         *project.Project;
+    operation: query.Operation;
+    failed:    collections_vector.Vector[query.QueryKey];
+    ahead:     readahead.ReadAhead;
+    reading:   bool;
+}
+
+fun walk_init(p: *project.Project) Walk {
+    ret Walk{p: p, operation: query.Operation{}, failed: collections_vector.init[query.QueryKey](p.alloc)};
+}
+
+fun walk_dnit(w: *Walk) {
+    front_load.unbind(?w.p.loader);
+    if (w.reading) {
+        readahead.close(?w.ahead);
+        w.p.ahead = nil;
+        w.reading = false;
+    }
+    collections_vector.dnit[query.QueryKey](?w.failed);
+}
+
+# the project's loader, pointed at the project where it is now and run for `w`: the project is a
+# value its callers move, so what the loader holds of it is bound again before each use
+fun loader_of(w: *Walk) res[*front_load.Loader, fail.Fail] {
+    val p: *project.Project = w.p;
+    if (p.disk.packages.len == 0) {
+        val err_placed: err[fail.Fail] = packages_set(p);
+        if (sel err_placed.err) { ret res[*front_load.Loader, fail.Fail].err{err_placed.err}; }
+    }
+    p.overlay = overlay.init(disk.provider_of(?p.disk), ?p.s.overlays);
+    val host: front_load.Host = front_load.Host{
+        ctx:     w::ptr, add: host_add, row: host_row, syntax: host_syntax, text: host_text, parse: host_parse,
+        context: host_context, done: host_done
+    };
+    front_load.bind(?p.loader, host, overlay.provider_of(?p.overlay), ?p.diags);
+    ret res[*front_load.Loader, fail.Fail].ok{?p.loader};
+}
+
+# open the operation an entry runs in, with the loader bound to it
+fun walk_begin(w: *Walk) res[*front_load.Loader, fail.Fail] {
+    val res_loader_of: res[*front_load.Loader, fail.Fail] = loader_of(w);
+    if (sel res_loader_of.err) { ret res_loader_of; }
+    val res_begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(w.p);
+    if (sel res_begun.err) { ret res[*front_load.Loader, fail.Fail].err{res_begun.err}; }
+    w.operation = res_begun.ok;
+    w.reading   = readahead.open(?w.ahead, w.p.s, overlay.provider_of(?w.p.overlay), w.p.req.threads);
+    if (w.reading) { w.p.ahead = ?w.ahead; }
+    ret res_loader_of;
+}
+
+# close an entry's operation and show what it collected
+fun walk_end(w: *Walk, result: err[fail.Fail]) err[fail.Fail] {
+    ret frontend.finish_query_phase(w.p, w.operation, w.failed.data, w.failed.len, result);
+}
+
+fun host_add(ctx: ptr, fqn: intern.StrId, sid: module.StableModuleId) res[module.ModuleId, fail.Fail] {
+    val p:        *project.Project = (ctx::*Walk).p;
+    val err_slot: err[fail.Fail]   = project.module_reserve(p);
+    if (sel err_slot.err) { ret res[module.ModuleId, fail.Fail].err{err_slot.err}; }
+    var m: project.ModuleEntry;
+    m.fqn              = fqn;
+    m.file_id          = base_source.FILE_NIL;
+    m.stable_id        = sid;
+    m.unit             = nil;
+    m.object           = nil;
+    m.object_output    = "";
+    m.object_away      = false;
+    m.ir_output        = "";
+    m.asm_output       = "";
+    m.staged           = nil;
+    m.record           = project.Record{};
+    m.staged_facts     = cache_record.Facts{};
+    m.cache_checked    = false;
+    m.cache_hit        = false;
+    m.cache_keyed      = false;
+    m.frontend_skipped = false;
+    m.test             = project.TestObject{};
+    m.load             = front_load.Module{};
+    m.lower_scoped     = false;
+    m.expects          = expect.Index{};
+    m.released         = false;
+    var cache_byte: usize = 0;
+    for (cache_byte < 32) {
+        m.cache_under[cache_byte] = 0;
+        cache_byte                = cache_byte + 1;
+    }
+    ret res[module.ModuleId, fail.Fail].ok{project.module_append(p, m)};
+}
+
+fun host_row(ctx: ptr, mid: module.ModuleId) front_load.Row {
+    val m: *project.ModuleEntry = project.module_at((ctx::*Walk).p, mid::u32);
+    ret front_load.Row{name: m.fqn, stable: m.stable_id, file: m.file_id, load: ?m.load};
+}
+
+fun host_syntax(ctx: ptr, mid: module.ModuleId) *ast.Ast {
+    val p: *project.Project = (ctx::*Walk).p;
+    ret frontend.syntax(p, project.module_at(p, mid::u32));
+}
+
+# a module's parse in the entry's operation; a failed one is kept as a root the entry presents
+fun host_parse(ctx: ptr, mid: module.ModuleId, file: base_source.FileId, reported: bool) err[fail.Fail] {
+    val w:          *Walk                = ctx::*Walk;
+    val p:          *project.Project     = w.p;
+    val opt_t_load: readout.Instant      = readout.item_begin(p.progress);
+    val m:          *project.ModuleEntry = project.module_at(p, mid::u32);
+    m.file_id = file;
+    val res_acquired: res[frontend.ParsedModule, fail.Fail] = acquire_parse_view(p, mid);
+    if (sel res_acquired.err) {
+        val res_kept: res[usize, A.Error] = collections_vector.push[query.QueryKey](?w.failed, query.QueryKey{kind: ?frontend.PARSE, key: base_source.file_index(file)::u64});
+        if (sel res_kept.err) {
+            diagnostic.note_lost(?p.diags);
+            diagnostic.note_lost(?p.s.diags);
+        }
+        ret err[fail.Fail].err{res_acquired.err};
+    }
+    if (w.reading) {
+        val opt_file: opt[*base_source.SourceFile] = base_source.get(p.s.sources, file);
+        if (sel opt_file.some) { readahead.propose_uses(?w.ahead, opt_file.some.path, res_acquired.ok.a, opt_file.some.text); }
+    }
+    if (reported) { readout.item(p.progress, readout.LOAD, intern.text(p.s.interner, m.fqn), opt_t_load); }
+    ret err[fail.Fail].ok{};
+}
+
+fun host_text(ctx: ptr, path: str) opt[provider.Text] {
+    val w: *Walk = ctx::*Walk;
+    if (!w.reading) { ret opt[provider.Text].none{}; }
+    ret readahead.text_for(?w.ahead, path);
+}
+
+fun host_context(ctx: ptr, artifact: intern.StrId) res[comptime_scope.ComptimeCtx, fail.Fail] {
+    ret artifact_context((ctx::*Walk).p, artifact);
+}
+
+fun host_done(ctx: ptr, mid: module.ModuleId) err[fail.Fail] {
+    ret topo_push((ctx::*Walk).p, mid);
+}
+
+# load the module `fqn` names and everything it reaches
+pub fun module_load(p: *project.Project, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val res_walk_begin: res[*front_load.Loader, fail.Fail] = walk_begin(?w);
+    if (sel res_walk_begin.err) { ret res[module.ModuleId, fail.Fail].err{res_walk_begin.err}; }
+    val res_loaded: res[module.ModuleId, fail.Fail] = front_load.module_load(res_walk_begin.ok, fqn);
+    var err_loaded: err[fail.Fail]                  = err[fail.Fail].ok{};
+    if (sel res_loaded.err) { err_loaded = err[fail.Fail].err{res_loaded.err}; }
+    val err_shown: err[fail.Fail] = walk_end(?w, err_loaded);
+    if (sel err_shown.err) { ret res[module.ModuleId, fail.Fail].err{err_shown.err}; }
+    ret res_loaded;
+}
+
+# parse the module `fqn` names as a root, without walking it
+pub fun module_load_one(p: *project.Project, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val res_walk_begin: res[*front_load.Loader, fail.Fail] = walk_begin(?w);
+    if (sel res_walk_begin.err) { ret res[module.ModuleId, fail.Fail].err{res_walk_begin.err}; }
+    val res_opened: res[module.ModuleId, fail.Fail] = front_load.module_load_one(res_walk_begin.ok, fqn);
+    var err_opened: err[fail.Fail]                  = err[fail.Fail].ok{};
+    if (sel res_opened.err) { err_opened = err[fail.Fail].err{res_opened.err}; }
+    val err_shown: err[fail.Fail] = walk_end(?w, err_opened);
+    if (sel err_shown.err) { ret res[module.ModuleId, fail.Fail].err{err_shown.err}; }
+    ret res_opened;
+}
+
+# whether the load reached the module `fqn` names and never read its file
+pub fun module_unread(p: *project.Project, fqn: intern.StrId) bool {
+    val opt_mid: opt[module.ModuleId] = front_load.module_find(?p.loader, fqn);
+    if (sel opt_mid.none) { ret false; }
+    ret base_source.file_is_nil(project.module_at(p, opt_mid.some::u32).file_id);
+}
+
+# reparse and re-walk one loaded module after its text changed, and say whether its load surface
+# survived, so the project's other modules stand as they are; every product the project holds of
+# the module is dropped, since each is keyed by the old syntax tree
+pub fun module_reload(p: *project.Project, mid: module.ModuleId) res[bool, fail.Fail] {
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val res_walk_begin: res[*front_load.Loader, fail.Fail] = walk_begin(?w);
+    if (sel res_walk_begin.err) { ret res[bool, fail.Fail].err{res_walk_begin.err}; }
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+    project.lower_scope_dnit(m);
+    project.recorded_dnit(m);
+    m.unit               = nil;
+    m.object             = nil;
+    m.object_output      = "";
+    m.object_away        = false;
+    m.ir_output          = "";
+    m.asm_output         = "";
+    m.staged             = nil;
+    m.cache_checked      = false;
+    m.cache_hit          = false;
+    m.cache_keyed        = false;
+    m.frontend_skipped   = false;
+    m.test.unit          = nil;
+    m.test.object        = nil;
+    m.test.object_output = "";
+    m.test.object_away   = false;
+    m.test.staged        = nil;
+    m.test.cache_checked = false;
+    m.test.cache_hit     = false;
+    val res_kept:     res[bool, fail.Fail] = front_load.module_reload(res_walk_begin.ok, mid);
+    var err_reloaded: err[fail.Fail]       = err[fail.Fail].ok{};
+    if (sel res_kept.err) { err_reloaded = err[fail.Fail].err{res_kept.err}; }
+    val err_shown: err[fail.Fail] = walk_end(?w, err_reloaded);
+    if (sel err_shown.err) { ret res[bool, fail.Fail].err{err_shown.err}; }
+    ret res_kept;
+}
+
+# mark in `reached`, by module index, every module the build target's own frame reaches from the
+# modules marked there already, the loader bound for the walk
+pub fun reach(p: *project.Project, reached: *bool) err[fail.Fail] {
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val res_loader_of: res[*front_load.Loader, fail.Fail] = loader_of(?w);
+    if (sel res_loader_of.err) { ret err[fail.Fail].err{res_loader_of.err}; }
+    ret front_load.build_reach(res_loader_of.ok, reached);
+}
+
+# record the strings a module's decorator arguments evaluate to, from the syntax the project's
+# operations last published
+pub fun decorators_record(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val res_loader_of: res[*front_load.Loader, fail.Fail] = loader_of(?w);
+    if (sel res_loader_of.err) { ret err[fail.Fail].err{res_loader_of.err}; }
+    ret front_load.decorators_record(res_loader_of.ok, mid);
+}
+
+# a module's parse in the open operation; a parse that published nothing is the load's
+# failure for the module, which the module's status keeps past the operation that lends it
+fun acquire_parse_view(p: *project.Project, mid: module.ModuleId) res[frontend.ParsedModule, fail.Fail] {
+    val m:            *project.ModuleEntry                  = project.module_at(p, mid::u32);
+    val res_acquired: res[frontend.ParsedModule, fail.Fail] = frontend.parse(p, m);
+    if (sel res_acquired.err) {
+        val failure: fail.Fail = res_acquired.err;
+        if (sel failure.reported) { report_phase.reject(?m.load.status); }
+        or                        { report_phase.internal(?m.load.status, diagnostic.failure_retain(p.s.interner, failure)); }
+    }
+    ret res_acquired;
+}
+
+# reorder the modules of the current topo order for emission: those the emit roots reach first,
+# each after what it imports, then every other module of the order the same way
+# ---
+# p:               project whose topo order and emit length are replaced
+# emit_roots:      the modules the build emits from
+# emit_root_count: length of `emit_roots`
+# ret:             ok, or the failure of an allocation or of a cycle among the loaded modules
+pub fun rebuild_topo(p: *project.Project, emit_roots: *module.ModuleId, emit_root_count: u32) err[fail.Fail] {
+    if (project.module_count(p) == 0) {
+        p.topo_len = 0;
+        ret err[fail.Fail].ok{};
+    }
+    val res_allocate: res[*bool, A.Error] = A.allocate[bool](p.alloc, project.module_count(p)::usize);
+    if (sel res_allocate.err) { ret err[fail.Fail].err{fail.refused(res_allocate.err)}; }
+    val included: *bool = res_allocate.ok;
+    fin { A.deallocate[bool](p.alloc, included, project.module_count(p)::usize); }
+    val res_allocate_alloc: res[*u8, A.Error] = A.allocate[u8](p.alloc, project.module_count(p)::usize);
+    if (sel res_allocate_alloc.err) { ret err[fail.Fail].err{fail.refused(res_allocate_alloc.err)}; }
+    val state: *u8 = res_allocate_alloc.ok;
+    fin { A.deallocate[u8](p.alloc, state, project.module_count(p)::usize); }
+    val res_allocate_usize: res[*bool, A.Error] = A.allocate[bool](p.alloc, project.module_count(p)::usize);
+    if (sel res_allocate_usize.err) { ret err[fail.Fail].err{fail.refused(res_allocate_usize.err)}; }
+    val emitted: *bool = res_allocate_usize.ok;
+    fin { A.deallocate[bool](p.alloc, emitted, project.module_count(p)::usize); }
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        included[i] = false;
+        emitted[i]  = false;
+        state[i]    = 0;
+        i           = i + 1;
+    }
+    i = 0;
+    for (i < p.topo_len) {
+        included[p.topo[i]::u32] = true;
+        i                        = i + 1;
+    }
+    i = 0;
+    val tests: bool = request.test_goal(p.req.goal);
+    for (i < emit_root_count) {
+        mark_emitted_deps(p, emit_roots[i], emitted, tests);
+        i = i + 1;
+    }
+
+    val res_moduleid: res[*module.ModuleId, A.Error] = A.allocate[module.ModuleId](p.alloc, project.module_count(p)::usize);
+    if (sel res_moduleid.err) { ret err[fail.Fail].err{fail.refused(res_moduleid.err)}; }
+    val ordered:     *module.ModuleId = res_moduleid.ok;
+    var ordered_len: u32              = 0;
+    var handed:      bool             = false;
+    fin {
+        if (!handed) { A.deallocate[module.ModuleId](p.alloc, ordered, project.module_count(p)::usize); }
+    }
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: module.ModuleId = p.topo[i];
+        if (!emitted[mid::u32]) {
+            i = i + 1;
+            cnt;
+        }
+        val err_topo_visit: err[fail.Fail] = topo_visit(p, mid, included, state, ordered, ?ordered_len, tests);
+        if (sel err_topo_visit.err) { ret err_topo_visit; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: module.ModuleId = p.topo[i];
+        if (emitted[mid::u32]) {
+            i = i + 1;
+            cnt;
+        }
+        val err_topo_visit: err[fail.Fail] = topo_visit(p, mid, included, state, ordered, ?ordered_len, true);
+        if (sel err_topo_visit.err) { ret err_topo_visit; }
+        i = i + 1;
+    }
+
+    if (p.topo != nil && p.topo_cap > 0) {
+        A.deallocate[module.ModuleId](p.alloc, p.topo, p.topo_cap::usize);
+    }
+    p.topo     = ordered;
+    handed     = true;
+    p.topo_len = ordered_len;
+    p.topo_cap = project.module_count(p);
+    p.emit_len = 0;
+    for (p.emit_len < p.topo_len && emitted[p.topo[p.emit_len]::u32]) {
+        p.emit_len = p.emit_len + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# every module `mid` reaches marked emitted: through every import in a build of the tests, and
+# otherwise through the imports not marked `#[testing]`
+# the modules a build that runs no tests emits narrowed to those its entries `entries[0 .. count]` reach through
+# imports not marked `#[testing]`, each after what it imports: a module reached only through `#[testing] use` is
+# checked but not emitted
+pub fun untested(p: *project.Project, entries: *module.ModuleId, count: u32) err[fail.Fail] {
+    if (p.emit_len == 0) { ret err[fail.Fail].ok{}; }
+    ret rebuild_topo(p, entries, count);
+}
+
+fun mark_emitted_deps(p: *project.Project, mid: module.ModuleId, emitted: *bool, tests: bool) {
+    if (mid::u32 >= project.module_count(p) || emitted[mid::u32]) { ret; }
+    emitted[mid::u32] = true;
+    val m:    *project.ModuleEntry                              = project.module_at(p, mid::u32);
+    var list: *collections_vector.Vector[module.StableModuleId] = ?m.load.lowers;
+    if (tests) { list = ?m.load.deps; }
+    var i: usize = 0;
+    for (i < list.len) {
+        mark_emitted_deps(p, front_load.module_of(?p.loader, list.data[i]), emitted, tests);
+        i = i + 1;
+    }
+}
+
+# module `mid` placed after what it imports: every import where `all` holds, and otherwise the imports not marked
+# `#[testing]`, so the modules a build emits come first, each after the emitted modules it imports
+fun topo_visit(p: *project.Project, mid: module.ModuleId, included: *bool, state: *u8,
+    ordered: *module.ModuleId, ordered_len: *u32, all: bool) err[fail.Fail] {
+    if (mid::u32 >= project.module_count(p) || !included[mid::u32]) { ret err[fail.Fail].ok{}; }
+    if (state[mid::u32] == 2)                                       { ret err[fail.Fail].ok{}; }
+    if (state[mid::u32] == 1)                                       { ret err[fail.Fail].err{fail.message("circular module dependency through a module a union target tuple reached late")}; }
+    state[mid::u32] = 1;
+    val m:    *project.ModuleEntry                              = project.module_at(p, mid::u32);
+    var list: *collections_vector.Vector[module.StableModuleId] = ?m.load.lowers;
+    if (all) { list = ?m.load.deps; }
+    var i: usize = 0;
+    for (i < list.len) {
+        val err_topo_visit: err[fail.Fail] = topo_visit(p, front_load.module_of(?p.loader, list.data[i]), included, state, ordered, ordered_len, all);
+        if (sel err_topo_visit.err) { ret err_topo_visit; }
+        i = i + 1;
+    }
+    state[mid::u32]       = 2;
+    ordered[@ordered_len] = mid;
+    @ordered_len          = @ordered_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun topo_push(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
+    val err_grown: err[A.Error] = growth.reserve[module.ModuleId](p.alloc, ?p.topo, ?p.topo_cap, p.topo_len::usize + 1);
+    if (sel err_grown.err) { ret err[fail.Fail].err{fail.refused(err_grown.err)}; }
+    p.topo[p.topo_len] = mid;
+    p.topo_len         = p.topo_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# number every module with a file, parse each in one operation and register its identity with the session
+# ---
+# p:   project whose loaded modules are registered
+# ret: ok, or the first failure of numbering, parsing, registering or presenting, after which
+#      every identity registered here is unregistered again
+pub fun register_module_asts(p: *project.Project) err[fail.Fail] {
+    var roots: collections_vector.Vector[query.QueryKey] = collections_vector.init[query.QueryKey](p.alloc);
+    fin { collections_vector.dnit[query.QueryKey](?roots); }
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        if (base_source.file_is_nil(m.file_id)) {
+            i = i + 1;
+            cnt;
+        }
+        var num:           u32            = i;
+        val err_set_input: err[fail.Fail] = query.set_input(?p.s.queries, ?frontend.MODULE_NUMBER, module.stable_index(m.stable_id)::u64, (?num)::*u8, 4);
+        if (sel err_set_input.err) { ret err_set_input; }
+        val res_saved: res[usize, A.Error] = collections_vector.push[query.QueryKey](?roots, query.QueryKey{kind: ?frontend.PARSE, key: base_source.file_index(m.file_id)::u64});
+        if (sel res_saved.err) { ret err[fail.Fail].err{fail.refused(res_saved.err)}; }
+        i = i + 1;
+    }
+    val res_begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(p);
+    if (sel res_begun.err) { ret err[fail.Fail].err{res_begun.err}; }
+    val operation:      query.Operation = res_begun.ok;
+    var err_registered: err[fail.Fail]  = err[fail.Fail].ok{};
+    i = 0;
+    for (i < project.module_count(p)) {
+        if (base_source.file_is_nil(project.module_at(p, i).file_id)) {
+            i = i + 1;
+            cnt;
+        }
+        val res_acquired: res[frontend.ParsedModule, fail.Fail] = acquire_parse_view(p, i::module.ModuleId);
+        if (sel res_acquired.err) {
+            err_registered = err[fail.Fail].err{res_acquired.err};
+            brk;
+        }
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        session.expire_views(p.s);
+        val err_registered_modules: err[fail.Fail] = module.register_module_identity(?p.s.modules, module.id(i), m.fqn, m.stable_id);
+        if (sel err_registered_modules.err) {
+            err_registered = err[fail.Fail].err{err_registered_modules.err};
+            brk;
+        }
+        i = i + 1;
+    }
+    val err_finished: err[fail.Fail] = frontend.finish_query_phase(p, operation, roots.data, roots.len, err_registered);
+    if (sel err_finished.err) {
+        var j: u32 = 0;
+        for (j < i) {
+            module.unregister_module_identity(?p.s.modules, module.id(j), project.module_at(p, j).stable_id);
+            j = j + 1;
+        }
+        ret err[fail.Fail].err{err_finished.err};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# acquire the parse of every module with a file in the open operation
+# ---
+# p:   project whose modules are parsed
+# ret: ok, or the first parse failure
+pub fun acquire_loaded_parses(p: *project.Project) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        if (!base_source.file_is_nil(project.module_at(p, i).file_id)) {
+            val res_acquired: res[frontend.ParsedModule, fail.Fail] = acquire_parse_view(p, i::module.ModuleId);
+            if (sel res_acquired.err) { ret err[fail.Fail].err{res_acquired.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# acquire the parse of every module with a file in an operation of its own and present them
+# ---
+# p:       project whose modules are parsed
+# primary: the caller's own result, which leads any failure found here
+# ret:     what finish_query_phase gives back for `primary` or the first parse failure, or
+#          `primary` or the failure itself when the roots cannot be collected or the operation
+#          cannot be opened
+pub fun collect_loaded_parses(p: *project.Project, primary: err[fail.Fail]) err[fail.Fail] {
+    var roots: collections_vector.Vector[query.QueryKey] = collections_vector.init[query.QueryKey](p.alloc);
+    fin { collections_vector.dnit[query.QueryKey](?roots); }
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val file: base_source.FileId = project.module_at(p, i).file_id;
+        if (!base_source.file_is_nil(file)) {
+            val res_added: res[usize, A.Error] = collections_vector.push[query.QueryKey](?roots, query.QueryKey{kind: ?frontend.PARSE, key: base_source.file_index(file)::u64});
+            if (sel res_added.err) {
+                diagnostic.note_lost(?p.diags);
+                diagnostic.note_lost(?p.s.diags);
+                if (sel primary.err) { ret primary; }
+                ret err[fail.Fail].err{fail.refused(res_added.err)};
+            }
+        }
+        i = i + 1;
+    }
+    val res_begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(p);
+    if (sel res_begun.err) {
+        if (sel primary.err) { ret primary; }
+        ret err[fail.Fail].err{res_begun.err};
+    }
+    val operation:   query.Operation = res_begun.ok;
+    var err_primary: err[fail.Fail]  = primary;
+    i = 0;
+    for (i < project.module_count(p)) {
+        if (!base_source.file_is_nil(project.module_at(p, i).file_id)) {
+            val res_acquired: res[frontend.ParsedModule, fail.Fail] = acquire_parse_view(p, i::module.ModuleId);
+            if (sel res_acquired.err) {
+                val result_ok: bool = sel err_primary.ok;
+                if (result_ok) { err_primary = err[fail.Fail].err{res_acquired.err}; }
+                brk;
+            }
+        }
+        i = i + 1;
+    }
+    ret frontend.finish_query_phase(p, operation, roots.data, roots.len, err_primary);
+}

@@ -1,0 +1,655 @@
+# the instances a module's sema discovers and the typing of each, which lowering reads
+#
+# an instance is one monomorphisation of a declaration: a generic at its type arguments, a
+# function with comptime value parameters at their values, or a function with a pack at its
+# element types. a frame is one typing of a stretch of syntax: frame 0 is the module's own
+# typing, which the module's typing tables hold, each instance has a root frame, and each
+# `$each` iteration has a frame under the frame its statement was typed in. a frame holds
+# what its typing decided differently from its parent's: expression and binding types, the
+# instance each call names, the verdict of each comptime gate, the constant array each
+# `$each` over one reads, and each type node a comptime parameter or loop variable sizes. a lookup walks a frame and its parents, and a miss falls to the
+# module's typing tables
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.crypto.hash.fnv1a;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.base.fail;
+use mach.base.float;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.wide;
+use ast_id:         mach.front.ast.id;
+use comptime_value: mach.front.comptime.value;
+use mach.session.module;
+use type_kind: mach.type.kind;
+
+pub def Kind: u8;
+pub val KIND_TYPE:  Kind = 0;
+pub val KIND_VALUE: Kind = 1;
+pub val KIND_PACK:  Kind = 2;
+
+pub val NONE: u32 = 0xFFFFFFFF;
+
+# the module's own typing, held by its typing tables
+pub val FRAME_TEMPLATE: u32 = 0;
+
+# one instance of a declaration, keyed by its kind, origin, declaration and arguments
+# ---
+# kind:   whether it instantiates type arguments, comptime values or a pack
+# origin: the module that declares the template
+# decl:   the template's declaration in that module
+# frame:  the instance's root frame
+pub rec Instance {
+    kind:   Kind;
+    origin: module.ModuleId;
+    decl:   ast_id.DeclId;
+    # the type arguments, for a generic
+    args:    *type_kind.TypeId;
+    arg_len: u32;
+    # the comptime value arguments and the parameters they bind
+    values:    *comptime_value.CTValue;
+    names:     *intern.StrId;
+    value_len: u32;
+    # the pack's element types
+    pack:     *type_kind.TypeId;
+    pack_len: u32;
+    # the declaration's name as written and as its module defines it, and the signature
+    # the instance was asked for at
+    bare:  intern.StrId;
+    canon: intern.StrId;
+    sig:   type_kind.TypeId;
+    # the growing cycle its declaration lies on, by the cycle's members, where `growing` holds
+    growing: bool;
+    cycle:   intern.StrId;
+    # the instance whose typing asked for this one first, how many such steps lie below
+    # it, and the place it was asked for at
+    parent:    u32;
+    depth:     u32;
+    site:      base_source.Span;
+    site_file: base_source.FileId;
+    frame:     u32;
+    # the next instance whose key hashes alike
+    next: u32;
+}
+
+# one typing of a stretch of syntax, holding what it decided apart from its parent
+# ---
+# parent: the frame an iteration was typed under, NONE for the module's and an instance's root
+# stmt:   the `$each` an iteration belongs to, nil for a root frame
+# index:  the iteration's index, or the instance id of a root frame
+# exprs:  expression types by expression index
+# decls:  binding types by declaration index
+# types:  the types of the type nodes the frame's comptime bindings size, by type node index
+# calls:  the instance each call names, by expression index
+# gates:  the verdict of each comptime gate, by condition expression index
+# arrays: the constant array each `$each` reads, by statement index
+# cases:  the case a live guard fixes of each tag place read whole, by expression index, as
+#         `case_code` encodes it
+pub rec Frame {
+    parent: u32;
+    stmt:   ast_id.StmtId;
+    index:  u32;
+    exprs:  map.Map[u32, type_kind.TypeId];
+    decls:  map.Map[u32, type_kind.TypeId];
+    types:  map.Map[u32, type_kind.TypeId];
+    calls:  map.Map[u32, u32];
+    gates:  map.Map[u32, bool];
+    arrays: map.Map[u32, comptime_value.CTValue];
+    cases:  map.Map[u32, u32];
+    # the next iteration frame whose key hashes alike
+    next: u32;
+}
+
+# a module's instances and every frame of their typing
+# ---
+# alloc:     the allocator everything is held in, nil once released
+# items:     the instances, by id
+# frames:    the frames, by id, frame 0 the module's own typing
+# by_key:    the latest instance of each key hash, earlier ones chained through `next`
+# iteration: the latest iteration frame of each iteration hash, earlier ones chained through `next`
+pub rec Set {
+    alloc:     *A.Allocator;
+    items:     collections_vector.Vector[Instance];
+    frames:    collections_vector.Vector[Frame];
+    by_key:    map.Map[u64, u32];
+    iteration: map.Map[u64, u32];
+}
+
+# the instance an `add` names
+# ---
+# id:    the instance's id in the set
+# fresh: whether the call added it, rather than finding it already there
+pub rec Added {
+    id:    u32;
+    fresh: bool;
+}
+
+# an instance set holding only frame 0, the module's own typing
+# ---
+# alloc: the allocator the set is held in
+# ret:   the set, released with `dnit`, or the failure of allocating its first frame
+pub fun init(alloc: *A.Allocator) res[Set, fail.Fail] {
+    var set: Set;
+    set.alloc     = alloc;
+    set.items     = collections_vector.init[Instance](alloc);
+    set.frames    = collections_vector.init[Frame](alloc);
+    set.by_key    = map.init[u64, u32](alloc);
+    set.iteration = map.init[u64, u32](alloc);
+    val res_root: res[u32, fail.Fail] = frame_add(?set, NONE, ast_id.STMT_NIL, 0);
+    if (sel res_root.err) {
+        dnit(?set);
+        ret res[Set, fail.Fail].err{res_root.err};
+    }
+    ret res[Set, fail.Fail].ok{set};
+}
+
+# release an instance set; a nil set, or one never made, holds nothing
+pub fun dnit(set: *Set) {
+    if (set == nil || set.alloc == nil) { ret; }
+    var i: usize = 0;
+    for (i < set.items.len) {
+        val item: *Instance = ?set.items.data[i];
+        if (item.args != nil && item.arg_len > 0)     { A.deallocate[type_kind.TypeId](set.alloc, item.args, item.arg_len::usize); }
+        if (item.values != nil && item.value_len > 0) { A.deallocate[comptime_value.CTValue](set.alloc, item.values, item.value_len::usize); }
+        if (item.names != nil && item.value_len > 0)  { A.deallocate[intern.StrId](set.alloc, item.names, item.value_len::usize); }
+        if (item.pack != nil && item.pack_len > 0)    { A.deallocate[type_kind.TypeId](set.alloc, item.pack, item.pack_len::usize); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < set.frames.len) {
+        val f: *Frame = ?set.frames.data[i];
+        map.dnit[u32, type_kind.TypeId](?f.exprs);
+        map.dnit[u32, type_kind.TypeId](?f.decls);
+        map.dnit[u32, type_kind.TypeId](?f.types);
+        map.dnit[u32, u32](?f.calls);
+        map.dnit[u32, bool](?f.gates);
+        map.dnit[u32, comptime_value.CTValue](?f.arrays);
+        map.dnit[u32, u32](?f.cases);
+        i = i + 1;
+    }
+    collections_vector.dnit[Instance](?set.items);
+    collections_vector.dnit[Frame](?set.frames);
+    map.dnit[u64, u32](?set.by_key);
+    map.dnit[u64, u32](?set.iteration);
+    set.alloc = nil;
+}
+
+# how many instances `set` holds, zero for a nil set
+# ---
+# set: the set asked about
+# ret: the instance count
+pub fun count(set: *Set) u32 {
+    if (set == nil) { ret 0; }
+    ret set.items.len::u32;
+}
+
+# the instance `id`, which must be below `count`
+# ---
+# set: the set holding it
+# id:  the instance's id
+# ret: the instance, owned by the set
+pub fun at(set: *Set, id: u32) *Instance {
+    ret ?set.items.data[id];
+}
+
+# the instance `item` names, added when no instance has its key; the arrays it points at are
+# copied, and its frame and chain are the set's to fill
+pub fun add(set: *Set, item: Instance) res[Added, fail.Fail] {
+    val opt_have: opt[u32] = find(set, ?item);
+    if (sel opt_have.some) { ret res[Added, fail.Fail].ok{Added{id: opt_have.some, fresh: false}}; }
+    val h:        u64       = key_hash(?item);
+    val opt_head: opt[*u32] = map.get[u64, u32](?set.by_key, ?h);
+
+    var owned: Instance = item;
+    owned.args   = nil;
+    owned.values = nil;
+    owned.names  = nil;
+    owned.pack   = nil;
+    var handed: bool = false;
+    fin {
+        if (!handed) { instance_dnit(set, ?owned); }
+    }
+    val res_args: res[*type_kind.TypeId, fail.Fail] = types_copy(set, item.args, item.arg_len);
+    if (sel res_args.err) { ret res[Added, fail.Fail].err{res_args.err}; }
+    owned.args = res_args.ok;
+    val res_pack: res[*type_kind.TypeId, fail.Fail] = types_copy(set, item.pack, item.pack_len);
+    if (sel res_pack.err) { ret res[Added, fail.Fail].err{res_pack.err}; }
+    owned.pack = res_pack.ok;
+    if (item.value_len > 0) {
+        val res_allocate: res[*comptime_value.CTValue, A.Error] = A.allocate[comptime_value.CTValue](set.alloc, item.value_len::usize);
+        if (sel res_allocate.err) { ret res[Added, fail.Fail].err{fail.refused(res_allocate.err)}; }
+        owned.values = res_allocate.ok;
+        val res_allocate_alloc: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](set.alloc, item.value_len::usize);
+        if (sel res_allocate_alloc.err) { ret res[Added, fail.Fail].err{fail.refused(res_allocate_alloc.err)}; }
+        owned.names = res_allocate_alloc.ok;
+        var i: u32 = 0;
+        for (i < item.value_len) {
+            res_allocate.ok[i]       = item.values[i];
+            res_allocate_alloc.ok[i] = item.names[i];
+            i                        = i + 1;
+        }
+    }
+
+    val id:        u32                 = set.items.len::u32;
+    val res_frame: res[u32, fail.Fail] = frame_add(set, NONE, ast_id.STMT_NIL, id);
+    if (sel res_frame.err) { ret res[Added, fail.Fail].err{res_frame.err}; }
+    owned.frame = res_frame.ok;
+    owned.next  = NONE;
+    if (sel opt_head.some) { owned.next = @opt_head.some; }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Instance](?set.items, owned);
+    if (sel res_pushed.err) { ret res[Added, fail.Fail].err{fail.refused(res_pushed.err)}; }
+    handed = true;
+    val res_put: res[bool, A.Error] = map.insert[u64, u32](?set.by_key, h, id);
+    if (sel res_put.err) { ret res[Added, fail.Fail].err{fail.refused(res_put.err)}; }
+    ret res[Added, fail.Fail].ok{Added{id: id, fresh: true}};
+}
+
+# the instance with `item`'s key, if the set holds one
+pub fun find(set: *Set, item: *Instance) opt[u32] {
+    val h:        u64       = key_hash(item);
+    val opt_head: opt[*u32] = map.get[u64, u32](?set.by_key, ?h);
+    var walk:     u32       = NONE;
+    if (sel opt_head.some) { walk = @opt_head.some; }
+    for (walk != NONE) {
+        if (key_same(?set.items.data[walk], item)) { ret opt[u32].some{walk}; }
+        walk = set.items.data[walk].next;
+    }
+    ret opt[u32].none{};
+}
+
+fun instance_dnit(set: *Set, item: *Instance) {
+    types_free(set, item.args, item.arg_len);
+    types_free(set, item.pack, item.pack_len);
+    if (item.values != nil && item.value_len > 0) { A.deallocate[comptime_value.CTValue](set.alloc, item.values, item.value_len::usize); }
+    if (item.names != nil && item.value_len > 0)  { A.deallocate[intern.StrId](set.alloc, item.names, item.value_len::usize); }
+}
+
+fun types_copy(set: *Set, src: *type_kind.TypeId, len: u32) res[*type_kind.TypeId, fail.Fail] {
+    if (src == nil || len == 0) { ret res[*type_kind.TypeId, fail.Fail].ok{nil}; }
+    val res_allocate: res[*type_kind.TypeId, A.Error] = A.allocate[type_kind.TypeId](set.alloc, len::usize);
+    if (sel res_allocate.err) { ret res[*type_kind.TypeId, fail.Fail].err{fail.refused(res_allocate.err)}; }
+    var i: u32 = 0;
+    for (i < len) {
+        res_allocate.ok[i] = src[i];
+        i                  = i + 1;
+    }
+    ret res[*type_kind.TypeId, fail.Fail].ok{res_allocate.ok};
+}
+
+fun types_free(set: *Set, p: *type_kind.TypeId, len: u32) {
+    if (p != nil && len > 0) { A.deallocate[type_kind.TypeId](set.alloc, p, len::usize); }
+}
+
+fun key_hash(item: *Instance) u64 {
+    var h: u64 = fnv1a.FNV_INIT;
+    h = fnv1a.step_u32(h, item.kind::u32);
+    h = fnv1a.step_u32(h, module.index(item.origin));
+    h = fnv1a.step_u32(h, ast_id.decl_index(item.decl));
+    h = types_hash(h, item.args, item.arg_len);
+    h = types_hash(h, item.pack, item.pack_len);
+    h = fnv1a.step_u32(h, item.value_len);
+    var i: u32 = 0;
+    for (i < item.value_len) {
+        h = value_hash(h, ?item.values[i]);
+        i = i + 1;
+    }
+    ret h;
+}
+
+fun types_hash(seed: u64, p: *type_kind.TypeId, len: u32) u64 {
+    var h: u64 = fnv1a.step_u32(seed, len);
+    var i: u32 = 0;
+    for (i < len) {
+        h = fnv1a.step_u32(h, type_kind.index(p[i]));
+        i = i + 1;
+    }
+    ret h;
+}
+
+# a value's identity is what names it in a symbol: an integer's value whatever its width, a
+# float's bits, a string's text
+fun value_hash(seed: u64, v: *comptime_value.CTValue) u64 {
+    var h: u64 = fnv1a.step_u32(seed, v.kind::u32);
+    if (v.kind == comptime_value.CT_KIND_INT) {
+        h = fnv1a.step_u32(h, (v.data.w.lo & 0xFFFFFFFF)::u32);
+        h = fnv1a.step_u32(h, (v.data.w.lo >> 32)::u32);
+        h = fnv1a.step_u32(h, (v.data.w.hi & 0xFFFFFFFF)::u32);
+        ret fnv1a.step_u32(h, (v.data.w.hi >> 32)::u32);
+    }
+    if (v.kind == comptime_value.CT_KIND_FLOAT) {
+        val bits: u64 = float.f64_bits(v.data.f);
+        h = fnv1a.step_u32(h, (bits & 0xFFFFFFFF)::u32);
+        ret fnv1a.step_u32(h, (bits >> 32)::u32);
+    }
+    if (v.kind == comptime_value.CT_KIND_STR) { ret fnv1a.step_u32(h, intern.str_index(v.data.s)); }
+    if (v.kind == comptime_value.CT_KIND_NODE) {
+        h = fnv1a.step_u32(h, v.data.node.module);
+        h = fnv1a.step_u32(h, v.data.node.shape);
+        h = fnv1a.step_u32(h, v.data.node.at);
+        ret fnv1a.step_u32(h, v.data.node.ty);
+    }
+    ret fnv1a.step_u32(h, v.data.t);
+}
+
+fun value_same(a: *comptime_value.CTValue, b: *comptime_value.CTValue) bool {
+    if (a.kind != b.kind)                       { ret false; }
+    if (a.kind == comptime_value.CT_KIND_INT)   { ret wide.eq(a.data.w, b.data.w); }
+    if (a.kind == comptime_value.CT_KIND_FLOAT) { ret float.f64_bits(a.data.f) == float.f64_bits(b.data.f); }
+    if (a.kind == comptime_value.CT_KIND_STR)   { ret intern.str_same(a.data.s, b.data.s); }
+    if (a.kind == comptime_value.CT_KIND_NODE) {
+        ret a.data.node.module == b.data.node.module && a.data.node.shape == b.data.node.shape && a.data.node.at == b.data.node.at && a.data.node.ty == b.data.node.ty;
+    }
+    ret a.data.t == b.data.t;
+}
+
+fun types_same(a: *type_kind.TypeId, b: *type_kind.TypeId, len: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        if (!type_kind.same(a[i], b[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun key_same(a: *Instance, b: *Instance) bool {
+    if (a.kind != b.kind || !module.same(a.origin, b.origin) || !ast_id.decl_same(a.decl, b.decl)) { ret false; }
+    if (a.arg_len != b.arg_len || a.pack_len != b.pack_len || a.value_len != b.value_len)          { ret false; }
+    if (!types_same(a.args, b.args, a.arg_len) || !types_same(a.pack, b.pack, a.pack_len))         { ret false; }
+    var i: u32 = 0;
+    for (i < a.value_len) {
+        if (!value_same(?a.values[i], ?b.values[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# appends an empty frame, returning its id
+fun frame_add(set: *Set, parent: u32, stmt: ast_id.StmtId, index: u32) res[u32, fail.Fail] {
+    var f: Frame;
+    f.parent = parent;
+    f.stmt   = stmt;
+    f.index  = index;
+    f.exprs  = map.init[u32, type_kind.TypeId](set.alloc);
+    f.decls  = map.init[u32, type_kind.TypeId](set.alloc);
+    f.types  = map.init[u32, type_kind.TypeId](set.alloc);
+    f.calls  = map.init[u32, u32](set.alloc);
+    f.gates  = map.init[u32, bool](set.alloc);
+    f.arrays = map.init[u32, comptime_value.CTValue](set.alloc);
+    f.cases  = map.init[u32, u32](set.alloc);
+    f.next   = NONE;
+    val id:         u32                 = set.frames.len::u32;
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Frame](?set.frames, f);
+    if (sel res_pushed.err) { ret res[u32, fail.Fail].err{fail.refused(res_pushed.err)}; }
+    ret res[u32, fail.Fail].ok{id};
+}
+
+fun iteration_hash(parent: u32, stmt: ast_id.StmtId, index: u32) u64 {
+    var h: u64 = fnv1a.FNV_INIT;
+    h = fnv1a.step_u32(h, parent);
+    h = fnv1a.step_u32(h, ast_id.stmt_index(stmt));
+    ret fnv1a.step_u32(h, index);
+}
+
+# the frame of iteration `index` of the `$each` at `stmt` typed in frame `parent`
+pub fun iteration_at(set: *Set, parent: u32, stmt: ast_id.StmtId, index: u32) opt[u32] {
+    val h:        u64       = iteration_hash(parent, stmt, index);
+    val opt_head: opt[*u32] = map.get[u64, u32](?set.iteration, ?h);
+    if (sel opt_head.none) { ret opt[u32].none{}; }
+    var walk: u32 = @opt_head.some;
+    for (walk != NONE) {
+        val f: *Frame = ?set.frames.data[walk];
+        if (f.parent == parent && ast_id.stmt_same(f.stmt, stmt) && f.index == index) { ret opt[u32].some{walk}; }
+        walk = f.next;
+    }
+    ret opt[u32].none{};
+}
+
+# the frame of an iteration, made the first time it is typed
+pub fun iteration_add(set: *Set, parent: u32, stmt: ast_id.StmtId, index: u32) res[u32, fail.Fail] {
+    val opt_have: opt[u32] = iteration_at(set, parent, stmt, index);
+    if (sel opt_have.some) { ret res[u32, fail.Fail].ok{opt_have.some}; }
+    val h:        u64                 = iteration_hash(parent, stmt, index);
+    val res_made: res[u32, fail.Fail] = frame_add(set, parent, stmt, index);
+    if (sel res_made.err) { ret res_made; }
+    val opt_head: opt[*u32] = map.get[u64, u32](?set.iteration, ?h);
+    if (sel opt_head.some) { set.frames.data[res_made.ok].next = @opt_head.some; }
+    val res_put: res[bool, A.Error] = map.insert[u64, u32](?set.iteration, h, res_made.ok);
+    if (sel res_put.err) { ret res[u32, fail.Fail].err{fail.refused(res_put.err)}; }
+    ret res_made;
+}
+
+# an iteration's frame, rather than an instance's or the module's
+pub fun frame_is_iteration(set: *Set, frame: u32) bool {
+    ret set.frames.data[frame].parent != NONE;
+}
+
+# records `ty` as the type of the expression `eid` in `frame`
+# ---
+# set:   the set holding the frame
+# frame: the frame typing it
+# eid:   the expression
+# ty:    its type in that frame
+# ret:   ok, or the failure of the allocation
+pub fun expr_record(set: *Set, frame: u32, eid: ast_id.ExprId, ty: type_kind.TypeId) err[fail.Fail] {
+    val res_put: res[bool, A.Error] = map.insert[u32, type_kind.TypeId](?set.frames.data[frame].exprs, ast_id.expr_index(eid), ty);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# records `ty` as the type of the binding `did` in `frame`
+# ---
+# set:   the set holding the frame
+# frame: the frame typing it
+# did:   the binding's declaration
+# ty:    its type in that frame
+# ret:   ok, or the failure of the allocation
+pub fun decl_record(set: *Set, frame: u32, did: ast_id.DeclId, ty: type_kind.TypeId) err[fail.Fail] {
+    val res_put: res[bool, A.Error] = map.insert[u32, type_kind.TypeId](?set.frames.data[frame].decls, ast_id.decl_index(did), ty);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# records the type the frame resolves the type node `tid` to, which its comptime bindings size
+# ---
+# set:   the set holding the frame
+# frame: the frame typing it
+# tid:   the type node
+# ty:    the type it resolves to in that frame
+# ret:   ok, or the failure of the allocation
+pub fun type_record(set: *Set, frame: u32, tid: ast_id.TypeId, ty: type_kind.TypeId) err[fail.Fail] {
+    val res_put: res[bool, A.Error] = map.insert[u32, type_kind.TypeId](?set.frames.data[frame].types, ast_id.type_index(tid), ty);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# records that the call or generic reference `eid` names the instance `id` in `frame`
+# ---
+# set:   the set holding the frame
+# frame: the frame typing it
+# eid:   the call or reference
+# id:    the instance it names
+# ret:   ok, or the failure of the allocation
+pub fun call_record(set: *Set, frame: u32, eid: ast_id.ExprId, id: u32) err[fail.Fail] {
+    val res_put: res[bool, A.Error] = map.insert[u32, u32](?set.frames.data[frame].calls, ast_id.expr_index(eid), id);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# records the verdict of the comptime gate whose condition is `cond` in `frame`
+# ---
+# set:    the set holding the frame
+# frame:  the frame typing it
+# cond:   the gate's condition
+# active: whether the gate's arm is taken
+# ret:    ok, or the failure of the allocation
+pub fun gate_record(set: *Set, frame: u32, cond: ast_id.ExprId, active: bool) err[fail.Fail] {
+    val res_put: res[bool, A.Error] = map.insert[u32, bool](?set.frames.data[frame].gates, ast_id.expr_index(cond), active);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a tag place read whole that no walk has typed yet
+pub val CASE_UNTYPED: u32 = 0;
+
+# a tag place read whole where no live guard fixes its case, on some walk that typed it
+pub val CASE_NONE: u32 = 1;
+
+# the code of the case `name` a live guard fixes, CASE_NONE for none
+pub fun case_code(name: intern.StrId) u32 {
+    if (intern.str_is_nil(name)) { ret CASE_NONE; }
+    ret name::u32 + 2;
+}
+
+# the case a code names, none for CASE_NONE and CASE_UNTYPED
+pub fun case_of(code: u32) opt[intern.StrId] {
+    if (code < 2) { ret opt[intern.StrId].none{}; }
+    ret opt[intern.StrId].some{(code - 2)::intern.StrId};
+}
+
+# what two walks of one place say together: a case only where every walk that typed it found
+# the same one, since a place a `$if` or an iteration types twice is read in each
+pub fun case_meet(had: u32, found: u32) u32 {
+    if (had == CASE_UNTYPED || had == found) { ret found; }
+    ret CASE_NONE;
+}
+
+# records the case `code` a walk found fixed of the tag place `eid` read whole in `frame`, met
+# with what an earlier walk of it in that frame found
+pub fun case_record(set: *Set, frame: u32, eid: ast_id.ExprId, code: u32) err[fail.Fail] {
+    val key:       u32       = ast_id.expr_index(eid);
+    var met:       u32       = code;
+    val opt_found: opt[*u32] = map.get[u32, u32](?set.frames.data[frame].cases, ?key);
+    if (sel opt_found.some) { met = case_meet(@opt_found.some, code); }
+    val res_put: res[bool, A.Error] = map.insert[u32, u32](?set.frames.data[frame].cases, key, met);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the case code of the tag place `eid` in `frame` or the nearest parent that records one,
+# CASE_UNTYPED when none does
+pub fun case_at(set: *Set, frame: u32, eid: ast_id.ExprId) u32 {
+    val key:  u32 = ast_id.expr_index(eid);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*u32] = map.get[u32, u32](?set.frames.data[walk].cases, ?key);
+        if (sel opt_found.some) { ret @opt_found.some; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret CASE_UNTYPED;
+}
+
+# the published constant value of the array the `$each` at `sid` reads
+pub fun each_record(set: *Set, frame: u32, sid: ast_id.StmtId, array: comptime_value.CTValue) err[fail.Fail] {
+    val res_put: res[bool, A.Error] = map.insert[u32, comptime_value.CTValue](?set.frames.data[frame].arrays, ast_id.stmt_index(sid), array);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the type of the expression `eid` in `frame` or the nearest parent that records one
+# ---
+# set:   the set holding the frame
+# frame: the frame asked
+# eid:   the expression
+# ret:   its type, or none when no frame up the chain records it
+pub fun expr_type_at(set: *Set, frame: u32, eid: ast_id.ExprId) opt[type_kind.TypeId] {
+    val key:  u32 = ast_id.expr_index(eid);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*type_kind.TypeId] = map.get[u32, type_kind.TypeId](?set.frames.data[walk].exprs, ?key);
+        if (sel opt_found.some) { ret opt[type_kind.TypeId].some{@opt_found.some}; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret opt[type_kind.TypeId].none{};
+}
+
+# the type of the binding `did` in `frame` or the nearest parent that records one
+# ---
+# set:   the set holding the frame
+# frame: the frame asked
+# did:   the binding's declaration
+# ret:   its type, or none when no frame up the chain records it
+pub fun decl_type_at(set: *Set, frame: u32, did: ast_id.DeclId) opt[type_kind.TypeId] {
+    val key:  u32 = ast_id.decl_index(did);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*type_kind.TypeId] = map.get[u32, type_kind.TypeId](?set.frames.data[walk].decls, ?key);
+        if (sel opt_found.some) { ret opt[type_kind.TypeId].some{@opt_found.some}; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret opt[type_kind.TypeId].none{};
+}
+
+# the type frame `frame` itself resolved the type node `tid` to, not one of its parents
+pub fun type_in_frame(set: *Set, frame: u32, tid: ast_id.TypeId) opt[type_kind.TypeId] {
+    val key:       u32                    = ast_id.type_index(tid);
+    val opt_found: opt[*type_kind.TypeId] = map.get[u32, type_kind.TypeId](?set.frames.data[frame].types, ?key);
+    if (sel opt_found.none) { ret opt[type_kind.TypeId].none{}; }
+    ret opt[type_kind.TypeId].some{@opt_found.some};
+}
+
+# the type frame `frame` or the nearest of its parents resolved the type node `tid` to
+pub fun type_at(set: *Set, frame: u32, tid: ast_id.TypeId) opt[type_kind.TypeId] {
+    val key:  u32 = ast_id.type_index(tid);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*type_kind.TypeId] = map.get[u32, type_kind.TypeId](?set.frames.data[walk].types, ?key);
+        if (sel opt_found.some) { ret opt[type_kind.TypeId].some{@opt_found.some}; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret opt[type_kind.TypeId].none{};
+}
+
+# the instance the call or generic reference `eid` names in frame `frame`
+pub fun call_at(set: *Set, frame: u32, eid: ast_id.ExprId) opt[u32] {
+    val key:  u32 = ast_id.expr_index(eid);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*u32] = map.get[u32, u32](?set.frames.data[walk].calls, ?key);
+        if (sel opt_found.some) { ret opt[u32].some{@opt_found.some}; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret opt[u32].none{};
+}
+
+# the verdict of the gate on `cond` in `frame` or the nearest parent that records one
+# ---
+# set:   the set holding the frame
+# frame: the frame asked
+# cond:  the gate's condition
+# ret:   whether its arm is taken, or none when no frame up the chain records it
+pub fun gate_at(set: *Set, frame: u32, cond: ast_id.ExprId) opt[bool] {
+    val key:  u32 = ast_id.expr_index(cond);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*bool] = map.get[u32, bool](?set.frames.data[walk].gates, ?key);
+        if (sel opt_found.some) { ret opt[bool].some{@opt_found.some}; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret opt[bool].none{};
+}
+
+# the constant array the `$each` at `sid` reads in `frame` or the nearest parent that records one
+# ---
+# set:   the set holding the frame
+# frame: the frame asked
+# sid:   the `$each` statement
+# ret:   the array's value, or none when no frame up the chain records it
+pub fun each_at(set: *Set, frame: u32, sid: ast_id.StmtId) opt[comptime_value.CTValue] {
+    val key:  u32 = ast_id.stmt_index(sid);
+    var walk: u32 = frame;
+    for (walk != NONE) {
+        val opt_found: opt[*comptime_value.CTValue] = map.get[u32, comptime_value.CTValue](?set.frames.data[walk].arrays, ?key);
+        if (sel opt_found.some) { ret opt[comptime_value.CTValue].some{@opt_found.some}; }
+        walk = set.frames.data[walk].parent;
+    }
+    ret opt[comptime_value.CTValue].none{};
+}

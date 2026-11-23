@@ -4,58 +4,56 @@ Thank you for your interest in contributing to Mach. Be respectful,
 constructive, and professional: treat Mach like a passion project and its
 community like family.
 
+[`doc/project.md`](doc/project.md) describes how the source is laid out and
+where a new module goes.
+
 
 ## Building
 
 Mach is self-hosting, so building it needs an existing Mach compiler. Install
 the latest [release](https://github.com/briar-systems/mach/releases) for your
 host and put `mach` on `PATH`; CI seeds from the same archive
-(`.github/scripts/bootstrap.sh`).
+(`.github/scripts/bootstrap.sh`, see [Fixpoint](#fixpoint)).
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
 cd mach
-mach dep pull .
-mach build .
+bash .github/scripts/seed-build.sh mach a
+./a dep pull .
+./a build .
 ```
 
-The compiler is written to `out/<target>/<profile>/bin/mach`, or
-`bin/mach.exe` on Windows. A default Linux x86_64 build writes
-`out/linux-x86_64/debug/bin/mach`.
+A 6.x release reads only the previous manifest keys, so it builds `a` through
+`seed-build.sh` (see [Fixpoint](#fixpoint)), and `a` builds the compiler. It is
+written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe` on Windows. A
+default Linux x86_64 build writes `out/linux-x86_64/debug/bin/mach`.
 
 
 ## Fixpoint
 
 A change to the compiler has to reach the self-host fixpoint: the compiler it
-builds must build itself byte for byte. The stages start from a seed, a
-published release fetched and checked against the release's `SHA256SUMS`, as
-CI does in `.github/scripts/bootstrap.sh`. The seed is the release that script
-pins (its `seed=` line), not whichever `mach` happens to be on `PATH`. From
-the repository root on x86_64 Linux:
+builds must build itself byte for byte. CI does not check it, so run it
+locally. `.github/scripts/bootstrap.sh` is the one way: it reads `RUNNER_OS`
+and `RUNNER_TEMP` and writes `MACH` to the file `GITHUB_ENV` names, so a local
+run names them. From the repository root:
 
 ```bash
-v=$(sed -n 's/^seed=//p' .github/scripts/bootstrap.sh)
-t=x86_64-linux
-gh release download "v$v" -R briar-systems/mach -p "mach-$v-$t.tar.gz" -p SHA256SUMS -D ../mach-seed
-(cd ../mach-seed && grep " mach-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c - && tar -xzf "mach-$v-$t.tar.gz" mach)
-../mach-seed/mach dep pull .
-../mach-seed/mach build . -o a
-./a build . -o b
-./b build . -o c
-cmp b c
+mkdir -p out/boot
+RUNNER_OS=Linux RUNNER_TEMP=$PWD/out/boot GITHUB_ENV=$PWD/out/boot/env \
+    bash .github/scripts/bootstrap.sh --fixpoint
 ```
 
-The seed builds `a` from your tree. `a` builds `b`, and `b` builds `c`. `cmp`
-prints nothing and exits 0 when `b` and `c` are identical. CI runs the
-fixpoint on every pull request, so run it locally
-only when a change needs it. The seed builds the `mach` binary and nothing
-else. Run the unit suites with `c`, as in [Testing and
-formatting](#testing-and-formatting), because the test code may use language
-the seed release predates. A release newer than the pin builds `a` too, and an
-older one is not supported. On macOS use `aarch64-darwin` or `x86_64-darwin`
-and `shasum -a 256 -c`. On Windows the archive is `mach-$v-x86_64-windows.zip`
-holding `mach.exe`, and the outputs are `a.exe`, `b.exe` and `c.exe`. Add
-`-p release` to every build for the release fixpoint.
+The script installs the seed release named on the `seed` line of
+`.github/bootstrap-chain`, never whichever `mach` is on `PATH`, and walks the
+chain through each pinned mach commit. The last step builds `a` from your tree
+at the debug profile, so no older compiler's optimiser compiles it, `a` builds
+`b` at the profile on two threads, and `b` builds `c` at the profile on three,
+so the fixpoint also holds the output to being the same at every thread count.
+It fails when `cmp b c` differs and
+otherwise leaves `c` as the compiler, with its path in `out/boot/env`. Use `RUNNER_OS=macOS` or
+`Windows` on those hosts (the outputs are then `a.exe`, `b.exe` and `c.exe` on
+Windows), and `--profile release` for the release fixpoint. Without
+`--fixpoint` it stops at `b`.
 
 `-o` names a canonical path inside the project root: relative, `/`-separated,
 with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
@@ -63,45 +61,59 @@ refused with `-o must name a canonical path inside the project root`, so keep
 the stage outputs in the checkout. `.gitignore` covers `a`, `b` and `c`.
 
 
-## Testing and formatting
+## Formatting and checks
 
-Run the tests and the formatter through the compiler you just built, never
+Run the formatter and the checks through the compiler you just built, never
 the seed on `PATH`:
 
 ```bash
-out/linux-x86_64/debug/bin/mach test .
-out/linux-x86_64/debug/bin/mach test . -p release
-out/linux-x86_64/debug/bin/mach test . -a tests
-out/linux-x86_64/debug/bin/mach test . -a tests -p release
 out/linux-x86_64/debug/bin/mach fmt .
+out/linux-x86_64/debug/bin/mach check .
 ```
 
-`mach test .` runs the tests in the compiler's own closure. The suites that
-live in modules the compiler never reaches (`src/lang/driver/tests/`, the
-codegen runtime probes and the rest) are reached by the `tests` library
-artifact, whose entry `src/lib/tests.mach` `use`s each of them, so a new
-test-only module is added there.
+The compiler's tests are a corpus under `test/`, one program a file, with no
+project around any of them but those under `project/`. A file under `run/` builds for every target and
+exits 0 where the host can run it. A file under `refuse/` is refused with the
+diagnostic kind its first line names. A file under `gpu/` builds for the shader
+targets. A directory under `project/` is a small project and its `steps` file,
+the commands run in order in one fresh work directory, each with the exit code it
+expects and, after `|`, text a line of its output must hold, for what only a
+sequence of commands shows. Each file under `target/` names a target's flags and states what
+`mink dump` must show of every artifact built for it. One driver runs it all
+through the compiler you just built, with the `mink` on `PATH` unless `--mink`
+names another:
+
+```bash
+python3 test/run.py --mach out/linux-x86_64/debug/bin/mach
+```
+
+The compiler carries no unit `test` blocks and no goldens. `mach test` and the
+language's `test` blocks are features for the projects Mach builds. CI is the
+build: it walks the bootstrap chain and builds the compiler with itself, and
+nothing else.
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
-request is opened (`mach fmt --check .` reports what differs). `.` reaches only
-the compiler's own source, so the test sources are held to it one operand at a
-time: each file under `test/cases` and `test/lib`, and each project under
-`test/link/cases` (its `mach.toml`). CI's `formatter` step checks all of them.
-The fuzz corpus is retained input and is left as it is.
+request is opened (`mach fmt --check .` reports what differs).
 
-The API reference is held the same way: `doc/mach` and `doc/README.md` are what `mach doc .`
-writes, so a change to a doc-comment or to the module tree regenerates them in
-the same pull request, and CI fails when the committed pages differ from a
-fresh generation.
+The API reference is held the same way: `doc/mach` is what `mach doc .` writes, in one run
+over every module either artifact reaches, the editor library's included. A change to a
+doc-comment or to the module tree regenerates it in the same pull request.
 
-`bash test/run.sh` runs the codegen corpus, a differential of each case against
-the same program written in C, and `bash test/run.sh --link` the link cases; see
-[test/README.md](test/README.md).
+### Local checks
 
-### Test policy
+Run from the repository root with the compiler you built (`$MACH`, the path in
+`out/boot/env`, or `out/<host>/debug/bin/mach`). Each command exits non-zero on
+failure.
 
-What earns a test, and where it sits, is set by the
-[test policy](doc/language/test.md#test-policy).
+| check | command |
+|---|---|
+| formatter | `"$MACH" fmt --check .` |
+| committed reference | `"$MACH" doc . -o out/docgen -q`, then compare `out/docgen/mach` with `doc/mach`: every page and nothing else |
+| editor library | `"$MACH" check . -a editor` |
+| documented flags are accepted | `python3 .github/scripts/doc-flags.py "$MACH" doc` |
+| doc and source markers cite open issues | `GH_TOKEN=$(gh auth token) GH_REPO=briar-systems/mach python3 .github/scripts/doc-markers.py` |
+| cross-build the compiler | `"$MACH" build . --target darwin-x86_64 --profile release -o out/cross-darwin-x86_64` (also `darwin-aarch64`, `linux-riscv64`) |
+| fixpoint | see [Fixpoint](#fixpoint) |
 
 
 ## Branching
@@ -128,11 +140,7 @@ The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `style`,
 `feat(#139)!: brief description`. A change with no issue uses `chore: ...` with
 no scope, and a release commit is `chore(release): <version>`.
 
-If no related issue exists, just supply a type without the scope, e.g:
-
-```
-chore: update dependencies
-```
+For example, `chore: update dependencies`.
 
 
 ## Pull requests
@@ -141,11 +149,12 @@ chore: update dependencies
 - Link the issue with `Closes #N`.
 - Leave `CHANGELOG.md` alone. The changelog is written from the merged
   commits when `dev` is released to `main`.
-- Say briefly what changed and which tests you ran. Every pull request runs
-  the same CI lanes on the linux runners. The windows, darwin and slow lanes
+- Say briefly what changed. Every pull request builds the compiler through the
+  bootstrap chain on the linux runners. The windows, darwin and release lanes
   run when the CI workflow is dispatched with a `lane`, which is worth doing
   before a windows or darwin change reaches `dev`, and `lane=all` runs green on
-  `dev` before every release.
+  `dev` before every release. Every other check is local, see
+  [Local checks](#local-checks).
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.
@@ -153,12 +162,12 @@ chore: update dependencies
 
 ## Issues
 
-File issues through the templates. Issues use an orthogonal, faceted tagging system across five sets:
+File issues through the templates. Issues use an orthogonal, faceted tagging system across six sets:
 
 - SemVer magnitude: `patch`, `minor`, `major`
 - Kind of work: `feature`, `fix`, `removal`, `chore`, `performance`
 - Where (domain or location): `testing`, `tooling`, `doc` (omitted when touching core compiler code)
-- Severity and state: `critical`, `blocked`, `security`
+- Severity and state: `critical`, `blocked`, `parked`, `security`
 - Discussion: `discussion` (design proposals, RFCs, and open debates)
 
 Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. There are no milestones. Work in flight is an open draft pull request, `parked` marks an issue deliberately set aside until something changes, and every other open issue is backlog. `blocked` is a tag that records state. Themes are epic issues with native sub-issues. SemVer impact comes from the `major`, `minor` and `patch` tags, never from a milestone.
@@ -171,7 +180,7 @@ Mach adheres strictly to [semantic versioning](https://semver.org/) (`vMAJOR.MIN
 - `MINOR`: backward-compatible new language features, compiler flags, target additions, and optimizations.
 - `PATCH`: backward-compatible bug fixes, documentation, and internal refactors.
 
-The standard library is versioned separately in its own repository. SemVer impact is tracked directly on issues and pull requests via conventional commit types and issue tags. A release bump updates both `[project].version` in `mach.toml` and `MACH_VERSION` in `src/lang/version.mach`. Tags are created on `main` after the integration merge from `dev`.
+The standard library is versioned separately in its own repository. SemVer impact is tracked directly on issues and pull requests via conventional commit types and issue tags. A release bump updates both `[project].version` in `mach.toml` and `MACH_VERSION` in `src/base/version.mach`. Tags are created on `main` after the integration merge from `dev`.
 
 
 ## License

@@ -1,0 +1,889 @@
+# the `[target.<name>]` tables: their decoding, `--set`, migration and resolution
+#
+# `resolve_declared` is the one place a declared target becomes mink's spelling and
+# narrowing. the host's target, made for a manifest that declares none, and the
+# `<sys>-<arch>` spelling of a target are made here too.
+
+use mach.base.fail;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.intern;
+use base_source:     mach.base.source;
+use mach_target:     mach.target;
+use target_baseline: mach.target.baseline;
+use mach.target.resolved;
+use target_tags: mach.target.tags;
+use mink_fail:   mink.base.fail;
+use mink_arch:   mink.catalog.arch;
+use mink_target: mink.catalog.target;
+
+use mach.manifest.model.Manifest;
+use mach.manifest.model.Origin;
+use mach.manifest.model.TARGET_PART_KEYS;
+use mach.manifest.model.TargetDef;
+use mach.manifest.model.id_of;
+use mach.manifest.model.optional_id_of;
+use mach.manifest.model.target_def;
+use mach.manifest.refusal.element_sites;
+use mach.manifest.refusal.fail_at;
+use mach.manifest.refusal.refuse;
+use mach.manifest.refusal.sfmt;
+use mach.manifest.refusal.span_site;
+use mach.manifest.schema.Fix;
+use mach.manifest.schema.StrArr;
+use mach.manifest.schema.element_span;
+use mach.manifest.schema.ids_of;
+use mach.manifest.schema.key_span;
+use mach.manifest.schema.key_text;
+use mach.manifest.schema.origin;
+use mach.manifest.schema.value_span;
+use mach.manifest.schema.written_address;
+
+# the host as `mach info` names it, by `tuple_of`
+# ---
+# alloc: owns the returned string
+# ret:   the formatted tuple; err when the allocator refused it
+pub fun host_tuple(alloc: *A.Allocator) res[str, fail.Fail] {
+    ret tuple_of(alloc, mach_target.host_sys_name(), mach_target.host_arch_name());
+}
+
+# the one spelling of a (sys, arch) pair, "<sys>-<arch>", e.g. "linux-x86_64"
+# ---
+# alloc:    owns the returned string
+# os_name:  the system's name
+# isa_name: the architecture's name
+# ret:      the formatted tuple; err when the allocator refused it
+pub fun tuple_of(alloc: *A.Allocator, os_name: str, isa_name: str) res[str, fail.Fail] {
+    ret sfmt(alloc, "{}-{}", os_name, isa_name);
+}
+
+# `[target.X].ext`: an array of names of masc's extension catalog, each listed
+# once. the names are checked against masc's catalog of the architecture when
+# the target resolves
+fun parse_target_extensions(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, label: str,
+    d: *TargetDef) err[fail.Fail] {
+    val opt_sub_entry: opt[*toml_value.Value] = toml_lookup.get(sub, "ext");
+    if (sel opt_sub_entry.none) { ret err[fail.Fail].ok{}; }
+    val v:   *toml_value.Value = opt_sub_entry.some;
+    val arr: *toml_value.Array = ?v.data.array;
+    val n:   usize             = toml_lookup.array_len(arr);
+    if (n > resolved.MAX_ADDED::usize) {
+        ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_TOO_MANY, "mach.toml: {}.ext names more than {} extensions", label, resolved.MAX_ADDED), v.span);
+    }
+    var i: usize = 0;
+    for (i < n) {
+        val opt_array_get: opt[*toml_value.Value] = toml_lookup.array_get(arr, i);
+        if (sel opt_array_get.none) { brk; }
+        val e:    *toml_value.Value = opt_array_get.some;
+        val name: str               = e.data.string;
+        if (str_len(name) == 0) {
+            ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_INVALID_NAME, "mach.toml: {}.ext entry \"\" names no extension", label), e.span);
+        }
+        val res_id_of: res[intern.StrId, fail.Fail] = id_of(itn, name);
+        if (sel res_id_of.err) { ret err[fail.Fail].err{res_id_of.err}; }
+        val id: intern.StrId = res_id_of.ok;
+        var j:  u32          = 0;
+        for (j < d.ext_count) {
+            if (intern.str_same(d.ext[j], id)) {
+                ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_DUPLICATE, "mach.toml: {}.ext lists \"{}\" twice", label, name), e.span);
+            }
+            j = j + 1;
+        }
+        d.ext[d.ext_count] = id;
+        d.ext_count        = d.ext_count + 1;
+        i                  = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# decode every `[target.<name>]` table of `t` into `m.targets`, nothing when there is none
+# ---
+# alloc: owns the target array, its runner lists and a refusal's text
+# itn:   interns the names and values
+# t:     the manifest's root table
+# m:     the manifest the targets are set on
+# ret:   ok, or the refusal of a table named `native`, of a retired spelling, or of the
+#        first target that does not decode
+pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail] {
+    val opt_tab: opt[*toml_value.Table] = toml_lookup.get_table(t, "target");
+    if (sel opt_tab.none) { ret err[fail.Fail].ok{}; }
+    val tab: *toml_value.Table = opt_tab.some;
+    val n:   usize             = toml_lookup.table_len(tab);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+    val res_targets: res[*TargetDef, A.Error] = A.allocate[TargetDef](alloc, n);
+    if (sel res_targets.err) { ret err[fail.Fail].err{fail.refused(res_targets.err)}; }
+    m.targets      = res_targets.ok;
+    m.target_count = n::u32;
+    var cleared: usize = 0;
+    for (cleared < n) {
+        m.targets[cleared] = target_def();
+        cleared            = cleared + 1;
+    }
+
+    var i: usize = 0;
+    for (i < n) {
+        val opt_name:        opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        if (sel opt_name.none)        { brk; }
+        if (sel opt_table_value.none) { brk; }
+        val name: str = opt_name.some;
+        if (str_equals(name, "native")) {
+            ret fail_at(fail.user(diagnostic_kind.TARGET_RESERVED_NAME, "mach.toml: [target.native] is reserved, because 'native' names the declared target for the host"), key_span(tab, i));
+        }
+        val res_label: res[str, fail.Fail] = sfmt(alloc, "[target.{}]", name);
+        if (sel res_label.err) { ret err[fail.Fail].err{res_label.err}; }
+        val err_decoded: err[fail.Fail] = target_decode(alloc, itn, tab, i, res_label.ok, ?m.targets[i]);
+        str_free(alloc, res_label.ok);
+        if (sel err_decoded.err) { ret err_decoded; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a spelling a target key no longer takes, and mink's name for the row it meant
+# ---
+# key:  the target key
+# was:  the key's previous name, which a manifest of the previous major writes it under; "" for none
+# old:  the retired spelling
+# new:  the spelling that replaces it, mink's name for the row
+# arch: the architecture the spelling is retired under, "" under every one
+# sys:  the system the spelling is retired under, "" under every one
+rec Retired {
+    key:  str;
+    was:  str;
+    old:  str;
+    new:  str;
+    arch: str;
+    sys:  str;
+}
+
+# raw and spv were mach's own names for mink's flat and spirv formats, a spir-v module's
+# system is vulkan, never freestanding, under the shader convention v6 named spirv, and
+# darwin on aarch64 runs only darwin's variant of aapcs64, which v6 named aapcs64
+val RETIRED_COUNT: usize                  = 5;
+val RETIRED:       [RETIRED_COUNT]Retired = [RETIRED_COUNT]Retired{
+    Retired{key: "of", was: "", old: "raw", new: "flat", arch: "", sys: ""},
+    Retired{key: "of", was: "", old: "spv", new: "spirv", arch: "", sys: ""},
+    Retired{key: "sys", was: "os", old: "freestanding", new: "vulkan", arch: "spirv", sys: ""},
+    Retired{key: "abi", was: "", old: "spirv", new: "shader", arch: "spirv", sys: ""},
+    Retired{key: "abi", was: "", old: "aapcs64", new: "darwinpcs", arch: "aarch64", sys: "darwin"},
+};
+
+# one name that replaces a device feature name of the previous major's closed spir-v `ext`
+# vocabulary, which this major spells as masc's capability and SPIR-V extension names
+# ---
+# old: the retired name
+# new: one name that replaces it, "" for a feature that enables no capability
+rec RetiredExt {
+    old: str;
+    new: str;
+}
+
+# a name replaced by several has a row for each, and one that enables no capability has one
+# row with no replacement
+val RETIRED_EXT_COUNT: usize                         = 72;
+val RETIRED_EXT:       [RETIRED_EXT_COUNT]RetiredExt = [RETIRED_EXT_COUNT]RetiredExt{
+    RetiredExt{old: "float16", new: "Float16"},
+    RetiredExt{old: "zero_init_workgroup", new: ""},
+    RetiredExt{old: "subgroup_arithmetic", new: "GroupNonUniformArithmetic"},
+    RetiredExt{old: "subgroup_clustered", new: "GroupNonUniformClustered"},
+    RetiredExt{old: "storage_read_without_format", new: "StorageImageReadWithoutFormat"},
+    RetiredExt{old: "storage_write_without_format", new: "StorageImageWriteWithoutFormat"},
+    RetiredExt{old: "subgroup_vote", new: "GroupNonUniformVote"},
+    RetiredExt{old: "subgroup_ballot", new: "GroupNonUniformBallot"},
+    RetiredExt{old: "subgroup_shuffle", new: "GroupNonUniformShuffle"},
+    RetiredExt{old: "subgroup_shuffle_relative", new: "GroupNonUniformShuffleRelative"},
+    RetiredExt{old: "subgroup_quad", new: "GroupNonUniformQuad"},
+    RetiredExt{old: "subgroup_graphics_stages", new: ""},
+    RetiredExt{old: "buffer_int64_atomics", new: "Int64Atomics"},
+    RetiredExt{old: "shared_int64_atomics", new: "Int64Atomics"},
+    RetiredExt{old: "buffer_float32_atomics", new: ""},
+    RetiredExt{old: "buffer_float32_atomic_add", new: "AtomicFloat32AddEXT"},
+    RetiredExt{old: "buffer_float32_atomic_add", new: "SPV_EXT_shader_atomic_float_add"},
+    RetiredExt{old: "buffer_float32_atomic_min_max", new: "AtomicFloat32MinMaxEXT"},
+    RetiredExt{old: "buffer_float32_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "buffer_float64_atomics", new: ""},
+    RetiredExt{old: "buffer_float64_atomic_add", new: "AtomicFloat64AddEXT"},
+    RetiredExt{old: "buffer_float64_atomic_add", new: "SPV_EXT_shader_atomic_float_add"},
+    RetiredExt{old: "buffer_float64_atomic_min_max", new: "AtomicFloat64MinMaxEXT"},
+    RetiredExt{old: "buffer_float64_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "shared_float32_atomics", new: ""},
+    RetiredExt{old: "shared_float32_atomic_add", new: "AtomicFloat32AddEXT"},
+    RetiredExt{old: "shared_float32_atomic_add", new: "SPV_EXT_shader_atomic_float_add"},
+    RetiredExt{old: "shared_float32_atomic_min_max", new: "AtomicFloat32MinMaxEXT"},
+    RetiredExt{old: "shared_float32_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "shared_float64_atomics", new: ""},
+    RetiredExt{old: "shared_float64_atomic_add", new: "AtomicFloat64AddEXT"},
+    RetiredExt{old: "shared_float64_atomic_add", new: "SPV_EXT_shader_atomic_float_add"},
+    RetiredExt{old: "shared_float64_atomic_min_max", new: "AtomicFloat64MinMaxEXT"},
+    RetiredExt{old: "shared_float64_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "storage_image_multisample", new: "StorageImageMultisample"},
+    RetiredExt{old: "storage_image_multisample", new: "ImageMSArray"},
+    RetiredExt{old: "resource_min_lod", new: "MinLod"},
+    RetiredExt{old: "image_gather_extended", new: "ImageGatherExtended"},
+    RetiredExt{old: "maintenance8", new: ""},
+    RetiredExt{old: "image_int64_atomics", new: "Int64Atomics"},
+    RetiredExt{old: "image_int64_atomics", new: "Int64ImageEXT"},
+    RetiredExt{old: "image_int64_atomics", new: "SPV_EXT_shader_image_int64"},
+    RetiredExt{old: "image_float32_atomics", new: ""},
+    RetiredExt{old: "image_float32_atomic_add", new: "AtomicFloat32AddEXT"},
+    RetiredExt{old: "image_float32_atomic_add", new: "SPV_EXT_shader_atomic_float_add"},
+    RetiredExt{old: "image_float32_atomic_min_max", new: "AtomicFloat32MinMaxEXT"},
+    RetiredExt{old: "image_float32_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "vulkan_memory_model", new: "VulkanMemoryModel"},
+    RetiredExt{old: "vulkan_memory_model_device_scope", new: "VulkanMemoryModel"},
+    RetiredExt{old: "vulkan_memory_model_device_scope", new: "VulkanMemoryModelDeviceScope"},
+    RetiredExt{old: "int8", new: "Int8"},
+    RetiredExt{old: "int16", new: "Int16"},
+    RetiredExt{old: "buffer_device_address", new: "PhysicalStorageBufferAddresses"},
+    RetiredExt{old: "int64", new: "Int64"},
+    RetiredExt{old: "float64", new: "Float64"},
+    RetiredExt{old: "buffer_float16_atomics", new: ""},
+    RetiredExt{old: "buffer_float16_atomic_add", new: "AtomicFloat16AddEXT"},
+    RetiredExt{old: "buffer_float16_atomic_add", new: "SPV_EXT_shader_atomic_float16_add"},
+    RetiredExt{old: "buffer_float16_atomic_min_max", new: "AtomicFloat16MinMaxEXT"},
+    RetiredExt{old: "buffer_float16_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "shared_float16_atomics", new: ""},
+    RetiredExt{old: "shared_float16_atomic_add", new: "AtomicFloat16AddEXT"},
+    RetiredExt{old: "shared_float16_atomic_add", new: "SPV_EXT_shader_atomic_float16_add"},
+    RetiredExt{old: "shared_float16_atomic_min_max", new: "AtomicFloat16MinMaxEXT"},
+    RetiredExt{old: "shared_float16_atomic_min_max", new: "SPV_EXT_shader_atomic_float_min_max"},
+    RetiredExt{old: "storage_buffer_16bit_access", new: "StorageBuffer16BitAccess"},
+    RetiredExt{old: "uniform_and_storage_buffer_16bit_access", new: "UniformAndStorageBuffer16BitAccess"},
+    RetiredExt{old: "storage_push_constant16", new: "StoragePushConstant16"},
+    RetiredExt{old: "storage_input_output16", new: "StorageInputOutput16"},
+    RetiredExt{old: "storage_buffer_8bit_access", new: "StorageBuffer8BitAccess"},
+    RetiredExt{old: "uniform_and_storage_buffer_8bit_access", new: "UniformAndStorageBuffer8BitAccess"},
+    RetiredExt{old: "storage_push_constant8", new: "StoragePushConstant8"},
+};
+
+# the system the target table `sub` names: its `sys`, or where it writes none, the previous
+# major's `os`; "" for none
+fun sys_written(sub: *toml_value.Table) str {
+    val opt_sys: opt[*toml_value.Value] = toml_lookup.get(sub, "sys");
+    if (sel opt_sys.some) { ret key_text(sub, "sys"); }
+    ret key_text(sub, "os");
+}
+
+# the architecture the target table `sub` names: its `arch`, or where it writes none, the
+# previous major's `isa` when that names an architecture; "" for none
+fun arch_written(sub: *toml_value.Table) str {
+    val opt_arch: opt[*toml_value.Value] = toml_lookup.get(sub, "arch");
+    if (sel opt_arch.some) { ret key_text(sub, "arch"); }
+    val isa: str = key_text(sub, "isa");
+    if (target_tags.arch_named(isa) != target_tags.NONE) { ret isa; }
+    ret "";
+}
+
+# the value of the retired spelling `r` the target table `sub` writes, under the key or its
+# previous name; nil when it writes none
+fun retired_value(sub: *toml_value.Table, r: *Retired) *toml_value.Value {
+    var opt_sub_entry: opt[*toml_value.Value] = toml_lookup.get(sub, r.key);
+    if (sel opt_sub_entry.none && str_len(r.was) != 0)                  { opt_sub_entry = toml_lookup.get(sub, r.was); }
+    if (sel opt_sub_entry.none)                                         { ret nil; }
+    if (opt_sub_entry.some.tag != toml_value.TYPE_STRING)               { ret nil; }
+    if (!str_equals(opt_sub_entry.some.data.string, r.old))             { ret nil; }
+    if (str_len(r.arch) != 0 && !str_equals(arch_written(sub), r.arch)) { ret nil; }
+    if (str_len(r.sys) != 0 && !str_equals(sys_written(sub), r.sys))    { ret nil; }
+    ret opt_sub_entry.some;
+}
+
+# the refusal of a retired spelling the target table `sub` writes, carrying the
+# rewrite to the new one
+fun refuse_retired(alloc: *A.Allocator, sub: *toml_value.Table, label: str) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < RETIRED_COUNT) {
+        val r: *Retired          = ?RETIRED[i];
+        val v: *toml_value.Value = retired_value(sub, r);
+        i = i + 1;
+        if (v == nil) { cnt; }
+        val f: fail.Fail = refuse(alloc, diagnostic_kind.TARGET_RETIRED_SPELLING,
+            "mach.toml: {}.{} = \"{}\" is a retired spelling. write \"{}\"", label, r.key, r.old, r.new);
+        val res_fix: res[str, fail.Fail] = sfmt(alloc, "\"{}\"", r.new);
+        if (sel res_fix.err) { ret err[fail.Fail].err{res_fix.err}; }
+        val res_what: res[str, fail.Fail] = sfmt(alloc, "write `{} = \"{}\"`", r.key, r.new);
+        if (sel res_what.err) { ret err[fail.Fail].err{res_what.err}; }
+        val at: base_source.Span = base_source.span(v.span.at, v.span.len);
+        ret fail_at(fail.with_fix(alloc, f, res_what.ok, opt[base_source.Span].some{at}, res_fix.ok), v.span);
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether `name` is a retired spir-v `ext` name
+fun ext_retired(name: str) bool {
+    var r: usize = 0;
+    for (r < RETIRED_EXT_COUNT) {
+        if (str_equals(RETIRED_EXT[r].old, name)) { ret true; }
+        r = r + 1;
+    }
+    ret false;
+}
+
+# `name` appended to `names` unless it holds it already
+fun name_add(names: *Vector[str], name: str) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < names.len) {
+        if (str_equals(names.data[i], name)) { ret err[fail.Fail].ok{}; }
+        i = i + 1;
+    }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[str](names, name);
+    if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `names` as quoted strings, comma separated
+fun names_quoted(alloc: *A.Allocator, names: *Vector[str]) res[str, fail.Fail] {
+    var text: str   = "";
+    var i:    usize = 0;
+    for (i < names.len) {
+        var sep: str = "";
+        if (i > 0) { sep = ", "; }
+        val res_longer: res[str, fail.Fail] = sfmt(alloc, "{}{}\"{}\"", text, sep, names.data[i]);
+        if (sel res_longer.err) { ret res_longer; }
+        text = res_longer.ok;
+        i    = i + 1;
+    }
+    ret res[str, fail.Fail].ok{text};
+}
+
+# each name that replaces the retired spir-v `ext` name `name` appended to `names`
+fun replacements_add(names: *Vector[str], name: str) err[fail.Fail] {
+    var r: usize = 0;
+    for (r < RETIRED_EXT_COUNT) {
+        val row: *RetiredExt = ?RETIRED_EXT[r];
+        r = r + 1;
+        if (!str_equals(row.old, name) || str_len(row.new) == 0) { cnt; }
+        val err_added: err[fail.Fail] = name_add(names, row.new);
+        if (sel err_added.err) { ret err_added; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the spir-v `ext` array `arr` as text, each retired name replaced by the names that replace
+# it and every name listed once; nil when it lists no retired name
+fun ext_rewritten(alloc: *A.Allocator, arr: *toml_value.Array) res[str, fail.Fail] {
+    var names: Vector[str] = collections_vector.init[str](alloc);
+    fin { collections_vector.dnit[str](?names); }
+    var retired: bool  = false;
+    var i:       usize = 0;
+    for (i < toml_lookup.array_len(arr)) {
+        val opt_item: opt[*toml_value.Value] = toml_lookup.array_get(arr, i);
+        i = i + 1;
+        if (sel opt_item.none)                           { cnt; }
+        if (opt_item.some.tag != toml_value.TYPE_STRING) { cnt; }
+        val name:      str            = opt_item.some.data.string;
+        val replaced:  bool           = ext_retired(name);
+        var err_added: err[fail.Fail] = err[fail.Fail].ok{};
+        if (replaced)          { err_added = replacements_add(?names, name); }
+        or                     { err_added = name_add(?names, name); }
+        if (sel err_added.err) { ret res[str, fail.Fail].err{err_added.err}; }
+        retired = retired || replaced;
+    }
+    if (!retired) { ret res[str, fail.Fail].ok{nil}; }
+    val res_listed: res[str, fail.Fail] = names_quoted(alloc, ?names);
+    if (sel res_listed.err) { ret res_listed; }
+    ret sfmt(alloc, "[{}]", res_listed.ok);
+}
+
+# the `ext` array the spir-v target table `sub` writes, under `ext` or the previous major's
+# `extensions`; nil when `sub` is no spir-v target or writes neither as an array
+fun spirv_ext_written(sub: *toml_value.Table) *toml_value.Value {
+    if (!str_equals(arch_written(sub), "spirv")) { ret nil; }
+    val opt_ext: opt[*toml_value.Value] = ext_entry(sub);
+    if (sel opt_ext.none)                          { ret nil; }
+    if (opt_ext.some.tag != toml_value.TYPE_ARRAY) { ret nil; }
+    ret opt_ext.some;
+}
+
+# the entry the target table `sub` writes under `ext`, or where it writes none, the previous
+# major's `extensions`
+fun ext_entry(sub: *toml_value.Table) opt[*toml_value.Value] {
+    val opt_ext: opt[*toml_value.Value] = toml_lookup.get(sub, "ext");
+    if (sel opt_ext.some) { ret opt_ext; }
+    ret toml_lookup.get(sub, "extensions");
+}
+
+# the refusal of a retired spir-v device feature name the `ext` of the target table `sub`
+# lists, carrying the rewrite of the array to the names that replace it
+fun refuse_retired_ext(alloc: *A.Allocator, sub: *toml_value.Table, label: str) err[fail.Fail] {
+    val v: *toml_value.Value = spirv_ext_written(sub);
+    if (v == nil) { ret err[fail.Fail].ok{}; }
+    val arr: *toml_value.Array = ?v.data.array;
+    var i:   usize             = 0;
+    for (i < toml_lookup.array_len(arr)) {
+        val opt_item: opt[*toml_value.Value] = toml_lookup.array_get(arr, i);
+        i = i + 1;
+        if (sel opt_item.none)                           { cnt; }
+        if (opt_item.some.tag != toml_value.TYPE_STRING) { cnt; }
+        val name: str = opt_item.some.data.string;
+        if (!ext_retired(name)) { cnt; }
+        var names: Vector[str] = collections_vector.init[str](alloc);
+        fin { collections_vector.dnit[str](?names); }
+        val err_added: err[fail.Fail] = replacements_add(?names, name);
+        if (sel err_added.err) { ret err_added; }
+        val res_named: res[str, fail.Fail] = names_quoted(alloc, ?names);
+        if (sel res_named.err) { ret err[fail.Fail].err{res_named.err}; }
+        val k: diagnostic_kind.Kind = diagnostic_kind.TARGET_RETIRED_SPELLING;
+        var f: fail.Fail            = refuse(alloc, k, "mach.toml: {}.ext entry \"{}\" is a retired spelling. write {}", label, name, res_named.ok);
+        if (names.len == 0) { f = refuse(alloc, k, "mach.toml: {}.ext entry \"{}\" is a retired spelling that names no capability. remove it", label, name); }
+        val res_fix: res[str, fail.Fail] = ext_rewritten(alloc, arr);
+        if (sel res_fix.err) { ret err[fail.Fail].err{res_fix.err}; }
+        val at: base_source.Span = base_source.span(v.span.at, v.span.len);
+        ret fail_at(fail.with_fix(alloc, f, "write the SPIR-V capability names", opt[base_source.Span].some{at}, res_fix.ok), opt_item.some.span);
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the rewrite of the retired spir-v device feature names the `ext` of the target table `sub`
+# lists, as one fix of the whole array
+fun retired_ext_fix(alloc: *A.Allocator, sub: *toml_value.Table, out: *Vector[Fix]) err[fail.Fail] {
+    val v: *toml_value.Value = spirv_ext_written(sub);
+    if (v == nil) { ret err[fail.Fail].ok{}; }
+    val res_text: res[str, fail.Fail] = ext_rewritten(alloc, ?v.data.array);
+    if (sel res_text.err)   { ret err[fail.Fail].err{res_text.err}; }
+    if (res_text.ok == nil) { ret err[fail.Fail].ok{}; }
+    ret fix_push(out, Fix{at: v.span.at, len: v.span.len, text: res_text.ok, pad: 0});
+}
+
+# a retired spir-v device feature name a target's `ext` lists that names no capability, which
+# the rewrite removes
+# ---
+# target: the target's name
+# name:   the retired name
+# at:     the name as written
+pub rec DroppedExt {
+    target: str;
+    name:   str;
+    at:     toml_value.Span;
+}
+
+# every retired spir-v device feature name a manifest of either major lists in a target's `ext`
+# that names no capability, which `mach migrate` removes with nothing in its place
+# ---
+# doc: the document root
+# out: receives the names, in document order; its strings are borrowed from `doc`
+# ret: ok, or the allocator's refusal
+pub fun dropped_extensions(doc: *toml_value.Table, out: *Vector[DroppedExt]) err[A.Error] {
+    val opt_targets: opt[*toml_value.Table] = toml_lookup.get_table(doc, "target");
+    if (sel opt_targets.none) { ret err[A.Error].ok{}; }
+    var i: usize = 0;
+    for (i < toml_lookup.table_len(opt_targets.some)) {
+        val opt_name:  opt[str]               = toml_lookup.table_key(opt_targets.some, i);
+        val opt_entry: opt[*toml_value.Value] = toml_lookup.table_value(opt_targets.some, i);
+        i = i + 1;
+        if (sel opt_name.none)                           { cnt; }
+        if (sel opt_entry.none)                          { cnt; }
+        if (opt_entry.some.tag != toml_value.TYPE_TABLE) { cnt; }
+        val v: *toml_value.Value = spirv_ext_written(?opt_entry.some.data.table);
+        if (v == nil) { cnt; }
+        var j: usize = 0;
+        for (j < toml_lookup.array_len(?v.data.array)) {
+            val opt_item: opt[*toml_value.Value] = toml_lookup.array_get(?v.data.array, j);
+            j = j + 1;
+            if (sel opt_item.none)                           { cnt; }
+            if (opt_item.some.tag != toml_value.TYPE_STRING) { cnt; }
+            if (!ext_dropped(opt_item.some.data.string))     { cnt; }
+            val res_pushed: res[usize, A.Error] = collections_vector.push[DroppedExt](out, DroppedExt{target: opt_name.some, name: opt_item.some.data.string, at: opt_item.some.span});
+            if (sel res_pushed.err) { ret err[A.Error].err{res_pushed.err}; }
+        }
+    }
+    ret err[A.Error].ok{};
+}
+
+# whether `name` is a retired spir-v `ext` name that names no capability
+fun ext_dropped(name: str) bool {
+    var r: usize = 0;
+    for (r < RETIRED_EXT_COUNT) {
+        if (str_equals(RETIRED_EXT[r].old, name) && str_len(RETIRED_EXT[r].new) == 0) { ret true; }
+        r = r + 1;
+    }
+    ret false;
+}
+
+# mink's architecture that enters the instruction set `written` spells, nil when `written` names
+# an architecture itself or none enters it
+fun entering(alloc: *A.Allocator, written: str) *mink_arch.Arch {
+    if (target_tags.arch_named(written) != target_tags.NONE) { ret nil; }
+    ret target_baseline.entered_by(alloc, written);
+}
+
+# what replaces the value of an `arch` written as the instruction set `written`, which `arch`
+# enters: the architecture, and the instruction set as `isa` when the table writes none
+fun selection_fix(alloc: *A.Allocator, sub: *toml_value.Table, written: str, arch: *mink_arch.Arch) res[str, fail.Fail] {
+    val opt_stated: opt[*toml_value.Value] = toml_lookup.get(sub, "isa");
+    if (sel opt_stated.some) { ret sfmt(alloc, "\"{}\"", arch.name); }
+    ret sfmt(alloc, "\"{}\"\nisa = \"{}\"", arch.name, written);
+}
+
+# the refusal of an `arch` the target table `sub` writes as an instruction set,
+# as `rv32imc`: the architecture is mink's name for the one that enters the
+# instruction set, which is the target's `isa`, so the fix rewrites the one key
+# into the two
+fun refuse_arch_selection(alloc: *A.Allocator, sub: *toml_value.Table, label: str) err[fail.Fail] {
+    val opt_sub_entry: opt[*toml_value.Value] = toml_lookup.get(sub, "arch");
+    if (sel opt_sub_entry.none) { ret err[fail.Fail].ok{}; }
+    val written: str             = key_text(sub, "arch");
+    val arch:    *mink_arch.Arch = entering(alloc, written);
+    if (arch == nil) { ret err[fail.Fail].ok{}; }
+    val name: str       = arch.name;
+    var f:    fail.Fail = refuse(alloc, diagnostic_kind.TARGET_RETIRED_SPELLING,
+        "mach.toml: {}.arch = \"{}\" names an instruction set. write `arch = \"{}\"` and `isa = \"{}\"`", label, written, name, written);
+    var res_what:   res[str, fail.Fail]    = sfmt(alloc, "write `arch = \"{}\"` and `isa = \"{}\"`", name, written);
+    val opt_stated: opt[*toml_value.Value] = toml_lookup.get(sub, "isa");
+    if (sel opt_stated.some) {
+        f = refuse(alloc, diagnostic_kind.TARGET_RETIRED_SPELLING,
+            "mach.toml: {}.arch = \"{}\" names an instruction set. write `arch = \"{}\"`", label, written, name);
+        res_what = sfmt(alloc, "write `arch = \"{}\"`", name);
+    }
+    val res_fix: res[str, fail.Fail] = selection_fix(alloc, sub, written, arch);
+    if (sel res_fix.err)  { ret err[fail.Fail].err{res_fix.err}; }
+    if (sel res_what.err) { ret err[fail.Fail].err{res_what.err}; }
+    val at: base_source.Span = base_source.span(opt_sub_entry.some.span.at, opt_sub_entry.some.span.len);
+    ret fail_at(fail.with_fix(alloc, f, res_what.ok, opt[base_source.Span].some{at}, res_fix.ok), opt_sub_entry.some.span);
+}
+
+# every rewrite of a target spelling the previous major wrote, as fixes of the manifest's text,
+# which `mach migrate` applies: each retired spelling and each `arch` written as an instruction
+# set, as the refusals above fix them, and the previous major's `isa` written as an instruction
+# set where the table writes no `arch`, which names the architecture that enters it beside it
+# ---
+# alloc: owns the fixes' text and storage
+# doc:   the document root, a manifest of either major
+# out:   receives the fixes, in no order
+# ret:   ok, or the refusal of an allocation
+pub fun rewrites(alloc: *A.Allocator, doc: *toml_value.Table, out: *Vector[Fix]) err[fail.Fail] {
+    val opt_targets: opt[*toml_value.Table] = toml_lookup.get_table(doc, "target");
+    if (sel opt_targets.none) { ret err[fail.Fail].ok{}; }
+    var i: usize = 0;
+    for (i < toml_lookup.table_len(opt_targets.some)) {
+        val opt_entry: opt[*toml_value.Value] = toml_lookup.table_value(opt_targets.some, i);
+        i = i + 1;
+        if (sel opt_entry.none)                          { cnt; }
+        if (opt_entry.some.tag != toml_value.TYPE_TABLE) { cnt; }
+        val sub: *toml_value.Table = ?opt_entry.some.data.table;
+        var r:   usize             = 0;
+        for (r < RETIRED_COUNT) {
+            val row: *Retired          = ?RETIRED[r];
+            val v:   *toml_value.Value = retired_value(sub, row);
+            r = r + 1;
+            if (v == nil) { cnt; }
+            val res_text: res[str, fail.Fail] = sfmt(alloc, "\"{}\"", row.new);
+            if (sel res_text.err) { ret err[fail.Fail].err{res_text.err}; }
+            val err_pushed: err[fail.Fail] = fix_push(out, Fix{at: v.span.at, len: v.span.len, text: res_text.ok, pad: 0});
+            if (sel err_pushed.err) { ret err_pushed; }
+        }
+        val err_ext: err[fail.Fail] = retired_ext_fix(alloc, sub, out);
+        if (sel err_ext.err) { ret err_ext; }
+        val opt_arch: opt[*toml_value.Value] = toml_lookup.get(sub, "arch");
+        if (sel opt_arch.some) {
+            if (opt_arch.some.tag != toml_value.TYPE_STRING) { cnt; }
+            val entered: *mink_arch.Arch = entering(alloc, opt_arch.some.data.string);
+            if (entered == nil) { cnt; }
+            val res_text: res[str, fail.Fail] = selection_fix(alloc, sub, opt_arch.some.data.string, entered);
+            if (sel res_text.err) { ret err[fail.Fail].err{res_text.err}; }
+            val err_pushed: err[fail.Fail] = fix_push(out, Fix{at: opt_arch.some.span.at, len: opt_arch.some.span.len, text: res_text.ok, pad: 0});
+            if (sel err_pushed.err) { ret err_pushed; }
+            cnt;
+        }
+        val opt_isa: opt[*toml_value.Value] = toml_lookup.get(sub, "isa");
+        if (sel opt_isa.none)                           { cnt; }
+        if (opt_isa.some.tag != toml_value.TYPE_STRING) { cnt; }
+        val entered: *mink_arch.Arch = entering(alloc, opt_isa.some.data.string);
+        if (entered == nil) { cnt; }
+        val res_text: res[str, fail.Fail] = sfmt(alloc, "arch = \"{}\"\nisa", entered.name);
+        if (sel res_text.err) { ret err[fail.Fail].err{res_text.err}; }
+        val err_pushed: err[fail.Fail] = fix_push(out, Fix{at: opt_isa.some.key.at, len: opt_isa.some.key.len, text: res_text.ok, pad: 0});
+        if (sel err_pushed.err) { ret err_pushed; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun fix_push(out: *Vector[Fix], fix: Fix) err[fail.Fail] {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Fix](out, fix);
+    if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the target table at entry `i` of `[target]`, labelled `label`
+fun target_decode(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml_value.Table, i: usize, label: str, d: *TargetDef) err[fail.Fail] {
+    val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+    val opt_table_key:   opt[str]               = toml_lookup.table_key(tab, i);
+    if (sel opt_table_value.none) { ret err[fail.Fail].err{fail.message("a [target] entry index is outside its table")}; }
+    if (sel opt_table_key.none)   { ret err[fail.Fail].err{fail.message("a [target] entry index is outside its table")}; }
+    val sub:         *toml_value.Table = ?opt_table_value.some.data.table;
+    val err_retired: err[fail.Fail]    = refuse_retired(alloc, sub, label);
+    if (sel err_retired.err) { ret err_retired; }
+    val err_selection: err[fail.Fail] = refuse_arch_selection(alloc, sub, label);
+    if (sel err_selection.err) { ret err_selection; }
+    val err_ext: err[fail.Fail] = refuse_retired_ext(alloc, sub, label);
+    if (sel err_ext.err) { ret err_ext; }
+    var ids:   [8]intern.StrId;
+    var texts: [8]str = [8]str{opt_table_key.some, key_text(sub, "arch"), key_text(sub, "sys"), key_text(sub, "abi"), key_text(sub, "of"), key_text(sub, "env"), key_text(sub, "isa"), key_text(sub, "code_model")};
+    var k:     usize  = 0;
+    for (k < 8) {
+        var res_id_of: res[intern.StrId, fail.Fail];
+        if (k < 4)             { res_id_of = id_of(itn, texts[k]); }
+        or                     { res_id_of = optional_id_of(itn, texts[k]); }
+        if (sel res_id_of.err) { ret err[fail.Fail].err{res_id_of.err}; }
+        ids[k] = res_id_of.ok;
+        k      = k + 1;
+    }
+    d.name       = ids[0];
+    d.at         = span_site(key_span(tab, i));
+    d.arch       = ids[1];
+    d.sys        = ids[2];
+    d.abi        = ids[3];
+    d.of         = ids[4];
+    d.env        = ids[5];
+    d.isa        = ids[6];
+    d.code_model = ids[7];
+    var p: usize = 0;
+    for (p < TARGET_PART_KEYS) {
+        d.parts_at[p] = span_site(value_span(sub, PART_KEYS[p].key));
+        p             = p + 1;
+    }
+    val err_set: err[fail.Fail] = target_set(alloc, itn, sub, label, d);
+    if (sel err_set.err) { ret err_set; }
+    val err_extended: err[fail.Fail] = parse_target_extensions(alloc, itn, sub, label, d);
+    if (sel err_extended.err) { ret err_extended; }
+    ret parse_target_runner(alloc, itn, sub, label, d);
+}
+
+# every key `--set` writes over a target that the table `sub` holds, decoded over `d` with where
+# it was written; a key `sub` does not hold leaves `d` as it is
+# ---
+# alloc: owns a refusal's text
+# itn:   receives the strings
+# sub:   the table
+# lead:  the table's label in mach.toml, nil for a `--set` value
+# d:     the target
+# ret:   ok, or the refusal of a value its key does not take, or a refused allocation
+pub fun target_set(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, lead: str, d: *TargetDef) err[fail.Fail] {
+    val opt_platform: opt[str] = toml_lookup.get_str(sub, "platform");
+    if (sel opt_platform.some) {
+        val res_optional_id_of: res[intern.StrId, fail.Fail] = optional_id_of(itn, opt_platform.some);
+        if (sel res_optional_id_of.err) { ret err[fail.Fail].err{res_optional_id_of.err}; }
+        val res_from: res[Origin, fail.Fail] = origin(alloc, itn, sub, lead, "platform");
+        if (sel res_from.err) { ret err[fail.Fail].err{res_from.err}; }
+        d.platform      = res_optional_id_of.ok;
+        d.platform_from = res_from.ok;
+    }
+    val opt_base: opt[u64] = written_address(sub, "base");
+    if (sel opt_base.some) {
+        val res_base_from: res[Origin, fail.Fail] = origin(alloc, itn, sub, lead, "base");
+        if (sel res_base_from.err) { ret err[fail.Fail].err{res_base_from.err}; }
+        d.base      = opt_base.some;
+        d.base_from = res_base_from.ok;
+    }
+    val err_reserve: err[fail.Fail] = size_set(alloc, itn, sub, lead, "stack_reserve", ?d.stack_reserve, ?d.stack_reserve_from);
+    if (sel err_reserve.err) { ret err_reserve; }
+    ret size_set(alloc, itn, sub, lead, "stack_commit", ?d.stack_commit, ?d.stack_commit_from);
+}
+
+# an optional byte count over `into` and where it was written over `from`, both left as they are
+# when the key is not written. a negative value is refused, since it names no size
+fun size_set(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, lead: str, key: str, into: *u64, from: *Origin) err[fail.Fail] {
+    val opt_int: opt[i64] = toml_lookup.get_int(sub, key);
+    if (sel opt_int.none) { ret err[fail.Fail].ok{}; }
+    val res_written: res[Origin, fail.Fail] = origin(alloc, itn, sub, lead, key);
+    if (sel res_written.err) { ret err[fail.Fail].err{res_written.err}; }
+    if (opt_int.some < 0) {
+        ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "{} must not be negative, as it is a size in bytes", res_written.ok.named), value_span(sub, key));
+    }
+    @into = opt_int.some::u64;
+    @from = res_written.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# `[target.X].runner`: the argv templates the target's programs are launched
+# through, nonempty with an executable first. the templates are checked when the
+# manifest loads, with every other template
+fun parse_target_runner(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, label: str, d: *TargetDef) err[fail.Fail] {
+    val opt_sub_entry: opt[*toml_value.Value] = toml_lookup.get(sub, "runner");
+    if (sel opt_sub_entry.none) { ret err[fail.Fail].ok{}; }
+    val arr:         *toml_value.Array      = ?opt_sub_entry.some.data.array;
+    val res_decoded: res[StrArr, fail.Fail] = ids_of(alloc, itn, arr, label, "runner");
+    if (sel res_decoded.err) { ret err[fail.Fail].err{res_decoded.err}; }
+    d.runner       = res_decoded.ok.items;
+    d.runner_count = res_decoded.ok.count;
+    val res_placed: res[*base_source.Location, fail.Fail] = element_sites(alloc, arr);
+    if (sel res_placed.err) { ret err[fail.Fail].err{res_placed.err}; }
+    d.runner_at = res_placed.ok;
+    if (d.runner_count == 0) { ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.runner must be nonempty", label), opt_sub_entry.some.span); }
+    if (str_len(intern.text(itn, d.runner[0])) == 0) {
+        ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.runner[0] must name an executable", label), element_span(arr, 0));
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the target `m` declares under `name`, nil when none is
+pub fun find_target_by_name(itn: *intern.Interner, m: *Manifest, name: str) *TargetDef {
+    var i: u32 = 0;
+    for (i < m.target_count) {
+        if (str_equals(intern.text(itn, m.targets[i].name), name)) { ret ?m.targets[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# resolve a declared target with every key it states: the one place a `[target.<name>]`
+# table becomes mink's spelling and narrowing
+# ---
+# alloc:        owns a refusal's text
+# itn:          resolves the target's strings
+# d:            the target
+# linkage:      the name of the linkage of the executable under build, nil for the host's
+#               default, which mink resolves against the host
+# linkage_from: where `linkage` was written, which a refusal of it names and points at;
+#               nil where it was written nowhere
+# ret:          the target; err the owners' refusal, naming the target
+pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef, linkage: intern.StrId, linkage_from: *Origin) res[resolved.Target, fail.Fail] {
+    # a target the manifest does not name is labelled by its arch
+    var label: str = intern.text(itn, d.arch);
+    if (!intern.str_is_nil(d.name) && str_len(intern.text(itn, d.name)) != 0) { label = intern.text(itn, d.name); }
+    val res_spec: res[mink_target.Spec, mink_fail.Fail] = mink_target.spec(intern.text(itn, d.sys), intern.text(itn, d.arch));
+    if (sel res_spec.err) {
+        var part: str = nil;
+        if (sel res_spec.err.refused.some) { part = res_spec.err.refused.some.part; }
+        val why: fail.Fail = resolved.refused(alloc, diagnostic_kind.TARGET_UNSUPPORTED, res_spec.err);
+        ret res[resolved.Target, fail.Fail].err{fail.at(declared_refusal(alloc, label, why), part_site(d, part))};
+    }
+    var n: mink_target.Narrowing = mink_target.UNNARROWED;
+    n.env        = stated(itn, d.env);
+    n.abi        = stated(itn, d.abi);
+    n.isa        = stated(itn, d.isa);
+    n.code_model = stated(itn, d.code_model);
+    n.format     = stated(itn, d.of);
+    n.linkage    = stated(itn, linkage);
+    var ext_names: [resolved.MAX_ADDED]str;
+    var ei:        u32 = 0;
+    for (ei < d.ext_count) {
+        ext_names[ei] = intern.text(itn, d.ext[ei]);
+        ei            = ei + 1;
+    }
+    n.ext       = ?ext_names[0];
+    n.ext_count = d.ext_count::usize;
+    val image:       resolved.Image                         = resolved.Image{base: d.base, stack_reserve: d.stack_reserve, stack_commit: d.stack_commit};
+    val res_resolve: res[resolved.Target, resolved.Refused] = resolved.resolve(alloc, res_spec.ok, ?n, image);
+    if (sel res_resolve.ok) { ret res[resolved.Target, fail.Fail].ok{res_resolve.ok}; }
+    if (res_resolve.err.part != nil && str_equals(res_resolve.err.part, mink_target.part_name(mink_target.Part.linkage{})) && linkage_from != nil) {
+        val res_said: res[str, fail.Fail] = sfmt(alloc, "{} is invalid. {}", linkage_from.named, fail.describe(res_resolve.err.why));
+        if (sel res_said.err) { ret res[resolved.Target, fail.Fail].err{res_said.err}; }
+        ret res[resolved.Target, fail.Fail].err{fail.at(fail.user(diagnostic_kind.MANIFEST_INVALID_VALUE, res_said.ok), linkage_from.at)};
+    }
+    ret res[resolved.Target, fail.Fail].err{fail.at(declared_refusal(alloc, label, res_resolve.err.why), part_site(d, res_resolve.err.part))};
+}
+
+# a key of a target table and the part of the target mink names it by
+rec PartKey {
+    part: str;
+    key:  str;
+}
+
+# every key a resolution refuses by its part, in the order of a target's `parts_at`
+val PART_KEYS: [TARGET_PART_KEYS]PartKey = [TARGET_PART_KEYS]PartKey{
+    PartKey{part: "sys", key: "sys"},
+    PartKey{part: "arch", key: "arch"},
+    PartKey{part: "env", key: "env"},
+    PartKey{part: "abi", key: "abi"},
+    PartKey{part: "isa", key: "isa"},
+    PartKey{part: "ext", key: "ext"},
+    PartKey{part: "code model", key: "code_model"},
+    PartKey{part: "format", key: "of"},
+};
+
+# where the target `d` writes the key of the part a resolution refused: the key's value, or the
+# table where it writes none, as for a part the catalog chose
+fun part_site(d: *TargetDef, part: str) base_source.Location {
+    if (part == nil) { ret d.at; }
+    var p: usize = 0;
+    for (p < TARGET_PART_KEYS) {
+        if (str_equals(PART_KEYS[p].part, part) && !base_source.file_is_nil(d.parts_at[p].file)) { ret d.parts_at[p]; }
+        p = p + 1;
+    }
+    ret d.at;
+}
+
+# the text a key states, nil where it states none
+fun stated(itn: *intern.Interner, id: intern.StrId) str {
+    if (intern.str_is_nil(id)) { ret nil; }
+    val text: str = intern.text(itn, id);
+    if (str_len(text) == 0) { ret nil; }
+    ret text;
+}
+
+# `why` said of the target table `label`, of its own kind
+fun declared_refusal(alloc: *A.Allocator, label: str, why: fail.Fail) fail.Fail {
+    val res_said: res[str, fail.Fail] = sfmt(alloc, "mach.toml: [target.{}] is invalid. {}", label, fail.describe(why));
+    if (sel res_said.err) { ret res_said.err; }
+    ret fail.user(fail.kind_of(why), res_said.ok);
+}
+
+# whether a target's `sys` and `arch` name the host the compiler runs on. the abi is not compared
+# ---
+# itn: resolves the target's strings
+# d:   the target
+# ret: true when both names are the host's
+pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef) bool {
+    ret str_equals(intern.text(itn, d.sys), mach_target.host_sys_name()) && str_equals(intern.text(itn, d.arch), mach_target.host_arch_name());
+}
+
+# the systems a compiler is built for, those mach's own manifest declares targets on
+val HOSTED_COUNT: usize             = 3;
+val HOSTED:       [HOSTED_COUNT]str = [HOSTED_COUNT]str{"linux", "darwin", "windows"};
+
+# whether `native` could ever name the target: its system is one a compiler runs on.
+# a freestanding, uefi, wasi or vulkan target is only ever selected by name
+pub fun target_is_hosted(itn: *intern.Interner, d: *TargetDef) bool {
+    val sys: str   = intern.text(itn, d.sys);
+    var i:   usize = 0;
+    for (i < HOSTED_COUNT) {
+        if (str_equals(sys, HOSTED[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the host's target, named `native`, with the host's arch, sys and abi and every other key at
+# its default, for a manifest that declares no target
+# ---
+# alloc: owns the returned definition, which the manifest frees in `dnit`
+# itn:   interns the names
+# ret:   the definition, or a refused allocation
+pub fun native_target_init(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, fail.Fail] {
+    var host:     TargetDef                    = target_def();
+    val res_name: res[intern.StrId, fail.Fail] = id_of(itn, "native");
+    if (sel res_name.err) { ret res[*TargetDef, fail.Fail].err{res_name.err}; }
+    host.name = res_name.ok;
+    val res_isa_name: res[intern.StrId, fail.Fail] = id_of(itn, mach_target.host_arch_name());
+    if (sel res_isa_name.err) { ret res[*TargetDef, fail.Fail].err{res_isa_name.err}; }
+    host.arch = res_isa_name.ok;
+    val res_os_name: res[intern.StrId, fail.Fail] = id_of(itn, mach_target.host_sys_name());
+    if (sel res_os_name.err) { ret res[*TargetDef, fail.Fail].err{res_os_name.err}; }
+    host.sys = res_os_name.ok;
+    val res_abi_name: res[intern.StrId, fail.Fail] = id_of(itn, mach_target.host_abi_name());
+    if (sel res_abi_name.err) { ret res[*TargetDef, fail.Fail].err{res_abi_name.err}; }
+    host.abi = res_abi_name.ok;
+    val res_owned: res[*TargetDef, A.Error] = A.allocate[TargetDef](alloc, 1);
+    if (sel res_owned.err) { ret res[*TargetDef, fail.Fail].err{fail.refused(res_owned.err)}; }
+    @res_owned.ok = host;
+    ret res[*TargetDef, fail.Fail].ok{res_owned.ok};
+}

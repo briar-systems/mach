@@ -1,23 +1,27 @@
 # Mach grammar (EBNF)
 
-A formal grammar for the Mach dialect, derived from the
-parser (`src/lang/fe/lexer.mach`, `src/lang/fe/token.mach`, and
-`src/lang/fe/parser/`) and cross-checked against the per-element docs in
-this directory. Where the live parser diverges from a doc, the divergence
-is called out inline. Productions that could not be fully pinned to the
-parser are marked `(* approximate, verify *)`.
+A formal grammar for the Mach dialect, written against the lexer
+(`src/front/lexer.mach`, `src/front/token.mach`) and the parser
+(`src/front/parser/`). Where the parser accepts more than a doc states, the
+difference is called out inline.
+
+The `keyword`, `punctuation`, `operator`, `binary-op`, `int-suffix`,
+`float-suffix` and `type-constructor` productions and the precedence table are
+written from the tables the compiler keeps: the reserved words in
+`src/front/lexis.mach`, and the fixed spellings and `infix_precedence` in
+`src/front/token.mach`. No test reads this page, so a change to one of those
+tables is carried here by hand, as every other production is.
 
 The tag productions (`tag-decl`, `tag-literal`, `sel-expr`, the `$cases`
 sequence and the `.[desc]` projection) are the syntax of the tagged-value
 contract; see [tag.md](tag.md) for the semantic restrictions the parser does
-not enforce (guards, places, payload arity). `test/doc-agreement.py` checks the keyword list below against
-the parser's `token.mach`.
+not enforce (guards, places, payload arity).
 
 This is a reference grammar, not the parser's exact control flow. The
 parser is a hybrid recursive-descent / Pratt climber that is
 malformed-input tolerant (it recovers and continues rather than failing),
-so some ambiguities the grammar leaves open are resolved operationally —
-those are noted.
+so some ambiguities the grammar leaves open are resolved operationally.
+Those are noted.
 
 
 ## Meta-notation
@@ -51,12 +55,13 @@ token ::= IDENT
         | LIT_INT | LIT_FLOAT | LIT_CHAR | LIT_STR
         | punctuation
         | operator
+        | ASM_HEAD | ASM_BODY    (* the raw head and body of an inline-assembly block *)
         | EOF
         | ERROR    (* emitted for an unexpected character, see below *)
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$"
-              | "#["    (* attribute-open: "#" immediately followed by "[" *)
+              | "#["    (* decorator-open: "#" immediately followed by "[" *)
               | "::" | ":~" | ":>" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
@@ -72,22 +77,24 @@ Notes:
   tokens; the parser recognizes them contextually by their text
   (`at_kw` / `eat_kw` in `parser/state.mach`). The same applies to the
   primitive type names and `nil`.
-- The maximal-munch multi-character operators are `::`, `:~`, `:^`, `:>`,
-  `...`, `==`, `!=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`. A leading `:` lexes as
-  `::`, `:~`, `:^`, or `:>` before a bare `:`, so `expr:~Type` is one cast,
-  never `:` then `~`. A space after the annotation colon (`k: ^[32]u8`) keeps
-  `:` and `^` separate, the same adjacency rule `::`/`:~` rely on, so `k: >T`
-  is still `:` then `>`. `:>` can never take a bare `:` away from an existing
+- Every multi-character spelling above lexes by maximal munch. A leading `:`
+  lexes as `::`, `:~` or `:>` before a bare `:`, so `expr:~Type` is one cast,
+  never `:` then `~`. `:^` is not a token, so the annotation colon in
+  `k: ^[32]u8` or `k:^[32]u8` stays `:` then `^`, and `k: >T` is still `:` then
+  `>`. `:>` can never take a bare `:` away from an existing
   program: `>` neither begins an expression nor begins a type, so a `:`
   immediately followed by `>` was a syntax error in every position.
 - The lexer recognizes the standalone characters `=`, `!`, `<`, `>`, `&`,
-  `|` and the two-character forms above. There is no `+=`, `-=`, etc. —
-  compound assignment does not exist.
-- `ERROR` (`KIND_ERROR`) is a real token kind the lexer emits for an
-  unexpected character: the input is recorded as a `LEX_ERR_UNEXPECTED_CHAR`
-  in the sibling error buffer, a one-byte `ERROR` token is pushed, and
-  lexing continues. `EOF` (`KIND_EOF`) terminates every stream. Neither
+  `|` and the two-character forms above. There is no `+=`, `-=`, etc.
+  Compound assignment does not exist.
+- `ERROR` (`KIND_ERROR`) is a real token kind the lexer emits for a byte that
+  begins no token: the byte is recorded in the sibling error buffer (see
+  [Unexpected characters](#unexpected-characters)), a one-byte `ERROR` token is
+  pushed, and lexing continues. `EOF` (`KIND_EOF`) terminates every stream. Neither
   appears in a well-formed production; they are listed here for completeness.
+- `ASM_HEAD` and `ASM_BODY` (`KIND_ASM_HEAD`, `KIND_ASM_BODY`) are the two raw-text
+  tokens the lexer emits for an `asm` block at the start of a statement (see
+  [Inline assembly](#inline-assembly)).
 
 ### Identifiers and keywords
 
@@ -99,13 +106,17 @@ ident-char  ::= ident-start | '0'..'9'
 
 The reserved keywords (matched as `IDENT` text by the parser) are:
 
-```
-asm  brk  cnt  def  each error ext  fin  for  fun
-fwd  if   in   nil  or   pub  rec  ret  sel  tag
-test uni  use  val  var
+```ebnf
+keyword ::= "asm" | "brk" | "cnt" | "def" | "each" | "error" | "ext" | "fin"
+          | "for" | "fun" | "fwd" | "if" | "in" | "nil" | "or" | "pub"
+          | "rec" | "ret" | "sel" | "tag" | "test" | "uni" | "use" | "val"
+          | "var"
 ```
 
 `nil` is an expression literal and `sel` is a prefix expression operator.
+`asm` is the one keyword the lexer reads: where a statement begins, followed on its
+line by a word, it opens an inline-assembly block whose head and body are raw text (see
+[Inline assembly](#inline-assembly)).
 `each`, `error` and `in` are recognized only in the comptime forms that spell
 them (`$each x in ...`, `$error(...)`; see [Statements](#statements)). The
 rest are statement, declaration, or type introducers. Note these are *contextual*: nothing in the lexer prevents a
@@ -113,9 +124,9 @@ binding or field from being named after one, but the parser will treat the
 keyword in its keyword position. The operand-less statement keywords `brk`
 and `cnt` are keywords only in their bare form (`brk;` / `cnt;`); the same
 word followed by anything else is an ordinary identifier, so `cnt = x;` is an
-assignment to a variable named `cnt`. The primitive type names (`u8`, `u16`,
-`u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `ptr`) are *not*
-keywords — they are ordinary identifiers resolved by name later.
+assignment to a variable named `cnt`. The primitive type names
+([types.md](types.md#primitive-scalars)) are *not* keywords. They are ordinary
+identifiers resolved by name later.
 
 ### Integer literals
 
@@ -123,12 +134,12 @@ keywords — they are ordinary identifiers resolved by name later.
 LIT_INT  ::= dec-int | hex-int | bin-int | oct-int
 
 dec-int  ::= digit { digit | "_" } [ int-suffix ]
-hex-int  ::= "0x" hex-digit { hex-digit | "_" } [ int-suffix ]
-bin-int  ::= "0b" ( "0" | "1" ) { "0" | "1" | "_" } [ int-suffix ]
-oct-int  ::= "0o" oct-digit { oct-digit | "_" } [ int-suffix ]
+hex-int  ::= "0x" { "_" } hex-digit { hex-digit | "_" } [ int-suffix ]
+bin-int  ::= "0b" { "_" } ( "0" | "1" ) { "0" | "1" | "_" } [ int-suffix ]
+oct-int  ::= "0o" { "_" } oct-digit { oct-digit | "_" } [ int-suffix ]
 
-int-suffix ::= "u8" | "u16" | "u32" | "u64"
-             | "i8" | "i16" | "i32" | "i64"
+int-suffix ::= "u8" | "u16" | "u32" | "u64" | "u128"
+             | "i8" | "i16" | "i32" | "i64" | "i128"
 
 digit     ::= '0'..'9'
 hex-digit ::= digit | 'a'..'f' | 'A'..'F'
@@ -137,11 +148,13 @@ oct-digit ::= '0'..'7'
 
 A leading `0x` / `0b` / `0o` selects the base; the suffix is scanned on any
 non-float integer literal regardless of base. The lexer scans the digit
-run, then — when the token is not a float — takes a trailing `u`, `i` or
+run, then, when the token is not a float, takes a trailing `u`, `i` or
 `f` with the digits after it into the same token, so a suffix that names
-no integer type (`7u7`, `1f32`) is diagnosed as a bad literal rather than
+no integer type (`7u7`, `1f32`) is refused as `literal.malformed` rather than
 lexed as a number followed by an identifier. Underscores are permitted as
-digit separators in every base. A suffix is the spelling of the type the
+digit separators in every base, anywhere after the base prefix, first and
+last included (`0x_1F`, `1_`). A prefix with no digit after it (`0x`) is
+refused as `literal.malformed` too. A suffix is the spelling of the type the
 literal has; see [literals.md](literals.md#typed-suffixes).
 
 ### Float literals
@@ -153,7 +166,7 @@ LIT_FLOAT ::= digit { digit | "_" }
 
 frac        ::= "." digit { digit | "_" }
 exponent    ::= ( "e" | "E" ) [ "+" | "-" ] digit { digit | "_" }
-float-suffix ::= "f32" | "f64"
+float-suffix ::= "f16" | "f32" | "f64"
 ```
 
 A token is a float when it has a fractional part (`.` followed by a digit)
@@ -165,25 +178,27 @@ digit, otherwise it lexes as a separate `.` token (so `1.field` is
 
 ```ebnf
 LIT_CHAR ::= "'" char-body "'"
-LIT_STR  ::= '"' { str-char } '"'
+LIT_STR  ::= '"' { str-char } '"' | ml-line { newline { " " | "\t" } ml-line }
+ml-line  ::= "\\" { any-char-except-newline }   (* "\\" is two backslash characters *)
 ```
 
 The lexer captures the raw span between the quotes and treats `\` as an
 escape that consumes the next character (so an escaped quote does not
-terminate the literal). Escape decoding happens later — in
-`comptime.eval_lit_char` / `comptime.eval_lit_str` for a comptime-evaluated
-literal, and in `me/lower/expr.lit_decode_escape` (an intentional mirror of the
-same table, #2472) for one lowered as ordinary runtime code. The recognized
-escapes are:
+terminate the literal). Escape decoding happens once, as the parser
+scans the literal (`char_scan` and `str_scan` in `src/front/literal.mach`).
+The recognized escapes are:
 
 ```
-char escapes:   \n  \t  \r  \\  \'  \0  \xHH
-string escapes: (char escapes) + \"
+escapes:  \n  \t  \r  \\  \'  \"  \0  \xHH
 ```
 
-A string literal is single-line (see [literals.md](literals.md)): the lexer
+A quoted string literal is single-line (see [literals.md](literals.md)): the lexer
 scans from the opening `"` to the next unescaped `"`, stopping at an
-unescaped newline or EOF. A char literal scans likewise to the next `'`. An
+unescaped newline or EOF. A multiline string is one token from its first
+`\\` through the end of the last line whose first text is `\\`. Its value is
+each line's text after its `\\`, read with no escapes, the lines joined by
+`\n` with none after the last. A line break of `\r\n` joins as `\n`, and a line
+that starts otherwise, a blank line or a comment, ends the token. A char literal scans likewise to the next `'`. An
 unterminated `'` or `"` (the scan hits a newline or EOF first) is a lexer
 error but still produces a token span covering the rest of that line.
 
@@ -195,8 +210,8 @@ whitespace ::= " " | "\t" | "\n" | "\r"
 ```
 
 `#` begins a line comment that runs to (but not including) the next
-newline — **unless** it is immediately followed by `[`, which opens an
-attribute decorator (`#[`, `KIND_ATTR_OPEN`; see [Decorators](#decorators)).
+newline, **unless** it is immediately followed by `[`, which opens a
+decorator (`#[`, `KIND_DECORATOR_OPEN`; see [Decorators](#decorators)).
 A literal comment that begins `#[` therefore needs a separating space
 (`# [...]`). There is no block-comment form. Whitespace and comments separate
 tokens and are otherwise discarded.
@@ -205,11 +220,16 @@ tokens and are otherwise discarded.
 
 The lexer has no fall-through quote or reserved class: any byte that begins
 none of the token forms above is an **unexpected character**. The lexer
-records a `LEX_ERR_UNEXPECTED_CHAR`, emits a one-byte `ERROR` token
-(`KIND_ERROR`) for it, and continues.
+records it, emits a one-byte `ERROR` token (`KIND_ERROR`) for it, and
+continues. A control byte (below `0x20`, other than the tab and line breaks
+above, or `0x7f`) is refused as `source.control_char`. Every other such byte
+is refused as `source.unexpected_char`. A non-ASCII byte (`0x80` and above)
+reads `this character is not allowed. source text must be ASCII`, and a
+printable ASCII byte that begins no token, such as the backtick or a lone
+backslash, reads `this character begins no token`.
 
 The backtick `` ` `` is not a token: it is an unexpected character wherever it
-appears. `#[` is the two-byte attribute-open token (`KIND_ATTR_OPEN`) that
+appears, refused as `source.unexpected_char`. `#[` is the two-byte decorator-open token (`KIND_DECORATOR_OPEN`) that
 opens a decorator (see [Decorators](#decorators) below).
 
 
@@ -225,25 +245,32 @@ module ::= { decl }
 ## Decorators
 
 Zero or more leading `#[...]` decorator clauses may appear before any
-declaration. Each clause is a comptime directive name, optionally followed by a
+declaration. Each clause is a decorator name, optionally followed by a
 parenthesized argument list of comptime expressions.
 
 ```ebnf
-decorator      ::= "#[" IDENT [ "(" [ expr { "," expr } ] ")" ] "]"
+decorator      ::= "#[" decorator-name [ "(" [ expr { "," expr } [ "," ] ] ")" ] "]"
+decorator-name ::= IDENT [ "." IDENT ]   (* no space around the "." *)
 decorated-decl ::= { decorator } decl
 ```
 
 - Decorators attach to the **immediately following** declaration and do not
   bleed across declarations.
 - Clauses may appear on the same line (space-separated) or one per line.
-- The argument list is optional; a bare `#[inline]` carries no arguments.
+- The argument list is optional; a bare `#[naked]` carries no arguments.
+- A dotted name is one name only where nothing stands between its words, as in
+  `#[gpu.stage("compute")]`. Only the GPU set is dotted.
+- Every argument is a constant expression: a number is an integer, and every
+  name, mode or path is a string. No decorator takes a bare word.
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
   argument; `T` as a raw type name is not. A layout intrinsic is accepted on both
   a global's `align` and a record/union type's, see [decorators.md](decorators.md).
-- The directive set is closed and enforced by sema, not the parser; the
-  full list (`symbol`, `library`, `inline`, `noinline`, `align`, `packed`,
-  `section`, `oblivious`, `scalar`, `naked`, `embed`, and the shader and
-  target-type directives) is in [decorators.md](decorators.md).
+- The decorator set is closed: the parser decodes each name to the decorator it
+  names, and sema refuses a name that names none (`decorator.unknown`). The set,
+  and where each decorator applies, is in [decorators.md](decorators.md#applicability).
+- Decorators stand only on module-level declarations and tag cases. One written
+  before a local statement is refused by name (`decorator.misplaced`), and the
+  statement after it is read as if it stood bare.
 - `#[...]` is the only decorator surface; a backtick is an unexpected
   character.
 
@@ -278,13 +305,17 @@ dotted-path ::= IDENT { "." IDENT }
 ```
 
 `use` imports; `fwd` re-exports. `fwd` always publishes, so `pub fwd` is
-rejected by the parser (the `pub` flag is dropped and an error is emitted).
+rejected by the parser (the `pub` flag is dropped and `fwd.pub` is reported).
 
-### `def` — type alias
+### `def` - type alias
 
 ```ebnf
-def-decl ::= "def" IDENT ":" type ";"
+def-decl ::= "def" IDENT [ ":" type ] ";"
 ```
+
+The parser accepts a `def` with no type. Sema refuses it as `def.no_type`
+unless a decorator defines the type, `handle` or `abi_type` (see
+[decorators.md](decorators.md)).
 
 ### `rec` and `uni`
 
@@ -303,16 +334,19 @@ layout). Both may be generic and both share the same field-block grammar.
 ```ebnf
 tag-decl ::= "tag" IDENT [ generic-params ] ":" discriminator "{" { tag-case ";" } "}"
 
-discriminator ::= "u8" | "u16" | "u32" | "u64"
+discriminator ::= type      (* sema admits u8, u16, u32 and u64 *)
 
-tag-case ::= IDENT [ ":" type ]
+tag-case ::= { decorator } IDENT [ ":" type ]
 ```
 
 `tag` defines a discriminated aggregate value with one active case at any time.
-Each case specifies a name and either one payload type or no payload. The
-discriminator type is mandatory and must be able to number every case.
+Each case specifies a name and either one payload type or no payload, and may
+carry decorators of its own (see [decorators.md](decorators.md#applicability)).
+The discriminator type is mandatory and must be able to number every case. A
+tag with no `:` and discriminator is refused by the parser as
+`tag.no_discriminator`.
 
-### `fun` — function
+### `fun` - function
 
 ```ebnf
 fun-decl ::= "fun" IDENT [ generic-params ] param-list [ type ] ( block | ";" )
@@ -326,7 +360,7 @@ fun-decl ::= "fun" IDENT [ generic-params ] param-list [ type ] ( block | ";" )
 ```ebnf
 param-list ::= "(" [ params ] ")"
 
-params ::= typed-name { "," typed-name } [ "," pack-param ]
+params ::= typed-name { "," typed-name } [ "," pack-param ] [ "," ]
          | typed-name { "," typed-name } [ "," c-variadic ]
          | pack-param
 
@@ -337,37 +371,36 @@ typed-name ::= [ "$" ] IDENT ":" type
 ```
 
 - A trailing `name: ...` declares a **comptime variadic pack parameter**
-  (`TYPE_KIND_PACK`); it must be the last parameter.
+  (`TYPE_KIND_PACK`). It must be the last parameter, and a parameter after it is
+  refused as `pack.not_last`, ``a variadic pack `...` must be the last parameter``.
 - A trailing **bare** `...` declares a **C-variadic** signature: the preceding
   parameters are the fixed arity and a call may pass further arguments, placed by
   the target's C variadic rules (see
   [ext-fun.md](ext-fun.md#c-variadic-imports)). It is accepted only on an `ext`
-  declaration and only after at least one fixed parameter. On any other
+  declaration and only after at least one fixed parameter (`ext fun f(...)` is
+  refused as `variadic.no_fixed_param`). On any other
   declaration a bare `...` is not a parameter and the parser reports the
-  missing parameter name; a comptime variadic pack is a named parameter
-  (`va: ...`). (A function *pointer type* also carries `...`; see
+  missing parameter name (`syntax.expected_name`). A comptime variadic pack is a
+  named parameter (`va: ...`). (A function *pointer type* also carries `...`; see
   `fun-type-params` below.)
-- A leading `$` on a `typed-name` marks it a **comptime value parameter**.
+- A leading `$` on a `typed-name` marks it a **comptime value parameter**. It is
+  accepted on function parameters only, and a `$` on a named `rec` or `uni` field
+  is refused as `syntax.expected_name`, ``a field takes no `$` comptime marker``.
 
-> **Divergence (parser vs. doc).** `typed-name` is shared between function
-> parameters and `rec`/`uni` fields, so the parser will *accept* a leading
-> `$` on a named `rec`/`uni` field too. [fun.md](fun.md) states comptime
-> value parameters apply to function parameters only; anonymous inline
-> `rec {...}` / `uni {...}` field types hardcode the comptime flag off. A
-> `$` on a *named-type* field parses but is not the documented surface.
-
-### `val` / `var` — bindings
+### `val` / `var` - bindings
 
 ```ebnf
-val-decl  ::= "val" IDENT ":" type "=" expr ";"
+val-decl  ::= "val" IDENT ":" type [ "=" expr ] ";"
 var-decl  ::= "var" IDENT ":" type [ "=" expr ] ";"
 bind-decl ::= val-decl | var-decl
 ```
 
 `val` is immutable, `var` mutable. The type annotation is mandatory for both
-(Mach has no type inference — see [val-var.md](val-var.md)); the parser
-rejects a binding with no `: type`. A `val` requires an initializer; a `var`
-may omit it and is default-initialized. A `val`/`var` may also appear as a
+(see [val-var.md](val-var.md)), and the parser rejects a binding with no
+`: type` as `binding.untyped`. A `val` requires an initializer unless it is an
+`ext` import or carries `#[embed(...)]`, and the parser refuses one without as
+`binding.val_uninitialized`. A `var` may omit it and is
+zero-initialized. A `val`/`var` may also appear as a
 local statement (see [Statements](#statements)).
 
 ### `test`
@@ -391,7 +424,7 @@ A bracketed list of bare type-parameter names with no constraints. An empty
 ## Comptime declarations and directives
 
 A `$` at declaration scope is either a comptime `$if` chain or a comptime
-directive (`$intrinsic(args);`).
+directive (`$<name>(args);`).
 
 ```ebnf
 comptime-decl ::= comptime-if-decl | comptime-directive
@@ -406,7 +439,7 @@ comptime-directive ::= expr-no-assign ";"
 ```
 
 - `comptime-directive` is a bare **comptime intrinsic / directive call**
-  (`$error("msg");`). Per-declaration codegen attributes are written as
+  (`$error("msg");`). Per-declaration codegen properties are written as
   `#[...]` decorators (see [decorators.md](decorators.md)); a directive takes
   no `=`, so a stray one after the target is a parse error at the directive's
   `;`. The target is parsed at a binding power above assignment so that `=`
@@ -429,21 +462,21 @@ type ::= secret-type
        | fun-type
        | rec-type
        | uni-type
-       | pointee-of-type
+       | constructed-type
        | field-type
        | named-type
 
 secret-type     ::= "^" type
 ptr-type        ::= "*" type
 array-type      ::= "[" ( expr | "_" ) "]" type
-pointee-of-type ::= "$" "pointee_of" "(" type ")"
+constructed-type ::= "$" type-constructor "(" type ")"
+type-constructor ::= "pointee_of" | "discriminant_of"
 field-type      ::= IDENT "." "type"
 named-type      ::= dotted-path [ type-args ]
 type-args       ::= "[" [ type { "," type } [ "," ] ] "]"
 
 fun-type ::= "fun" "(" [ fun-type-params ] ")" [ type ]
-fun-type-params ::= "..."
-                  | type { "," type } [ "," "..." ]
+fun-type-params ::= type { "," type } [ "," "..." ]
 
 rec-type ::= "rec" anon-field-block
 uni-type ::= "uni" anon-field-block
@@ -451,33 +484,40 @@ anon-field-block ::= "{" { IDENT ":" type ";" } "}"
 ```
 
 Notes:
-- `^T` marks `T` as carrying secret data for the constant-time guarantee
-  (#1643). It is a prefix qualifier binding to the type immediately to its
+- `^T` marks `T` as carrying secret data for the constant-time guarantee.
+  It is a prefix qualifier binding to the type immediately to its
   right, so it nests with `*` and `[N]` in any order (`*^u8`, `^*u8`,
   `[N]^u8`). The grammar accepts it in every type position. Its flow-typing
   semantics - the secrecy lattice and join, the leakage-model gates, and the
-  welded-storage pointer rules - are enforced by sema (#1645) and documented in
+  welded-storage pointer rules - are enforced by sema and documented in
   [secrecy.md](secrecy.md).
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
-- `$pointee_of(T)` is the type a typed reference `*U` refers to (#2693). It is a
-  type **constructor** rather than an intrinsic call, which is what lets it nest
-  inside another intrinsic's operand and inside a generic argument list. `ptr`,
-  `^*U`, and any non-reference operand are refused by sema, each with its own
-  cause — see [comptime-intrinsics.md](comptime-intrinsics.md).
-- `f.type` is a field descriptor's own type inside a `$each` body (#2691), and is
+- `$pointee_of(T)` is the type a typed reference `*U` refers to, and
+  `$discriminant_of(T)` the discriminator type of a tag. Each is a type
+  **constructor** rather than an intrinsic call, which is what lets it nest
+  inside another intrinsic's operand and inside a generic argument list. An
+  operand of the wrong kind is refused by sema with its own cause, see
+  [comptime-intrinsics.md](comptime-intrinsics.md).
+- `...` is not a type. Written where a type is expected it is refused as
+  `syntax.expected_type`. A variadic pack is spelled only by `pack-param`.
+- `f.type` is a field descriptor's own type inside a `$each` body, and is
   a type spelling in its own right so a constructor can take one
   (`$pointee_of(f.type)`). `type` is contextual, not a keyword: a module or record
   member genuinely named `type` still reads as a path (`mod.type.T`, `mod.type[A]`).
 - `[N]T` is a fixed-length array; `N` is a full expression (a comptime
-  constant), including `$size_of(T)` / `$align_of(T)` — see
+  constant), including `$size_of(T)` / `$align_of(T)`, see
   [comptime-intrinsics.md](comptime-intrinsics.md). Nesting (`[N][M]T`) falls out
   of the recursion.
-- `[_]T` is an inferred array length (#2507): the length is not written but taken
-  from elsewhere. It is legal **only** on a `val` carrying `#[embed(...)]`, where
-  the length comes from the embedded file's byte count; written anywhere else it
-  is rejected — "an inferred array length `[_]` is only valid on an
-  `#[embed(...)]` declaration". See
+- `[_]T` is an inferred array length: the length is not written but taken
+  from elsewhere. It is legal only as the type of an array literal
+  (`[_]T{...}`), as the annotation of a `val` or `var` initialized by an array
+  literal, where the length is the literal's element count, or by a string
+  literal, where it is the literal's byte count, and on a `val`
+  carrying `#[embed(...)]`, where it is the embedded file's byte count. A
+  `val` or `var` annotation may wrap it in a secret (`^[_]u8`). Anywhere
+  else, including nested in another type (`*[_]u8`), it is rejected with
+  `array.inferred_length`. See [types.md](types.md#inferred-length-_t) and
   [decorators.md](decorators.md#embedstr--compile-time-file-embedding).
 - `named-type` covers both plain names (`i64`, `Point`) and generic
   instantiations (`Pair[i64, u8]`, `Map[str, u32]`). The dotted path allows
@@ -485,7 +525,9 @@ Notes:
 - A `fun(...)` type's return type is optional; it is omitted when the next
   token cannot begin a type (`{`, `;`, `,`, `)`, `]`, `=`, EOF).
 - `fun`-type parameter lists carry a `variadic` flag via a trailing `...`,
-  mirroring `fun` declarations.
+  mirroring `fun` declarations. As there, at least one fixed parameter must
+  precede it: `fun(...) i32` is refused by the parser as
+  `variadic.no_fixed_param`.
 - Anonymous inline `rec {...}` / `uni {...}` types use a field block whose
   entries do **not** accept the leading `$` comptime marker.
 
@@ -504,7 +546,7 @@ Expressions are a Pratt climber over a primary (prefix + postfix) grammar.
 expr ::= prefix { postfix } { binary-op prefix { postfix } }
 ```
 
-(The braces above are illustrative; the real binding is precedence-driven —
+(The braces above are illustrative. The real binding is precedence-driven,
 see the precedence table.)
 
 ### Prefix (atoms and unary)
@@ -536,8 +578,9 @@ unary-op ::= "-"      (* numeric negation *)
   chain, so `@p.field` and `?arr[i]` apply member/index *inside* the unary.
 - `sel` binds the same way and requires the result to be a member access or
   a descriptor projection (`sel r.ok`, `sel v.[c]`), so `sel r.ok && r.ok > 3`
-  parses as `(sel r.ok) && (r.ok > 3)`; any other operand is a parse error
-  (`` `sel` tests one case of a place: write `sel place.case` or `sel place.[case]` ``).
+  parses as `(sel r.ok) && (r.ok > 3)`. Any other operand is a parse error,
+  `sel.not_a_case`
+  (`` `sel` tests one case of a place. write `sel place.case` or `sel place.[case]` ``).
 - `(expr)` is a plain grouping; there is no tuple form.
 
 ### Postfix
@@ -561,11 +604,11 @@ cast         ::= ( "::" | ":~" ) type
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
-[operators.md](operators.md#cast). Neither `::` nor `:~` may add or drop the
-`^` secret qualifier. `:>` is the only downgrade: it strips `^` from the
-operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
-Its target type is required and names the operand's stripped public type; a bare
-`:>` is a parse error, and `:>` never reinterprets storage.
+[operators.md](operators.md#cast). `::` and `:~` may add the
+`^` secret qualifier to a value but never drop it, and never add it to a pointer's target. `:>` is the only downgrade: it strips `^` from the
+operand's type, producing a new public value ([secrecy.md](secrecy.md)).
+Its target type is required and names the operand's stripped public type. A bare
+`:>` is a parse error (`syntax.expected_type`), and `:>` never reinterprets storage.
 
 `:^` is not a token: `x:^u32` lexes as `x`, `:`, `^`, `u32`, the postfix
 chain stops at the colon, and the enclosing statement reports its own
@@ -579,28 +622,28 @@ Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index
 (`obj[idx]`, a range `obj[start, count]`, or the index of an index-then-call
 `callee[idx](args)`). The two
-grammars overlap — a bare name is both a type and a value — so the parser cannot
+grammars overlap (a bare name is both a type and a value), so the parser cannot
 decide locally. It probes the payload against both grammars, and the same four
 outcomes apply whether or not a `(` follows the `]`:
 - reads cleanly **only** as a type list (`*T`, `[N]T`, a list of three or more,
-  or a nested generic like `res[bool, ParseError]`) → generic arguments;
+  or a nested generic like `res[bool, ParseError]`) -> generic arguments.
 - reads cleanly **only** as an expression (`i + 1`, `f(x)`, a literal, or a
-  range with such a part like `p[i, 4]`) → an index, so `table[0]()` and
-  `table[i + 1]()` are index-then-call;
+  range with such a part like `p[i, 4]`) -> an index, so `table[0]()` and
+  `table[i + 1]()` are index-then-call.
 - reads cleanly as **both** (a bare identifier, a dotted path, a generic
   application like `v[k]`, or two of those separated by a comma like `v[a, b]`)
-  → the decision is deferred to name resolution, which
+  -> the decision is deferred to name resolution, which
   picks by the object's resolved kind. In **callee** position a value (or any
   non-name callee, e.g. an index/call result) makes `[x]` an index, while a
   function, type, or imported name takes `[x]` as a type argument. In **value**
-  position the predicate is narrower — only a name that resolves to a *function
-  declaration* takes type arguments — because with no `(` to key on every
+  position the predicate is narrower (only a name that resolves to a *function
+  declaration* takes type arguments), because with no `(` to key on every
   subscript in the language reaches this path, and `mod.ARR[i]` must stay an
   index. So `table[i]()` calls the indexed function pointer, `make[T]()`
   instantiates the generic, and `make[T]` names that instance as a value. A
   two-part payload follows the same rule: `v[a, b]` on a value is a range, and
-  `f[T, U]` on a generic is its type arguments, in either position;
-- reads cleanly as **neither** → the committing index parse reports the error
+  `f[T, U]` on a generic is its type arguments, in either position.
+- reads cleanly as **neither** -> the committing index parse reports the error
   (never a silent wrong parse). In value position, a payload that is a type and
   nothing else has no index reading to fall back on, and is reported against the
   object instead.
@@ -685,6 +728,7 @@ stmt ::= block
        | local-decl-stmt
        | comptime-if-stmt
        | comptime-each-stmt
+       | comptime-directive-stmt
        | expr-stmt
 
 block ::= "{" { stmt } "}"
@@ -710,6 +754,8 @@ comptime-if-stmt ::= "$" "if" "(" expr ")" stmt-branch-body
 stmt-branch-body ::= "{" { stmt } "}"
 
 comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
+
+comptime-directive-stmt ::= "$" "error" call-args ";"
 ```
 
 `$each` is a compile-time unroll: the body is duplicated once per element of
@@ -722,72 +768,80 @@ Notes:
   and `else` (`or { ... }`). Arms are parsed greedily; an `or` with a
   condition continues the chain, an `or` without one terminates it. Each
   arm body is a block.
-- `fin { ... }` registers a block to run when the enclosing block exits —
-  Mach's defer, block-scoped (see [statements.md](statements.md) for the exit
-  rules). The body must be a block; the bare `fin stmt;` form is rejected.
+- `fin { ... }` registers a block to run when the enclosing block exits,
+  block-scoped (see [statements.md](statements.md) for the exit
+  rules). The body must be a block. The bare `fin stmt;` form is rejected with
+  `syntax.expected_token` (`expected '{' to open 'fin' body`).
 - `comptime-if-stmt` is the statement-scope `$if`/`$or` chain (the
   declaration-scope variant is under [Comptime](#comptime-declarations-and-directives)).
-  A `$` only begins this form when the next token is the keyword `if`;
-  otherwise a leading `$` at statement position is parsed as an
+  A `$` begins this form when the next token is the keyword `if`, a
+  `$each` when it is `each`, and a `comptime-directive-stmt` when it is
+  `error`. Any other leading `$` at statement position is parsed as an
   `expr-stmt` whose first atom is a `comptime-ident`.
 
 ### Inline assembly
 
 ```ebnf
-asm-stmt ::= "asm" IDENT "{" asm-body "}"
+asm-stmt ::= "asm" asm-head "{" asm-body "}"
 ```
 
-- The `IDENT` after `asm` is the mandatory **ISA tag** (`x86_64`,
-  `aarch64`, … — a closed set). Bare `asm { ... }` is rejected.
-- `asm-body` is **raw text**, not a token grammar: the parser captures the
-  source span between the opening `{` and its brace-matched `}` and hands it
-  to the backend verbatim. Nested `{ }` are balanced by depth. Local
-  substitution uses `{name}` references inside the body; operand direction
-  and clobbers are inferred from the instruction stream, so there is no
-  operand or clobber list. `#` introduces a line comment inside the body.
+- `asm` beginning a statement is always an `asm-stmt`. A statement begins at the
+  start of a file or a body and after `;`, `{` or `}`, and there the lexer reads
+  `asm` followed on its line by a word as a block: `asm-head` and `asm-body` are each
+  one token of raw text. `asm` elsewhere is an ordinary identifier.
+- `asm-head` is the mandatory **selection of masc's**: raw text from after `asm` to
+  the `{` on the same line, handed to masc unchanged (see [asm.md](asm.md)). A
+  statement that begins with `asm` and no head, as `asm { ... }`, is rejected as
+  `asm.isa_missing`.
+- `asm-body` is **raw text**, not a token grammar: the lexer takes the source
+  between the opening `{` and the `}` that closes it and hands it to the backend
+  verbatim. That `}` is found in the source dialect of the one instruction set of
+  masc's whose catalog reads the head, whatever the target and whether or not
+  `$if` keeps the block, so a brace inside the dialect's comments (`#` on x86 and
+  RISC-V, `//` on aarch64, `;;` on WebAssembly), strings or character constants
+  neither opens nor closes the body, and every other brace balances. A head no
+  set reads, or more than one reads, is refused with `asm.head`, and a body never
+  closed with `asm.unterminated`. Local substitution uses `{name}` references
+  inside the body, outside its comments and literals. Operand direction and
+  clobbers are inferred from the instruction stream, so there is no operand or
+  clobber list.
 
 ```ebnf
-asm-body ::= (* raw source text, brace-balanced; not tokenized *)
+asm-head ::= (* raw source text to the "{" on its line; masc's selection syntax *)
+asm-body ::= (* raw source text, brace-balanced in the head's dialect; not tokenized *)
 ```
 
 
 ## Comptime surface (syntactic forms)
 
-These are not separate grammar productions — they reuse `comptime-ident`,
-`call-args`, and `member` — but are listed here as the recognized comptime
-shapes for reference. They are accepted syntactically; which ones the
-compiler actually resolves is a semantic concern (several are documented
-stubs).
+These are not separate grammar productions. They reuse `comptime-ident`,
+`call-args`, and `member`, and are listed here as the recognized comptime
+shapes. Which names the compiler answers is a semantic concern.
 
 ```ebnf
 comptime-ident ::= "$" IDENT                       (* $size_of, $mach, $type_of, ... *)
 
 intrinsic-call ::= comptime-ident call-args         (* $size_of(T), $fields(T), $type_of(e) *)
-mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arch.x86_64 *)
+mach-read      ::= comptime-ident { member }        (* $mach.build.sys, $mach.arch.x86_64 *)
 ```
 
-- Intrinsic calls (`$size_of(T)`, `$length_of(T)`, `$align_of(T)`,
-  `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$cases(T)`,
-  `$discriminant_of(T)`, `$is_tag(T)`, `$is_record(T)`,
-  `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$holds_secret(T)`, `$type_name(T)`,
-  `$type_id(T)`, `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
-- The **type-taking** intrinsics — `$size_of`, `$length_of`, `$align_of`,
-  `$offset_of`, `$fields`, `$cases`, `$discriminant_of`, and the type predicates
-  with `$type_name` and `$type_id` — parse their
-  **first argument with the `type` production**, not the
-  expression grammar, so the whole type language is spellable there:
-  `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,
-  `$size_of(^u32)`, `$fields(mod.Rec)`. Every other argument is an ordinary
-  expression; `$offset_of`'s second is a bare field name resolved against the
-  record or tag payload case. `$type_of(e)` takes a value expression and produces a comptime type
-  value.
+- An intrinsic call is a `comptime-ident` callee with `call-args`. The set of
+  intrinsics is closed, and each is documented in
+  [comptime-intrinsics.md](comptime-intrinsics.md).
+- An intrinsic that takes a type parses its **first argument with the `type`
+  production**, not the expression grammar, so the whole type language is
+  spellable there: `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`,
+  `$size_of([4]u16)`, `$size_of(^u32)`, `$fields(mod.Rec)`. Every other argument
+  is an ordinary expression. `$offset_of`'s second is a bare field name resolved
+  against the record or tag payload case. `$type_of(e)` takes a value expression
+  and produces a comptime type value.
 - A **type comparison** operand (`$type_of(x) == Name`) is the one type spelling
   read with the expression grammar, because the comparison is only recognizable
   once both sides are parsed. Only a bare name or `module.Name` is available
   there; a generic instance is not.
 - `$mach.*` reads are a `comptime-ident` followed by a `.`-member chain. They
   appear in `$if` conditions and as comptime initializers.
-- A bare **directive** `$intrinsic(args);` (e.g. `$error("msg");`) is the
+- A bare **directive** `$<name>(args);` (e.g. `$error("msg");`) is the
   `comptime-directive` declaration form above.
 
 The `$mach.*` tag/path set is closed and documented in
@@ -803,77 +857,14 @@ disambiguated from a regular member access `v.name` by the `[` lookahead:
 `.` then `[` = projection; `.` then `IDENT` = member.
 
 
-## Verification notes
-
-Productions verified directly against the parser source:
-
-- **Lexical grammar** — `lexer.mach` / `token.mach`: token set (incl.
-  `KIND_ATTR_OPEN`), operator maximal-munch,
-  number/char/string scanning and escapes, comment and whitespace handling
-  (incl. the `#[` attribute-open exception), the "keywords are `IDENT`s" model.
-- **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
-  (the table is a direct transcription; only `=` is right-associative).
-- **Decorators** — `parser/grammar.mach` `parse_decorators` / `parse_one_decorator`:
-  leading `#[name(args)]` clauses (one Decorator node), closed directive set.
-- **Declarations** — `parser/grammar.mach`: `use`, `fwd` (incl. `pub fwd`
-  rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
-  comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
-  `tag` (mandatory discriminator, cases with an optional payload type),
-  `val`/`var` (type annotation required; `val x = 42;` is rejected), `def`, `test`, `flags`
-  (`pub`/`ext` any order/count), the decl-scope `$if`/`$or` chain, and the
-  `comptime-directive` (attribute-write vs. bare directive) form.
-- **Statements** — `parser/grammar.mach`: `block`, `if`/`or` chain, `for`
-  (optional condition), `ret`/`brk`/`cnt`/`fin`, local `val`/`var`, the
-  stmt-scope `$if`/`$or` chain, `$each … in … { }`, and `expr-stmt`.
-- **Expressions** — `parser/grammar.mach`: prefix atoms, `sel`, all five
-  unary prefix operators (`-`, `!`, `~`, `?`, `@`), the postfix chain
-  (call with optional `...` spread on arguments, generic-call, index,
-  member, field projection `.[f]`, cast), struct/array/tag literals and the
-  typed-literal lookahead, the generic-call-vs-index `[` disambiguation,
-  and `comptime-ident`.
-- **Types** — `parser/grammar.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic,
-  pack `name: ...`, and optional return), anonymous `rec {...}` / `uni {...}`,
-  and named types with generic args / dotted paths.
-- **Inline asm** — `parser/iasm.mach`: mandatory ISA tag, raw brace-balanced
-  body, no operand/clobber list.
-
-Doc-only (intended surface, not a distinct parser production):
-
-- The concrete escape sets (`\n \t \r \\ \' \0 \xHH`, plus `\"` for
-  strings) — the lexer only treats `\` as "consume next char"; the actual
-  escape set is decoded in `comptime.eval_lit_char` / string lowering and
-  documented in [literals.md](literals.md).
-- The closed ISA-tag set (`x86_64`, `aarch64`, `riscv64`, `riscv32`) and the
-  closed `$mach.*` tag/path set — the parser accepts any `IDENT` / `$`-chain;
-  the closed sets are enforced later (see [asm.md](asm.md),
-  [comptime-mach.md](comptime-mach.md)).
-- The closed intrinsic set (`$size_of`, `$length_of`, `$align_of`, `$offset_of`,
-  `$type_of`, `$fields`, `$cases`, `$discriminant_of`, `$is_tag`, `$is_record`,
-  `$is_union`, `$is_pointer`, `$is_secret`, `$holds_secret`,
-  `$type_name`, `$error`) — syntactically indistinguishable from any other
-  `comptime-ident` call.
-- The closed decorator directive set ([decorators.md](decorators.md)) — the
-  parser accepts any `IDENT` after `#[`; sema enforces the closed set.
-
-Divergences flagged inline:
-
-- `$` comptime marker is grammatically accepted on named `rec`/`uni` fields
-  (shared `typed-name`), though [fun.md](fun.md) scopes comptime value
-  parameters to functions only.
-
-No production above is left unverified against the parser; nothing here is
-invented. The only "approximate" surface is the asm body, which is
-deliberately *not* a token grammar (it is raw text by design).
-
-
 ## See also
 
-- [literals.md](literals.md) — literal forms and escapes
-- [types.md](types.md) — type semantics
-- [operators.md](operators.md) — operator semantics and precedence prose
-- [expressions.md](expressions.md) — expression composition
-- [statements.md](statements.md) — control-flow semantics
-- [fun.md](fun.md) — function declarations, generics, variadics, comptime params
-- [comptime-control.md](comptime-control.md) — `$if` / `$or`
-- [comptime-mach.md](comptime-mach.md) — `$mach.*` namespace
-- [asm.md](asm.md) — inline assembly
+- [literals.md](literals.md): literal forms and escapes
+- [types.md](types.md): type semantics
+- [operators.md](operators.md): operator semantics and precedence prose
+- [expressions.md](expressions.md): expression composition
+- [statements.md](statements.md): control-flow semantics
+- [fun.md](fun.md): function declarations, generics, variadics, comptime params
+- [comptime-control.md](comptime-control.md): `$if` / `$or`
+- [comptime-mach.md](comptime-mach.md): `$mach.*` namespace
+- [asm.md](asm.md): inline assembly

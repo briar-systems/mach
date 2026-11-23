@@ -2,13 +2,14 @@
 
 A **variadic pack** (`va: ...`) is a trailing function parameter that collects
 a variable number of call-site arguments into a compile-time sequence. The
-compiler monomorphizes the function once per distinct argument type-list at
-each call site; there is no runtime structure, no `va_list`, and no `any`.
+compiler monomorphizes the function once per distinct argument type-list, and
+the pack has no runtime representation.
 
-This is unrelated to C's varargs, which share only the spelling. A pack is a
-*named* parameter (`va: ...`) on a mach function; the C form is a *bare* trailing
-`...` and may be declared only on an `ext fun`, where it describes a foreign
-callee's ABI — see [ext-fun.md](ext-fun.md#c-variadic-imports).
+A pack is unrelated to the C-variadic signature, which shares only the
+spelling. A pack is a *named* parameter (`va: ...`) on a mach function. The
+C-variadic form is a *bare* trailing `...` and may be declared only on an
+`ext fun`, where it describes a foreign callee's ABI. See
+[ext-fun.md](ext-fun.md#c-variadic-imports).
 
 ## Declaring a pack parameter
 
@@ -19,14 +20,18 @@ fun name(va: ...) RetType { ... }
 fun name(fixed: T, va: ...) RetType { ... }   # leading fixed params are allowed
 ```
 
-The pack parameter must be last. Any number of fixed (typed) parameters may
+The pack parameter must be last. A parameter written after it is refused with
+`pack.not_last`, and `...` anywhere else a type is expected is refused with
+`syntax.expected_type`. Any number of fixed (typed) parameters may
 precede it.
 
 ## Iterating with `$each`
 
 `$each a in va` unrolls the body once per element, with `a` bound to the
 element and re-typed to that element's concrete type per instantiation.
-This is the only way to consume a pack.
+This is the only way to consume a pack's elements. A pack cannot be indexed,
+and its only member is `.len`, so any other member is refused with
+`pack.member`.
 
 ```mach
 use std.print;
@@ -45,13 +50,17 @@ fun main(argc: i64, argv: **u8) i64 {
     print.printlnf("{} {} {}",
         sum(1, 2, 3), # 6
         sum(10, 20), # 30
-        sum()); # 0 — empty pack, body never runs
+        sum()); # 0, an empty pack, so the body never runs
     ret 0;
 }
 ```
 
 Because each element has its own concrete type at monomorphization, the body
-can handle heterogeneous packs:
+can handle heterogeneous packs. The `$each` body is checked once per element of
+each instance, as part of checking the program, so `mach check` reports a body
+that does not type for some element. The error points at the call that asked for
+the instance, with the body line as the related site, labelled `in this body,
+checked against this instance's pack element types`:
 
 ```mach
 use std.print;
@@ -72,14 +81,16 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-A `$each` body is a normal statement block; it may nest arbitrarily, call
+A `$each` body is a normal statement block. It may nest arbitrarily, call
 functions, read outer-scope runtime variables, and write them back. Runtime
 variables in the enclosing scope (e.g. a cursor) thread across all unrolled
-iterations — each iteration reads where the previous one left off.
+iterations, and each iteration reads where the previous one left off.
 
-## `va.len` — element count
+## `va.len`: element count
 
-`va.len` folds to the instance's element count at compile time.
+`va.len` is a `u64` that folds to the instance's element count. It is not a
+comptime value, so a `$if` gate cannot read it (`gate.runtime_value`) and it
+cannot size an array type (`array.length_not_const`).
 
 ```mach
 use std.print;
@@ -96,7 +107,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-## `va...` — forwarding a whole pack
+## `va...`: forwarding a whole pack
 
 Inside a pack instance, `g(va...)` forwards the whole pack to another
 pack-tailed function, which is monomorphized for the forwarded type-list.
@@ -122,7 +133,7 @@ fun fwdpre(base: i64, va: ...) i64 {
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     print.printlnf("{} {}",
-        outer(1, 2, 3), # forwards (1, 2, 3) to sum → 6
+        outer(1, 2, 3), # forwards (1, 2, 3) to sum, 6
         fwdpre(100, 1, 2, 3)); # 106
     ret 0;
 }
@@ -131,25 +142,29 @@ fun main(argc: i64, argv: **u8) i64 {
 Leading fixed arguments may precede the spread at the call site:
 
 ```mach fragment
-fun fwdpre(base: i64, va: ...) i64 { ret base + sum(va...); }
+fun outer2(va: ...) i64 { ret fwdpre(100, va...); }
 ```
 
 `va...` is valid **only as the sole trailing argument of a pack-tailed
 callee**. The compiler rejects:
-- Spreading into a callee with no pack parameter.
-- Spreading when other arguments follow the spread.
-- Spreading only part of a pack (partial forward is not supported).
+- Spreading into a callee with no pack parameter (`call.spread`).
+- Spreading when other arguments follow the spread (`call.spread`).
+- Spreading only part of a pack, or spreading anything that is not a pack,
+  such as one `$each` element (`pack.spread`). Partial forward is not
+  supported.
+- Passing the pack bare, as `g(va)`, instead of spreading it (`pack.spread`).
 
 ## Monomorphization and ABI
 
-A pack-tailed function is compiled once per distinct argument type-list at
-each call site. Different arities, or the same arity with different types,
-produce separate instances:
+A pack-tailed function is compiled once per distinct argument type-list. Call
+sites that pass the same type-list share one instance. Different arities, or
+the same arity with different types, produce separate instances:
 
 ```mach fragment
-sum(1, 2, 3)           # instance: (i64, i64, i64)
-sum(10, 20)            # instance: (i64, i64)
-sum(5::u8, 1::u32)     # instance: (u8, u32)
+sumc(1, 2, 3)          # instance: (i64, i64, i64)
+sumc(10, 20)           # instance: (i64, i64)
+sumc(30, 40)           # the same instance as sumc(10, 20)
+sumc(5::u8, 1::u32)    # instance: (u8, u32)
 ```
 
 A pack tail composes with generic parameters. The instance key is then the
@@ -160,9 +175,10 @@ each typed and lowered against its own type arguments:
 ```mach fragment
 fun sink[T](t: T, va: ...) u32 { ... }
 
-sink[u32](p, 1u32)     # instance: [u32] over (u32)
-sink[u64](p, 1u32)     # instance: [u64] over (u32)
+sink[u32](p, 1u32)         # p: u32, instance: [u32] over (u32)
+sink[u64](q, 1u32)         # q: u64, instance: [u64] over (u32)
 sink[u32](p, 1u32, 2u64)   # instance: [u32] over (u32, u64)
+sink[^u32](k, 1u32)        # k: ^u32, instance: [^u32] over (u32)
 ```
 
 The instance's typing covers the **whole body**, not just the `$each`. A `val` /
@@ -179,19 +195,23 @@ fun mk[T](seed: T, va: ...) T {
 ```
 
 Because a pack-tailed function has no single entry point, it is **not a
-stable-ABI symbol** — it cannot be the target of `ext fun` or a function
-pointer shared across compilation units. It is source-level only.
+stable-ABI symbol**. A pack cannot appear on a body-less `fun` or an
+`ext fun` (`pack.bodyless`), and a pack-tailed function cannot be taken as a
+function pointer value, since its type `fun(...) R` matches no function
+pointer type. It is source-level only.
 
 A `^` secret may not be passed to a pack, including a secret nested inside an
-aggregate argument. A pack instance is re-inferred per call site and commonly
-feeds formatting or logging, so admitting one would launder a secret straight to
-an observable sink — see [secrecy.md](secrecy.md).
+aggregate argument (`secret.variadic`). A pack instance is typed per call site
+and commonly feeds formatting or logging, so admitting one would launder a
+secret straight to an observable sink. A pointer to secret storage is
+admitted, since the address is public and the instance's body stays gated on
+the secret pointee. See [secrecy.md](secrecy.md).
 
 ## Cross-module packs
 
 Pack-tailed functions may call functions in other modules from inside the
-`$each` body. The compiler re-infers the body per monomorphization instance
-against the full module set.
+`$each` body. The compiler types the body per element of each instance against
+the full module set.
 
 ```mach fragment
 fun sumdbl(va: ...) i64 {
@@ -254,19 +274,19 @@ fun vformat(fmt: str, va: ...) res[usize, FormatError] {
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    val hi: str                     = "hi";
-    val r:  res[usize, FormatError] = vformat("n={} s={}\n", 7, hi);
-    if (sel r.err) { ret 1; }
+    val hi:            str                     = "hi";
+    val res_formatted: res[usize, FormatError] = vformat("n={} s={}\n", 7, hi);
+    if (sel res_formatted.err) { ret 1; }
     ret 0;
 }
 ```
 
-The runtime format cursor `i` threads across all unrolled iterations; the
+The runtime format cursor `i` threads across all unrolled iterations, and the
 arg sequence is consumed entirely at compile time.
 
 ## See also
 
-- [fun.md](fun.md) — function declarations, generic and comptime parameters
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$type_of`, `$fields`, `$each`
-- [comptime-control.md](comptime-control.md) — `$if` / `$or` used inside pack bodies
-- [ext-fun.md](ext-fun.md#c-variadic-imports) — C varargs, the unrelated `ext`-only form
+- [fun.md](fun.md): function declarations, generic and comptime parameters
+- [comptime-intrinsics.md](comptime-intrinsics.md): `$type_of`, `$fields`, `$each`
+- [comptime-control.md](comptime-control.md): `$if` / `$or` used inside pack bodies
+- [ext-fun.md](ext-fun.md#c-variadic-imports): the C-variadic signature, the unrelated `ext`-only form

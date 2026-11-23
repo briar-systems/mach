@@ -1,0 +1,611 @@
+# a build request: what one build is asked to do, from its profile and the command line
+#
+# `compose` takes the selected profile's levers and sets the command line's overrides over
+# them, and `semantic_hash` digests the fields that decide what the build produces.
+
+use crypto.hash.sha256;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_len;
+
+use A:         std.allocator;
+use system_os: std.system.os;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use base_fingerprint: mach.base.fingerprint;
+use mach.base.intern;
+use mach.base.wire;
+use mink_subsystem: mink.catalog.subsystem;
+
+use base_catalog: mach.base.catalog;
+use mach.base.textbuild;
+use manifest_model:  mach.manifest.model;
+use manifest_schema: mach.manifest.schema;
+use manifest_select: mach.manifest.select;
+use mirl_record:     mirl.pass.record;
+use mirl.pass.relaxation;
+use mirl_rows: mirl.pass.rows;
+use mirl.pass.setting;
+use mirl.pass.setting.Optimise;
+use std.collections.slice.Slice;
+
+# a binary profile lever as the command line sets it
+pub def Lever: u8;
+
+# neither `--key` nor `--no-key` was given: the profile decides
+pub val LEVER_PROFILE: Lever = 0;
+# `--key`
+pub val LEVER_ON: Lever = 1;
+# `--no-key`
+pub val LEVER_OFF: Lever = 2;
+
+# what a build-shaped command sets over the profile it builds, already typed;
+# a lever or value left unset leaves the profile's
+# ---
+# output:   the `-o` path, nil when absent
+# work:     the `-w` work directory, nil when absent
+# optimize: whether to optimize, or LEVER_PROFILE
+# debug:    whether to emit debug information, or LEVER_PROFILE
+# threads:  the worker count, 0 for the host's
+pub rec Overrides {
+    output:       *u8;
+    work:         *u8;
+    emit_asm:     bool;
+    emit_ir:      bool;
+    verify:       bool;
+    passes:       bool;
+    dep_warnings: bool;
+    optimize:     Lever;
+    debug:        Lever;
+    threads:      u32;
+    include_deps: bool;
+    no_cache:     bool;
+    declassified: bool;
+    link_tokens:  Vector[*u8];
+    lib_dirs:     Vector[*u8];
+}
+
+# no override: the profile decides everything, with empty name lists and link
+# inputs growable through `a`
+pub fun overrides_init(a: *A.Allocator) Overrides {
+    var o: Overrides;
+    o.output       = nil;
+    o.work         = nil;
+    o.emit_asm     = false;
+    o.emit_ir      = false;
+    o.verify       = false;
+    o.passes       = false;
+    o.dep_warnings = false;
+    o.optimize     = LEVER_PROFILE;
+    o.debug        = LEVER_PROFILE;
+    o.threads      = 0;
+    o.include_deps = false;
+    o.no_cache     = false;
+    o.declassified = false;
+    o.link_tokens  = collections_vector.init[*u8](a);
+    o.lib_dirs     = collections_vector.init[*u8](a);
+    ret o;
+}
+
+pub def BuildGoal: u8;
+
+# the finished artifact of the unit's kind: an executable, a static archive or a shared library
+pub val GOAL_ARTIFACT: BuildGoal = 0;
+
+pub val GOAL_OBJECTS: BuildGoal = 1;
+
+pub val GOAL_TESTS: BuildGoal = 2;
+
+pub val GOAL_TEST_LIST: BuildGoal = 3;
+
+# `mach check`: load, resolve and check the selected artifacts' reachable source
+# through the frontend and stop; no step runs and no product is written
+pub val GOAL_CHECK: BuildGoal = 4;
+
+# verb:   what the readout calls working on a cell for this goal
+# caches: a request from the command line reads and publishes the object cache
+# unless `--no-cache` forces an uncached build
+rec BuildGoalSpec {
+    goal:            BuildGoal;
+    display:         str;
+    verb:            str;
+    fingerprint_tag: u8;
+    caches:          bool;
+}
+
+val BUILD_GOAL_CATALOG_VERSION: u8 = 1;
+
+val BUILD_GOAL_N: usize                       = 5;
+val BUILD_GOALS:  [BUILD_GOAL_N]BuildGoalSpec = [BUILD_GOAL_N]BuildGoalSpec{
+    BuildGoalSpec{goal: GOAL_ARTIFACT, display: "artifact", verb: "building", fingerprint_tag: 1, caches: true},
+    BuildGoalSpec{goal: GOAL_OBJECTS, display: "objects", verb: "building", fingerprint_tag: 2, caches: true},
+    BuildGoalSpec{goal: GOAL_TESTS, display: "tests", verb: "building", fingerprint_tag: 3, caches: true},
+    BuildGoalSpec{goal: GOAL_TEST_LIST, display: "test list", verb: "building", fingerprint_tag: 4, caches: true},
+    BuildGoalSpec{goal: GOAL_CHECK, display: "check", verb: "checking", fingerprint_tag: 5, caches: false},
+};
+
+# a `-l` value or path operand the build plan links
+pub rec LinkToken {
+    text: str;
+}
+
+# owner: "" for a cell of the root manifest, or the id of the closure dependency
+#        whose export library requires the cell; `target` and
+#        `artifact` then name that dependency's declarations
+pub rec BuildRequest {
+    project_root: str;
+    owner:        str;
+
+    target:   str;
+    profile:  str;
+    artifact: str;
+
+    goal: BuildGoal;
+
+    # whether mirl optimises, and the passes the profile turns on or off one by one
+    optimise: Optimise;
+    # the command line changed a lever of the selected profile, or a `--set` wrote
+    # a key of it, so a build that publishes artifacts must say where:
+    # presentation only, no part of any hash
+    overrides: bool;
+    debug:     bool;
+    # whether mach and mirl run their verifiers: opt-in, no part of any hash
+    verify: bool;
+    # whether mirl reports each optimisation pass that changed each function: presentation only, no part of any
+    # hash, and a build that reports compiles every module, as a cached object holds no report
+    passes: bool;
+    # whether the linker may relax the code, which mirl's relax build option states
+    linker_relax: bool;
+    # whether the image keeps its symbol table, an executable its section header table, and
+    # the image its unwind tables, which the link states
+    symbols:  bool;
+    sections: bool;
+    unwind:   bool;
+    # the float relaxations the profile's `relax` permits, which mirl's floats build option states
+    floats: relaxation.Relaxations;
+    # the artifact's declared subsystem, none for the host's
+    subsystem: opt[*mink_subsystem.Subsystem];
+    simd:      manifest_model.SimdMode;
+    # the warning kinds the profile silences: presentation only, so no part of the request hash
+    allow: diagnostic_kind.KindSet;
+    # the build shows its dependencies' warnings too, each under that dependency's own `allow`:
+    # presentation only, so no part of the request hash
+    dep_warnings: bool;
+    threads:      u32;
+
+    emit_ir:  bool;
+    emit_asm: bool;
+    out:      str;
+    # `-w`, the root manifest's work directory in place of its `[project].work`;
+    # "" for none
+    work: str;
+
+    link_tokens: Vector[LinkToken];
+    lib_dirs:    Vector[str];
+
+    include_deps: bool;
+    no_cache:     bool;
+    object_cache: bool;
+    # a test run's selection: the tests whose qualified name contains it, all when empty.
+    # it shapes the dispatcher and never an object
+    test_filter: str;
+    # a check lists the source's declassifications: presentation only, so no part of the request hash
+    declassified: bool;
+}
+
+# a request with every field at its built-in default: an unoptimized artifact build of no cell
+# ---
+# ret: the request, its link token and library directory lists empty with no allocator
+pub fun defaults() BuildRequest {
+    var r: BuildRequest;
+    r.project_root = "";
+    r.owner        = "";
+    r.target       = "";
+    r.profile      = "";
+    r.artifact     = "";
+    r.goal         = GOAL_ARTIFACT;
+    r.optimise     = setting.OFF;
+    r.debug        = false;
+    r.verify       = false;
+    r.passes       = false;
+    r.linker_relax = true;
+    r.symbols      = true;
+    r.sections     = true;
+    r.unwind       = true;
+    r.floats       = relaxation.EXACT;
+    r.subsystem    = opt[*mink_subsystem.Subsystem].none{};
+    r.simd         = manifest_model.SIMD_SCALARIZE;
+    r.overrides    = false;
+    r.allow        = diagnostic_kind.set_make();
+    r.dep_warnings = false;
+    r.threads      = 0;
+    r.emit_ir      = false;
+    r.emit_asm     = false;
+    r.out          = "";
+    r.work         = "";
+    r.link_tokens  = collections_vector.init[LinkToken](nil);
+    r.lib_dirs     = collections_vector.init[str](nil);
+    r.include_deps = false;
+    r.test_filter  = "";
+    r.no_cache     = false;
+    r.object_cache = false;
+    r.declassified = false;
+    ret r;
+}
+
+# whether a goal compiles the tests, to run them or to list them
+# ---
+# g:   the goal
+# ret: true for GOAL_TESTS and GOAL_TEST_LIST
+pub fun test_goal(g: BuildGoal) bool {
+    ret g == GOAL_TESTS || g == GOAL_TEST_LIST;
+}
+
+# the name a catalogued goal is displayed by
+pub fun goal_name(goal: BuildGoal) str {
+    ret catalogued(goal).display;
+}
+
+# the verb a catalogued goal's unit is announced with
+pub fun goal_verb(goal: BuildGoal) str {
+    ret catalogued(goal).verb;
+}
+
+# refuse a request whose goal or simd mode is outside its catalog
+# ---
+# a:   allocator for the refusal's message
+# r:   the request to check
+# ret: ok, or the refusal naming the catalog and the value
+pub fun validate(a: *A.Allocator, r: *BuildRequest) err[fail.Fail] {
+    if (goal_spec(r.goal) == nil) {
+        ret err[fail.Fail].err{base_catalog.unknown_catalog(a, "BuildGoal", r.goal::u32)};
+    }
+    if (r.simd != manifest_model.SIMD_SCALARIZE && r.simd != manifest_model.SIMD_REQUIRE) {
+        ret err[fail.Fail].err{base_catalog.unknown_catalog(a, "SimdMode", r.simd::u32)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether a build shows the warnings of a package, the project being built where `root` holds
+# and a dependency otherwise: its own always, a dependency's only under `--dep-warnings`. the one
+# statement of the rule, which the store's governance and every pass whose only product is a
+# warning read through the module registry
+pub fun shows_warnings(r: *BuildRequest, root: bool) bool {
+    ret root || r.dep_warnings;
+}
+
+# whether the request optimizes
+# ---
+# r:   the request
+# ret: true when its optimisation setting is on
+pub fun is_release(r: *BuildRequest) bool {
+    ret r.optimise.on;
+}
+
+# the request for a build of `m`: the selected profile's levers with the command line's over them
+# ---
+# a:       allocator for refusals and the request's link token and library directory lists
+# itn:     interner holding the manifest's names
+# m:       the root manifest, every profile of which is checked
+# o:       what the command line sets over the profile
+# root:    the project root
+# goal:    what the build is asked to produce
+# profile: the profile to select, "" for the manifest's default
+# ret:     the request, its lists owned through `a` and its strings borrowed from `o`, or the
+#          refusal of the goal, the profile, a profile's `relax` list or an allocation
+pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest,
+    o: *Overrides, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.Fail] {
+    var r: BuildRequest = defaults();
+    r.project_root = root;
+    r.goal         = goal;
+    val err_valid: err[fail.Fail] = validate(a, ?r);
+    if (sel err_valid.err) {
+        ret res[BuildRequest, fail.Fail].err{err_valid.err};
+    }
+
+    r.profile = profile;
+
+    val res_resolve_profile: res[manifest_select.ResolvedProfile, fail.Fail] = manifest_select.resolve_profile(a, itn, m, profile);
+    if (sel res_resolve_profile.err) {
+        ret res[BuildRequest, fail.Fail].err{res_resolve_profile.err};
+    }
+    val pf: manifest_select.ResolvedProfile = res_resolve_profile.ok;
+
+    val err_checked: err[fail.Fail] = profiles_check(a, itn, m);
+    if (sel err_checked.err) { ret res[BuildRequest, fail.Fail].err{err_checked.err}; }
+    val err_levers: err[fail.Fail] = levers_compose(a, itn, ?pf, o, ?r);
+    if (sel err_levers.err) { ret res[BuildRequest, fail.Fail].err{err_levers.err}; }
+    r.verify = o.verify;
+    r.passes = o.passes;
+
+    r.allow        = pf.allow;
+    r.dep_warnings = o.dep_warnings;
+
+    r.threads = workers(o.threads);
+
+    r.emit_ir  = o.emit_ir;
+    r.emit_asm = o.emit_asm;
+    if (o.output != nil) { r.out = o.output::str; }
+    if (o.work != nil)   { r.work = o.work::str; }
+
+    r.link_tokens = collections_vector.init[LinkToken](a);
+    r.lib_dirs    = collections_vector.init[str](a);
+    var moved: bool = false;
+    fin {
+        if (!moved) {
+            collections_vector.dnit[LinkToken](?r.link_tokens);
+            collections_vector.dnit[str](?r.lib_dirs);
+        }
+    }
+    var ti: usize = 0;
+    for (ti < o.link_tokens.len) {
+        var t: LinkToken;
+        t.text = o.link_tokens.data[ti]::str;
+        val res_link_tokens_pushed: res[usize, A.Error] = collections_vector.push[LinkToken](?r.link_tokens, t);
+        if (sel res_link_tokens_pushed.err) {
+            ret res[BuildRequest, fail.Fail].err{fail.refused(res_link_tokens_pushed.err)};
+        }
+        ti = ti + 1;
+    }
+    var di: usize = 0;
+    for (di < o.lib_dirs.len) {
+        val res_lib_dirs_pushed: res[usize, A.Error] = collections_vector.push[str](?r.lib_dirs, o.lib_dirs.data[di]::str);
+        if (sel res_lib_dirs_pushed.err) {
+            ret res[BuildRequest, fail.Fail].err{fail.refused(res_lib_dirs_pushed.err)};
+        }
+        di = di + 1;
+    }
+
+    r.include_deps = o.include_deps;
+    r.no_cache     = o.no_cache;
+    r.declassified = o.declassified;
+    r.object_cache = goal_caches(goal) && !o.no_cache && !o.passes;
+    moved          = true;
+    ret res[BuildRequest, fail.Fail].ok{r};
+}
+
+# the levers of the selected profile `pf`, then the command line's over them,
+# into `r`: built-in defaults, then the profile, then the command line
+fun levers_compose(a: *A.Allocator, itn: *intern.Interner, pf: *manifest_select.ResolvedProfile, o: *Overrides, r: *BuildRequest) err[fail.Fail] {
+    val res_passes: res[Optimise, fail.Fail] = passes_of(a, itn, ?pf.passes);
+    if (sel res_passes.err) { ret err[fail.Fail].err{res_passes.err}; }
+    r.optimise     = res_passes.ok;
+    r.optimise.on  = pf.optimize;
+    r.debug        = pf.debug;
+    r.simd         = pf.simd;
+    r.linker_relax = pf.linker_relax;
+    r.symbols      = pf.symbols;
+    r.sections     = pf.sections;
+    r.unwind       = pf.unwind;
+    val res_floats: res[relaxation.Relaxations, fail.Fail] = floats_of(a, itn, pf.relax_named, ?pf.relax);
+    if (sel res_floats.err) { ret err[fail.Fail].err{res_floats.err}; }
+    r.floats = res_floats.ok;
+
+    val profiled: BuildRequest = @r;
+    if (o.optimize == LEVER_ON)  { r.optimise.on = true; }
+    if (o.optimize == LEVER_OFF) { r.optimise.on = false; }
+    if (o.debug == LEVER_ON)     { r.debug = true; }
+    if (o.debug == LEVER_OFF)    { r.debug = false; }
+    r.overrides = pf.written || r.optimise.on != profiled.optimise.on || r.debug != profiled.debug || r.simd != profiled.simd;
+    ret err[fail.Fail].ok{};
+}
+
+# every profile's keys name what a build can hold, so a profile is refused where
+# it is written whichever profile is selected: none names a relaxation mirl has no
+# option for, or a pass that is no optimization pass of mirl's
+fun profiles_check(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < m.profile_count) {
+        val pf: *manifest_model.ProfileDef = ?m.profiles[i];
+        i = i + 1;
+        val res_floats: res[relaxation.Relaxations, fail.Fail] = floats_of(a, itn, pf.relax_named, ?pf.relax);
+        if (sel res_floats.err) { ret err[fail.Fail].err{res_floats.err}; }
+        val res_passes: res[Optimise, fail.Fail] = passes_of(a, itn, ?pf.passes);
+        if (sel res_passes.err) { ret err[fail.Fail].err{res_passes.err}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the passes a profile's `passes` table turns on or off, as mirl's setting numbers them, the setting off
+# otherwise. a key that names no optimization pass is refused where it is written, with the names it may give
+fun passes_of(a: *A.Allocator, itn: *intern.Interner, c: *manifest_model.PassChoices) res[Optimise, fail.Fail] {
+    val listed: Slice[*mirl_record.Pass] = mirl_rows.optimisations();
+    var o:      Optimise                 = setting.OFF;
+    var i:      u32                      = 0;
+    for (i < c.count) {
+        val choice:    *manifest_model.PassChoice = ?c.items[i];
+        val opt_place: opt[u32]                   = setting.index_of(listed, intern.text(itn, choice.name));
+        if (sel opt_place.none) { ret res[Optimise, fail.Fail].err{unnamed_pass(a, itn, choice, listed)}; }
+        o = setting.chose(o, opt_place.some, choice.on);
+        i = i + 1;
+    }
+    ret res[Optimise, fail.Fail].ok{o};
+}
+
+# a `passes` key that names no optimization pass, refused where it is written with the names it may give
+fun unnamed_pass(a: *A.Allocator, itn: *intern.Interner, choice: *manifest_model.PassChoice, listed: Slice[*mirl_record.Pass]) fail.Fail {
+    var b: textbuild.TextBuilder = textbuild.tb_init(a);
+    fin { textbuild.tb_dnit(?b); }
+    var i: usize = 0;
+    for (i < listed.size) {
+        if (i > 0) { textbuild.tb_append(?b, ", "); }
+        textbuild.tb_append(?b, listed.data[i].name);
+        i = i + 1;
+    }
+    val res_made: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel res_made.err) { ret fail.message(textbuild.text(res_made.err)); }
+    val refused: fail.Fail = fail.formatted_user(a, diagnostic_kind.MANIFEST_INVALID_VALUE,
+        "{} names \"{}\", which is no optimization pass. the optimization passes are {}", choice.named, intern.text(itn, choice.name), res_made.ok);
+    ret fail.at(refused, choice.at);
+}
+
+# a profile's `relax` list, written as `named` names it, refused where its name at `i` is
+# written, for `why`
+fun relax_refused(a: *A.Allocator, itn: *intern.Interner, named: str, names: *manifest_model.NameList, i: u32, why: str) fail.Fail {
+    val refused: fail.Fail = fail.formatted_user(a, diagnostic_kind.MANIFEST_INVALID_VALUE,
+        "{} names \"{}\" {}", named, intern.text(itn, names.items[i]), why);
+    ret fail.at(refused, names.sites[i]);
+}
+
+# the float relaxations a profile's `relax` list names, as mirl's relaxation table reads
+# them, refused where a name it holds no row for, or a repeated one, is written
+fun floats_of(a: *A.Allocator, itn: *intern.Interner, named: str, names: *manifest_model.NameList) res[relaxation.Relaxations, fail.Fail] {
+    var s: relaxation.Relaxations = relaxation.EXACT;
+    var i: u32                    = 0;
+    for (i < names.count) {
+        val name:       str                    = intern.text(itn, names.items[i]);
+        val opt_member: opt[relaxation.Member] = relaxation.named(name);
+        if (sel opt_member.none)                  { ret res[relaxation.Relaxations, fail.Fail].err{relax_refused(a, itn, named, names, i, "which is no departure from exact semantics mirl permits")}; }
+        if (relaxation.holds(s, opt_member.some)) { ret res[relaxation.Relaxations, fail.Fail].err{relax_refused(a, itn, named, names, i, "more than once")}; }
+        s = relaxation.add(s, opt_member.some);
+        i = i + 1;
+    }
+    ret res[relaxation.Relaxations, fail.Fail].ok{s};
+}
+
+# `work`, a `-w` value, in place of the root manifest `m`'s `[project].work`: a
+# canonical path inside the project root, taken as written
+pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest_model.Manifest) err[fail.Fail] {
+    if (!manifest_schema.is_project_path(work) || str_contains(work, "{")) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.CLI_OUTPUT_PATH, WORK_CONSTRAINT)};
+    }
+    val res_itn_added: res[intern.StrId, A.Error] = intern.add(itn, work);
+    if (sel res_itn_added.err) { ret err[fail.Fail].err{fail.refused(res_itn_added.err)}; }
+    m.work_tmpl = res_itn_added.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# the rule `-w` keeps
+val WORK_CONSTRAINT: str = "-w must name a canonical path inside the project root, relative, with no . or .. component and no template";
+
+# a copy of `base` aimed at one build cell
+# ---
+# base:      the composed request
+# owner:     "" for a cell of the root manifest, or the dependency whose export library requires it
+# target:    the cell's target name
+# artifact:  the cell's artifact name
+# subsystem: the artifact's declared subsystem, none for the host's
+# goal:      the cell's goal
+# ret:       the copy, sharing every list and string with `base`
+pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
+    subsystem: opt[*mink_subsystem.Subsystem], goal: BuildGoal) BuildRequest {
+    var r: BuildRequest = @base;
+    r.owner     = owner;
+    r.target    = target;
+    r.artifact  = artifact;
+    r.subsystem = subsystem;
+    r.goal      = goal;
+    ret r;
+}
+
+# the workers a run uses: the `--threads` count, or the host's processor count when none was given
+# ---
+# asked: the count, 0 when none was given
+# ret:   at least 1
+pub fun workers(asked: u32) u32 {
+    if (asked > 0) { ret asked; }
+    val nc: i64 = system_os.cpu_count();
+    if (nc > 1) { ret nc::u32; }
+    ret 1;
+}
+
+pub val HASH_SIZE: usize = 32;
+
+fun write_semantic_fields(s: *wire.Sink, r: *BuildRequest) {
+    put_text(s, r.project_root);
+    put_text(s, r.owner);
+    put_text(s, r.target);
+    put_text(s, r.profile);
+    put_text(s, r.artifact);
+    write_goal(s, r.goal);
+    put_flag(s, r.optimise.on);
+    wire.put_u64(s, r.optimise.named);
+    wire.put_u64(s, r.optimise.chosen & r.optimise.named);
+    put_flag(s, r.debug);
+    put_flag(s, r.linker_relax);
+    put_flag(s, r.symbols);
+    put_flag(s, r.sections);
+    put_flag(s, r.unwind);
+    wire.put_u32(s, r.floats.bits);
+    wire.put_u8(s, r.simd);
+    put_flag(s, r.include_deps);
+}
+
+fun goal_spec(goal: BuildGoal) *BuildGoalSpec {
+    var i: usize = 0;
+    for (i < BUILD_GOAL_N) {
+        if (BUILD_GOALS[i].goal == goal) { ret ?BUILD_GOALS[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the entry of a goal in BUILD_GOALS. every goal a request carries is one validate admitted, so a
+# goal outside the catalog is a defect in its caller
+fun catalogued(goal: BuildGoal) *BuildGoalSpec {
+    val spec: *BuildGoalSpec = goal_spec(goal);
+    if (spec == nil) { panic("a build goal outside BUILD_GOALS"); }
+    ret spec;
+}
+
+# whether a goal caches objects; a goal outside the catalog does not, and validate refuses it
+fun goal_caches(goal: BuildGoal) bool {
+    val spec: *BuildGoalSpec = goal_spec(goal);
+    ret spec != nil && spec.caches;
+}
+
+fun write_goal(s: *wire.Sink, goal: BuildGoal) {
+    val spec: *BuildGoalSpec = goal_spec(goal);
+    if (spec == nil) {
+        wire.refuse(s, fail.message("build request names an unknown goal"));
+        ret;
+    }
+    base_fingerprint.put_domain_u8(s, base_fingerprint.DOMAIN_BUILD_GOAL, BUILD_GOAL_CATALOG_VERSION, spec.fingerprint_tag);
+}
+
+# the sha-256 of what the sink holds, or its failure; releases the sink
+fun digest_of(s: *wire.Sink, digest: *u8) err[fail.Fail] {
+    fin { wire.dnit(s); }
+    val opt_failed: opt[fail.Fail] = wire.failure(s);
+    if (sel opt_failed.some) { ret err[fail.Fail].err{opt_failed.some}; }
+    sha256.hash(wire.bytes(s), s.len, digest);
+    ret err[fail.Fail].ok{};
+}
+
+# the sha-256 of the request fields that decide what the build produces
+# ---
+# a:      allocator for the hashed bytes and any refusal
+# r:      the request, validated first
+# digest: where the HASH_SIZE bytes of the digest go
+# ret:    ok, or the refusal of validation or of writing the fields
+pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) err[fail.Fail] {
+    val err_valid: err[fail.Fail] = validate(a, r);
+    if (sel err_valid.err) {
+        ret err[fail.Fail].err{err_valid.err};
+    }
+    var s: wire.Sink = wire.grown(a);
+    write_semantic_fields(?s, r);
+    ret digest_of(?s, digest);
+}
+
+# a text as its u32 length then its bytes
+fun put_text(s: *wire.Sink, text: str) {
+    wire.put_sized(s, text::*u8, str_len(text));
+}
+
+fun put_flag(s: *wire.Sink, v: bool) {
+    var b: u8 = 0;
+    if (v) { b = 1; }
+    wire.put_u8(s, b);
+}

@@ -1,0 +1,313 @@
+# builds a module's interface once sema has typed it: every module-level function and
+# binding as its declaration says, every module constant evaluated to its deep value, and the
+# public surface its resolution published
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use mach.base.diagnostic;
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.front.ast;
+use ast_decl:         mach.front.ast.decl;
+use ast_expr:         mach.front.ast.expr;
+use ast_id:           mach.front.ast.id;
+use ast_type:         mach.front.ast.type;
+use comptime_deep:    mach.front.comptime.deep;
+use comptime_failure: mach.front.comptime.failure;
+use comptime_scope:   mach.front.comptime.scope;
+use mach.front.decorator;
+use mach.front.resolve;
+use sema_constant: mach.front.sema.constant;
+use sema_context:  mach.front.sema.context;
+use mach.front.sema.interface;
+use sema_op:       mach.front.sema.op;
+use sema_template: mach.front.sema.template;
+use report_phase:  mach.report.phase;
+use mach.session.module;
+
+# the interface takes over the module's store of constant values, which its typing built in
+pub fun interface_of(sc: *sema_context.SemaContext) res[interface.Interface, fail.Fail] {
+    var iface: interface.Interface = interface.init(sc.s.alloc);
+    val outer: sema_context.Walk   = sema_context.walk_begin(sc);
+    sc.walk.silent = true;
+    val err_built: err[fail.Fail] = interface_fill(sc, ?iface);
+    sema_context.walk_end(sc, outer);
+    if (sel err_built.err) {
+        interface.dnit(?iface);
+        ret res[interface.Interface, fail.Fail].err{err_built.err};
+    }
+    comptime_deep.dnit(?iface.values);
+    iface.values      = @sc.typing.values;
+    @sc.typing.values = comptime_deep.init(sc.s.alloc);
+    ret res[interface.Interface, fail.Fail].ok{iface};
+}
+
+# reports the refusal each module `val` and `var` the interface publishes holds: an initializer,
+# or a member of an aggregate or address value, that has no compile-time value as no constant,
+# and any other refusal, a fault in a value it has, under its own kind. a value of its own is
+# reported only as lowering's own fold meets it again. a `nil` initializer lowers as null and
+# folds nothing, and a refusal the declaration's typing reports itself is not reported again
+pub fun refusals_report(sc: *sema_context.SemaContext, iface: *interface.Interface) {
+    var i: usize = 0;
+    for (i < iface.declarations.len) {
+        val decl: *interface.Declaration = ?iface.declarations.data[i];
+        i = i + 1;
+        if ((decl.kind != resolve.SYM_VAL && decl.kind != resolve.SYM_VAR) || comptime_deep.is_none(decl.value)) { cnt; }
+        val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, decl.decl);
+        if (sel opt_decl.none)                              { cnt; }
+        if (is_null_init(sc, opt_decl.some.data.bind.init)) { cnt; }
+        val n:           *comptime_deep.Shape    = comptime_deep.shape_at(?iface.values, decl.value);
+        val opt_refused: opt[comptime_deep.Node] = comptime_deep.refused_within(?iface.values, decl.value);
+        if (sel opt_refused.none) { cnt; }
+        val r: comptime_deep.Refusal = comptime_deep.shape_at(?iface.values, opt_refused.some).refusal;
+        if (comptime_failure.typed_alone(r.kind, r.diag)) { cnt; }
+        if (n.kind == comptime_deep.NODE_REFUSED && own_unevaluable(sc, decl, r)) {
+            not_constant_report(sc, opt_decl.some, init_at(sc, opt_decl.some), r);
+            cnt;
+        }
+        if (n.kind == comptime_deep.NODE_REFUSED && !own_rejected(sc, decl, r)) { cnt; }
+        if (n.kind != comptime_deep.NODE_REFUSED && comptime_failure.no_value(r.kind, r.diag)) {
+            not_constant_report(sc, opt_decl.some, r.at, r);
+            cnt;
+        }
+        report_phase.reject(?sc.status);
+        val err_reported: err[fail.Fail] = diagnostic.report(sc.diags, r.diag, r.at.file, r.at.span, intern.text(sc.s.interner, r.message));
+        if (sel err_reported.err) { report_phase.internal(?sc.status, err_reported.err); }
+    }
+}
+
+# whether the evaluation lowering folds a refused value of its own with needs a value no
+# constant gives, read from the same evaluation own_rejected reads
+fun own_unevaluable(sc: *sema_context.SemaContext, decl: *interface.Declaration, r: comptime_deep.Refusal) bool {
+    if (decl.kind == resolve.SYM_VAL) { ret sema_constant.unevaluable(sc, decl.decl); }
+    ret comptime_failure.no_value(r.kind, r.diag);
+}
+
+fun init_at(sc: *sema_context.SemaContext, d: *ast_decl.Decl) base_source.Location {
+    var span:     base_source.Span    = base_source.span(0, 0);
+    val opt_init: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, d.data.bind.init);
+    if (sel opt_init.some) { span = opt_init.some.span; }
+    ret base_source.location(sc.view.a.file_id, span);
+}
+
+# reports the initializer of `d` as no constant, at `at`: the initializer or the member of it
+# that has no compile-time value, for the reason the refusal `r` gives
+fun not_constant_report(sc: *sema_context.SemaContext, d: *ast_decl.Decl, at: base_source.Location, r: comptime_deep.Refusal) {
+    report_phase.reject(?sc.status);
+    val res_name: res[intern.StrId, A.Error] = intern.range_add(sc.s.interner, sc.view.source, d.data.bind.name.offset, d.data.bind.name.len);
+    if (sel res_name.err) {
+        report_phase.internal(?sc.status, fail.refused(res_name.err));
+        ret;
+    }
+    val err_reported: err[fail.Fail] = comptime_failure.init_no_value_report(sc.diags, at.file, at.span, intern.text(sc.s.interner, res_name.ok), intern.text(sc.s.interner, r.message));
+    if (sel err_reported.err) { report_phase.internal(?sc.status, err_reported.err); }
+}
+
+# whether the evaluation lowering folds a refused value of its own with is rejected: a `val`'s
+# binding, the last evaluation of it, and a `var`'s initializer, which only its published value
+# evaluated
+fun own_rejected(sc: *sema_context.SemaContext, decl: *interface.Declaration, r: comptime_deep.Refusal) bool {
+    if (decl.kind == resolve.SYM_VAL) { ret sema_constant.rejected(sc, decl.decl); }
+    ret r.kind == comptime_failure.EVAL_FAIL_REJECTED;
+}
+
+# whether the initializer `eid` is `nil`, seen through any casts around it
+fun is_null_init(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool {
+    var cur: ast_id.ExprId = eid;
+    for (true) {
+        val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, cur);
+        if (sel opt_expr.none)                                { ret false; }
+        if (opt_expr.some.kind == ast_expr.EXPR_KIND_LIT_NIL) { ret true; }
+        if (opt_expr.some.kind != ast_expr.EXPR_KIND_CAST)    { ret false; }
+        cur = opt_expr.some.data.cast.value;
+    }
+    ret false;
+}
+
+# adds every module-level function, `val` and `var` the module declares, the template part,
+# and each symbol of its public surface to `iface`
+fun interface_fill(sc: *sema_context.SemaContext, iface: *interface.Interface) err[fail.Fail] {
+    val rr: *resolve.ResolveResult = sc.view.rr;
+    if (rr == nil || rr.symbols == nil) { ret err[fail.Fail].ok{}; }
+    var i: u32 = 0;
+    for (i < rr.symbol_count) {
+        val sym: *resolve.Symbol = ?rr.symbols[i];
+        if (declares(sc, sym)) {
+            val err_added: err[fail.Fail] = declaration_add(sc, iface, sym);
+            if (sel err_added.err) { ret err_added; }
+        }
+        i = i + 1;
+    }
+    val err_captured: err[fail.Fail] = template_capture(sc, iface);
+    if (sel err_captured.err) { ret err_captured; }
+    i = 0;
+    for (i < rr.pub_count) {
+        val sym:       *resolve.Symbol = ?rr.symbols[i];
+        val err_added: err[fail.Fail]  = interface.exported_add(iface, interface.Exported{
+            kind:          sym.kind, name: sym.name, canon: sym.canon, origin: sym.origin, module: resolve.use_stable(sym),
+            generic_arity: sym.generic_arity, has_comptime_params: sym.has_comptime_params, has_pack_param: sym.has_pack_param
+        });
+        if (sel err_added.err) { ret err_added; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a module with a generic, comptime-parameter or pack function publishes the template its
+# instances are emitted from. on a target whose pointers are logical every module does, since
+# an importer lowers a copy of any function whose pointer parameters it calls with another
+# class, and declares an interface variable the module writes with its decorators
+fun template_capture(sc: *sema_context.SemaContext, iface: *interface.Interface) err[fail.Fail] {
+    var instanced: bool  = !sc.view.ctx.env.target.flat_addressing;
+    var i:         usize = 0;
+    for (i < iface.declarations.len) {
+        if (interface.declaration_has_instances(iface, ?iface.declarations.data[i])) { instanced = true; }
+        i = i + 1;
+    }
+    if (!instanced) { ret err[fail.Fail].ok{}; }
+    val a:          *ast.Ast                               = sc.view.a;
+    val res_copied: res[sema_template.Template, fail.Fail] = sema_template.capture(sc.s.alloc, sema_template.Captured{
+        a:      a, source: sc.view.source, rr: sc.view.rr,
+        typing: sema_template.Typing{expr_type: sc.view.expr_type, guard_case: sc.view.guard_case, type_resolved_ty: sc.view.type_resolved_ty, decl_type: sc.view.decl_type,
+            expr_count: a.exprs.len::u32, type_count: a.types.len::u32, decl_count: a.decls.len::u32},
+        load:  comptime_scope.layer_at(sc.view.ctx, comptime_scope.STAGE_LOAD), resolved: comptime_scope.layer_at(sc.view.ctx, comptime_scope.STAGE_RESOLVE),
+        typed: ?sc.view.ctx.own, env: comptime_scope.environment(sc.view.ctx)
+    });
+    if (sel res_copied.err) { ret err[fail.Fail].err{res_copied.err}; }
+    sema_template.dnit(?iface.template);
+    iface.template = res_copied.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# a module-level function, `val` or `var` the module itself declares
+fun declares(sc: *sema_context.SemaContext, sym: *resolve.Symbol) bool {
+    if (sema_context.foreign(sc, sym) || ast_id.decl_is_nil(sym.decl)) { ret false; }
+    if (ast_id.decl_index(sym.decl) >= sc.view.a.decls.len::u32)       { ret false; }
+    if (sym.kind == resolve.SYM_FUN)                                   { ret true; }
+    ret (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_VAR) && (sym.flags & resolve.SYM_FLAG_MODULE) != 0;
+}
+
+# adds the declaration of `sym` to `iface` with its flags, its intrinsic instruction, its
+# constant or initial value and its parameters
+fun declaration_add(sc: *sema_context.SemaContext, iface: *interface.Interface, sym: *resolve.Symbol) err[fail.Fail] {
+    val opt_found: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+    if (sel opt_found.none) { ret err[fail.Fail].err{fail.message("interface: a declared symbol has no declaration")}; }
+    val d: *ast_decl.Decl = opt_found.some;
+
+    var out: interface.Declaration = interface.Declaration{
+        kind: sym.kind, canon: sym.canon, decl: sym.decl, value: comptime_deep.NONE, op_set: intern.STR_NIL, op_name: intern.STR_NIL
+    };
+    out.at = base_source.location_nil();
+    if (d.kind == ast_decl.DECL_KIND_FUN)                                     { out.at = base_source.location(sc.view.a.file_id, d.data.fun_.name); }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) { out.at = base_source.location(sc.view.a.file_id, d.data.bind.name); }
+
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0)         { out.flags = out.flags | interface.DECLARATION_EXT; }
+    if (decorator.has(sc.view.a, d, decorator.THREAD))   { out.flags = out.flags | interface.DECLARATION_THREAD; }
+    if (decorator.has(sc.view.a, d, decorator.WEAK))     { out.flags = out.flags | interface.DECLARATION_WEAK; }
+    if (decorator.has(sc.view.a, d, decorator.NORETURN)) { out.flags = out.flags | interface.DECLARATION_NORETURN; }
+    val opt_timed: opt[str] = decorator.constant_time_mode(sc.s.interner, sc.view.ctx, sc.view.a, d);
+    if (sel opt_timed.some) {
+        if (str_equals(opt_timed.some, "soft")) { out.flags = out.flags | interface.DECLARATION_SOFT; }
+        or (str_equals(opt_timed.some, "hard")) { out.flags = out.flags | interface.DECLARATION_HARD; }
+    }
+    if (sym.kind != resolve.SYM_FUN || d.kind != ast_decl.DECL_KIND_FUN) {
+        if (sym.kind == resolve.SYM_VAL) {
+            val err_bound: err[fail.Fail] = constant_bind(sc, sym, d, ?out);
+            if (sel err_bound.err) { ret err_bound; }
+        }
+        or (sym.kind == resolve.SYM_VAR) {
+            val err_initial: err[fail.Fail] = initial_bind(sc, d, ?out);
+            if (sel err_initial.err) { ret err_initial; }
+        }
+        ret interface.declaration_add(iface, out, nil, 0);
+    }
+
+    val f: *ast_decl.DeclFun = ?d.data.fun_;
+    out.generics = f.generics_len;
+    if (!ast_id.stmt_is_nil(f.body)) { out.flags = out.flags | interface.DECLARATION_BODY; }
+    if (f.params_len > 0) {
+        val opt_last: opt[*ast_type.Type] = ast.get_type(sc.view.a, sc.view.a.typed_names.data[f.params_start + f.params_len - 1].ty);
+        if (sel opt_last.some && opt_last.some.kind == ast_type.TYPE_KIND_PACK) { out.flags = out.flags | interface.DECLARATION_PACK; }
+    }
+    val err_op_read: err[fail.Fail] = op_read(sc, d, ?out);
+    if (sel err_op_read.err) { ret err_op_read; }
+
+    var params: *interface.Param = nil;
+    if (f.params_len > 0) {
+        val res_allocated: res[*interface.Param, A.Error] = A.allocate[interface.Param](sc.s.alloc, f.params_len::usize);
+        if (sel res_allocated.err) { ret err[fail.Fail].err{fail.refused(res_allocated.err)}; }
+        params = res_allocated.ok;
+    }
+    fin {
+        if (params != nil) { A.deallocate[interface.Param](sc.s.alloc, params, f.params_len::usize); }
+    }
+    var i: u32 = 0;
+    for (i < f.params_len) {
+        params[i] = interface.Param{comptime: sc.view.a.typed_names.data[f.params_start + i].comptime};
+        i         = i + 1;
+    }
+    ret interface.declaration_add(iface, out, params, f.params_len);
+}
+
+# the instruction an `#[intrinsic]` of the selected target makes the function: its set and
+# operation, read once so no reader decodes the decorator again. one naming another target
+# makes it none
+fun op_read(sc: *sema_context.SemaContext, d: *ast_decl.Decl, out: *interface.Declaration) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *ast_decl.Decorator = ?sc.view.a.decorators.data[d.decorators_start + i];
+        if (dec.id == decorator.INTRINSIC) {
+            if (dec.args_len != 3) { ret err[fail.Fail].ok{}; }
+            val opt_tgt_s: opt[str] = decorator.string_of(sc.s.interner, sc.view.ctx, sc.view.a, dec, 0);
+            if (sel opt_tgt_s.none)                              { ret err[fail.Fail].ok{}; }
+            if (!sema_op.target_is_selected(sc, opt_tgt_s.some)) { ret err[fail.Fail].ok{}; }
+            val opt_set_s: opt[str] = decorator.string_of(sc.s.interner, sc.view.ctx, sc.view.a, dec, 1);
+            val opt_nam_s: opt[str] = decorator.string_of(sc.s.interner, sc.view.ctx, sc.view.a, dec, 2);
+            if (sel opt_set_s.none) { ret err[fail.Fail].ok{}; }
+            if (sel opt_nam_s.none) { ret err[fail.Fail].ok{}; }
+            val res_set_id: res[intern.StrId, A.Error] = intern.add(sc.s.interner, opt_set_s.some);
+            if (sel res_set_id.err) { ret err[fail.Fail].err{fail.refused(res_set_id.err)}; }
+            val res_nam_id: res[intern.StrId, A.Error] = intern.add(sc.s.interner, opt_nam_s.some);
+            if (sel res_nam_id.err) { ret err[fail.Fail].err{fail.refused(res_nam_id.err)}; }
+            out.op_set  = res_set_id.ok;
+            out.op_name = res_nam_id.ok;
+            ret err[fail.Fail].ok{};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a constant sema bound is its value; an array, record or case literal no scalar holds is
+# evaluated member by member; any other initializer is no constant
+fun constant_bind(sc: *sema_context.SemaContext, sym: *resolve.Symbol, d: *ast_decl.Decl, out: *interface.Declaration) err[fail.Fail] {
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.expr_is_nil(d.data.bind.init) || decorator.has(sc.view.a, d, decorator.EMBED)) {
+        ret err[fail.Fail].ok{};
+    }
+    val res_built: res[comptime_deep.Node, fail.Fail] = sema_constant.own_value(sc, sym);
+    if (sel res_built.err) { ret err[fail.Fail].err{res_built.err}; }
+    out.value = res_built.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# the value a `var`'s initializer gives it, evaluated member by member: the data the var starts
+# with, and the value a `#[gpu.spec]` var holds until the host supplies another
+fun initial_bind(sc: *sema_context.SemaContext, d: *ast_decl.Decl, out: *interface.Declaration) err[fail.Fail] {
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.expr_is_nil(d.data.bind.init) || decorator.has(sc.view.a, d, decorator.EMBED)) {
+        ret err[fail.Fail].ok{};
+    }
+    val res_built: res[comptime_deep.Node, fail.Fail] = sema_constant.node_build(sc, d.data.bind.init, comptime_deep.NO_SHAPE);
+    if (sel res_built.err) { ret err[fail.Fail].err{res_built.err}; }
+    out.value = res_built.ok;
+    ret err[fail.Fail].ok{};
+}

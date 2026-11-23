@@ -1,37 +1,45 @@
+[mach](../../README.md) / [cli](../README.md) / [cmd](README.md) / **info**
+
 # mach.cli.cmd.info
 
-## fun run
+`mach info`: the version and the host target, or with `targets` every target a build can be made for
+
+Source: [`src/cli/cmd/info.mach`](../../../../src/cli/cmd/info.mach)
+
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
+
+| Functions | |
+| :--- | :--- |
+| [`run`](#run) | `mach info`: print "mach \<version>" and the host target this binary resolves for the machine it runs on, or with the verb `targets` every target a build can be made for; any other verb is an error |
+
+| Constants | |
+| :--- | :--- |
+| [`COMMAND`](#constants) | `mach info` |
+| [`POLICY`](#constants) | what mach holds `mach info` to beyond the parse |
+
+---
+
+## Functions
+
+### run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
-`mach info`: print "mach <version>" and the host target this binary resolves for the
-machine it runs on. `--version` prints the version alone; the verb `targets` prints
-every target the registries compose end-to-end, one full tuple per line; combining
-the two, or any other verb, is an error
+`mach info`: print "mach \<version>" and the host target this binary resolves for the
+machine it runs on, or with the verb `targets` every target a build can be made for; any other
+verb is an error
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: exit.OK, exit.USER for a usage error, or the code `exit.of` maps a target registration or
-      host resolution failure to
+| Parameter | |
+| :--- | :--- |
+| `cx` | the call |
+| **returns** | exit.OK, or a user failure for a usage error, or a host resolution failure |
 
-## fun render_host
+## Constants
 
-```mach
-pub fun render_host(a: *A.Allocator, reg: *target.TargetRegistry) res[str, fail.Fail];
-```
-
-the `mach info` page: the version and the resolved host target, one dimension
-per line, every value taken from the target the host request resolves to
-
-## fun render_targets
-
-```mach
-pub fun render_targets(a: *A.Allocator, reg: *target.TargetRegistry) res[str, fail.Fail];
-```
-
-the `mach info targets` listing: one line per accepted cell, the `<os>-<isa>`
-name then `key=value` for every dimension, each column padded to the widest
-value it holds over the whole listing
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "info", aliases: args.NO_WORDS, help: "show the host target, or every target", usage: "[targets]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: 1, passthrough: false}` | `mach info` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach info` to beyond the parse |
 

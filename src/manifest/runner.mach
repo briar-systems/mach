@@ -1,0 +1,320 @@
+# the command a target's programs are launched through, and the executable `mach run`
+# launches. a target may declare a `runner`, argv templates the launch expands, and
+# `--runner <cmd>` replaces it for one invocation with `<cmd> <program>`. mach knows no
+# runner by name: the command is the manifest's, and its exit status is the program's
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_is_empty;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use base_alloc: mach.base.alloc;
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.host;
+use manifest_load:  mach.manifest.load;
+use manifest_model: mach.manifest.model;
+use mach.manifest.model.TargetDef;
+use manifest_plan:   mach.manifest.plan;
+use manifest_select: mach.manifest.select;
+use mach.manifest.target.target_matches_host;
+use mach.manifest.template;
+use mach_target: mach.target;
+
+# how one (target, profile)'s programs are launched
+# ---
+# program: the resolved `--runner` program, which launches `<program> <out>`; nil
+#          when the declared templates apply
+# words:   the target's `runner` templates, owned; nil when it declares none
+# count:   length of `words`
+# target:  the target's name, for a refusal
+# work:    `{project.work}`, joined to the project root
+# values:  the target's and profile's template values, owned
+pub rec Runner {
+    program: *u8;
+    words:   *str;
+    count:   u32;
+    target:  str;
+    work:    str;
+    values:  template.Values;
+}
+
+# a launch command: `argv` is nil-terminated, its first `lead` entries the
+# runner's and the program's, the rest the run's own arguments
+pub rec Command {
+    argv: **u8;
+    len:  usize;
+    lead: usize;
+}
+
+# no runner: the program runs itself
+pub fun none() Runner {
+    var r: Runner;
+    r.program = nil;
+    r.words   = nil;
+    r.count   = 0;
+    r.target  = "";
+    r.work    = "";
+    r.values  = template.values_make();
+    ret r;
+}
+
+# whether `r` launches through a command rather than running the program itself
+pub fun given(r: *Runner) bool {
+    ret r.program != nil || r.count > 0;
+}
+
+# the runner `--runner` names for one invocation, replacing the declared one
+# ---
+# program: the resolved program
+# target:  the target's name
+pub fun overriding(program: *u8, target: str) Runner {
+    var r: Runner = none();
+    r.program = program;
+    r.target  = target;
+    ret r;
+}
+
+# the program `mach run` launches
+# ---
+# path:          the built executable, or `-o`
+# host_runnable: the target's sys and arch are the host's
+# target_name:   the target's declared name
+# runner:        the runner the target declares, none when it declares none
+pub rec RunArtifact {
+    path:          str;
+    host_runnable: bool;
+    target_name:   str;
+    runner:        Runner;
+}
+
+# the built executable `mach run` launches: the one (artifact, target, profile)
+# the selectors name, which must be a `bin`
+# ---
+# alloc:           owns the result and every message
+# project_root:    the project root
+# selectors:       the `-a`, `-t` and `-p` patterns; an artifact axis given none takes the sole `bin`
+# output_override: `-o`, the path to run instead of the artifact's output, or nil
+# sources:         receives the manifest's text, which a refusal points into
+# ret:             the executable; err from the manifest or selection, when the selection
+#                  names several cells or a library, or for an unusable `-o`
+pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest_select.Selectors,
+    output_override: str, sources: *base_source.SourceMap) res[RunArtifact, fail.Fail] {
+    var itn:         intern.Interner                         = intern.init(alloc);
+    val res_read_at: res[manifest_model.Manifest, fail.Fail] = manifest_load.read_at(alloc, ?itn, sources, project_root);
+    if (sel res_read_at.err) { ret res[RunArtifact, fail.Fail].err{res_read_at.err}; }
+    var m: manifest_model.Manifest = res_read_at.ok;
+    fin { manifest_model.dnit(?m, alloc); }
+
+    val res_picked: res[manifest_select.Cell, fail.Fail] = manifest_select.resolve_cell(alloc, ?itn, ?m, selectors,
+        manifest_select.ARTIFACT_DEFAULT_EXECUTABLE, "mach run executes one artifact");
+    if (sel res_picked.err) { ret res[RunArtifact, fail.Fail].err{res_picked.err}; }
+    var cell: manifest_select.Cell = res_picked.ok;
+
+    val res_resolve_build_unit: res[manifest_plan.BuildUnit, fail.Fail] = manifest_plan.resolve_build_unit(alloc, ?itn, ?m, project_root, ?cell);
+    if (sel res_resolve_build_unit.err) { ret res[RunArtifact, fail.Fail].err{res_resolve_build_unit.err}; }
+    val bu: manifest_plan.BuildUnit = res_resolve_build_unit.ok;
+
+    if (!mach_target.is_executable(bu.artifact.kind)) {
+        val refusal: fail.Fail = fail.formatted_user(alloc, diagnostic_kind.ARTIFACT_NOT_RUNNABLE,
+            "selected artifact '{}' is kind = \"{}\", and run executes only bin artifacts", intern.text(?itn, bu.artifact.name), mach_target.kind_name(bu.artifact.kind));
+        ret res[RunArtifact, fail.Fail].err{refusal};
+    }
+
+    var ra: RunArtifact;
+    ra.host_runnable = target_matches_host(?itn, bu.target);
+    ra.target_name   = intern.text(?itn, bu.target.name);
+    val res_work: res[types_path.Path, A.Error] = types_path.join(alloc, project_root, intern.text(?itn, bu.out_root));
+    if (sel res_work.err) { ret res[RunArtifact, fail.Fail].err{fail.refused(res_work.err)}; }
+    val res_declared: res[Runner, fail.Fail] = declared(alloc, ?itn, bu.target, intern.text(?itn, bu.profile_name), res_work.ok);
+    if (sel res_declared.err) { ret res[RunArtifact, fail.Fail].err{res_declared.err}; }
+    ra.runner = res_declared.ok;
+
+    if (output_override != nil) {
+        if (str_is_empty(output_override)) {
+            ret res[RunArtifact, fail.Fail].err{fail.user(diagnostic_kind.CLI_OUTPUT_PATH, "-o requires a non-empty path")};
+        }
+        val res_resolved: res[types_path.Path, A.Error] = types_path.resolve(alloc, project_root, output_override);
+        if (sel res_resolved.err) {
+            ret res[RunArtifact, fail.Fail].err{fail.formatted_user(alloc, diagnostic_kind.CLI_OUTPUT_PATH, "-o '{}' cannot be resolved ({})", output_override, base_alloc.text(res_resolved.err))};
+        }
+        val res_cleaned: res[types_path.Path, A.Error] = types_path.clean(alloc, res_resolved.ok);
+        if (sel res_cleaned.err) {
+            ret res[RunArtifact, fail.Fail].err{fail.formatted_user(alloc, diagnostic_kind.CLI_OUTPUT_PATH, "-o '{}' cannot be normalized ({})", output_override, base_alloc.text(res_cleaned.err))};
+        }
+        ra.path = res_cleaned.ok;
+        ret res[RunArtifact, fail.Fail].ok{ra};
+    }
+
+    if (intern.str_is_nil(bu.bin_path)) {
+        ret res[RunArtifact, fail.Fail].err{fail.user(diagnostic_kind.ARTIFACT_NO_OUTPUT, "the selected artifact is an object artifact, whose objects stay under obj/ for a later link, so nothing runs")};
+    }
+    val res_abs: res[types_path.Path, A.Error] = types_path.join(alloc, project_root, intern.text(?itn, bu.bin_path));
+    if (sel res_abs.err) { ret res[RunArtifact, fail.Fail].err{fail.refused(res_abs.err)}; }
+    ra.path = res_abs.ok;
+    ret res[RunArtifact, fail.Fail].ok{ra};
+}
+
+# the runner `t` declares for `profile`, copied out of `itn` into `a`; no runner
+# when it declares none
+# ---
+# work: `{project.work}` for the cell, joined to the project root
+pub fun declared(a: *A.Allocator, itn: *intern.Interner, t: *TargetDef, profile: str, work: str) res[Runner, fail.Fail] {
+    var r: Runner = none();
+    if (t == nil) { ret res[Runner, fail.Fail].ok{r}; }
+    val res_name: res[str, fail.Fail] = dup(a, intern.text(itn, t.name));
+    if (sel res_name.err) { ret res[Runner, fail.Fail].err{res_name.err}; }
+    r.target = res_name.ok;
+    if (t.runner_count == 0) { ret res[Runner, fail.Fail].ok{r}; }
+
+    val res_allocate: res[*str, A.Error] = A.allocate[str](a, t.runner_count::usize);
+    if (sel res_allocate.err) { ret res[Runner, fail.Fail].err{fail.refused(res_allocate.err)}; }
+    var i: u32 = 0;
+    for (i < t.runner_count) {
+        val res_dup: res[str, fail.Fail] = dup(a, intern.text(itn, t.runner[i]));
+        if (sel res_dup.err) { ret res[Runner, fail.Fail].err{res_dup.err}; }
+        res_allocate.ok[i] = res_dup.ok;
+        i                  = i + 1;
+    }
+    r.words = res_allocate.ok;
+    r.count = t.runner_count;
+
+    val v:                template.Values     = template.values_of(itn, t, profile);
+    val res_target:       res[str, fail.Fail] = dup(a, v.target);
+    val res_arch:         res[str, fail.Fail] = dup(a, v.arch);
+    val res_sys:          res[str, fail.Fail] = dup(a, v.sys);
+    val res_abi:          res[str, fail.Fail] = dup(a, v.abi);
+    val res_profile_name: res[str, fail.Fail] = dup(a, v.profile);
+    if (sel res_target.err)       { ret res[Runner, fail.Fail].err{res_target.err}; }
+    if (sel res_arch.err)         { ret res[Runner, fail.Fail].err{res_arch.err}; }
+    if (sel res_sys.err)          { ret res[Runner, fail.Fail].err{res_sys.err}; }
+    if (sel res_abi.err)          { ret res[Runner, fail.Fail].err{res_abi.err}; }
+    if (sel res_profile_name.err) { ret res[Runner, fail.Fail].err{res_profile_name.err}; }
+    r.values         = template.values_make();
+    r.values.target  = res_target.ok;
+    r.values.arch    = res_arch.ok;
+    r.values.sys     = res_sys.ok;
+    r.values.abi     = res_abi.ok;
+    r.values.profile = res_profile_name.ok;
+    val res_dup: res[str, fail.Fail] = dup(a, work);
+    if (sel res_dup.err) { ret res[Runner, fail.Fail].err{res_dup.err}; }
+    r.work = res_dup.ok;
+    ret res[Runner, fail.Fail].ok{r};
+}
+
+# the command launching `out` through `r` with the `n` arguments at `args`: the
+# override's program then `out`, or each declared template expanded with
+# `{artifact.out}` as `out` and its first word resolved as a program
+# ---
+# a:   owns the command, released with `command_dnit`
+# ret: the command; err when a template does not expand or the first word names no
+#      program
+pub fun command(a: *A.Allocator, r: *Runner, out: str, args: **u8, n: usize) res[Command, fail.Fail] {
+    var lead: usize = r.count::usize;
+    if (r.program != nil) { lead = 2; }
+    val res_allocate: res[**u8, A.Error] = A.allocate[*u8](a, lead + n + 1);
+    if (sel res_allocate.err) { ret res[Command, fail.Fail].err{fail.refused(res_allocate.err)}; }
+    var c: Command = Command{argv: res_allocate.ok, len: lead + n, lead: lead};
+    var i: usize   = 0;
+    for (i <= c.len) {
+        c.argv[i] = nil;
+        i         = i + 1;
+    }
+    if (r.program != nil) {
+        val res_dup: res[str, fail.Fail] = dup(a, r.program::str);
+        if (sel res_dup.err) { ret failed(a, ?c, res_dup.err); }
+        c.argv[0] = res_dup.ok::*u8;
+        val res_dup_out: res[str, fail.Fail] = dup(a, out);
+        if (sel res_dup_out.err) { ret failed(a, ?c, res_dup_out.err); }
+        c.argv[1] = res_dup_out.ok::*u8;
+    }
+    or {
+        var v: template.Values = r.values;
+        v.run_out = out;
+        i         = 0;
+        for (i < lead) {
+            val res_expand: res[str, fail.Fail] = template.expand(a, r.words[i], template.CONTEXT_RUNNER, r.work, ?v);
+            if (sel res_expand.err) { ret failed(a, ?c, res_expand.err); }
+            c.argv[i] = res_expand.ok::*u8;
+            i         = i + 1;
+        }
+        val res_found: res[str, fail.Fail] = host.program_resolve(a, c.argv[0]::str);
+        if (sel res_found.err) {
+            val res_said: res[str, fail.Fail] = diagnostic.format(a, "the runner of target '{}' names '{}', which cannot be found ({})", r.target, c.argv[0]::str, fail.describe(res_found.err));
+            if (sel res_said.err) { ret failed(a, ?c, res_said.err); }
+            ret failed(a, ?c, fail.owning(fail.with_text(res_found.err, res_said.ok)));
+        }
+        str_free(a, c.argv[0]::str);
+        c.argv[0] = res_found.ok::*u8;
+    }
+    i = 0;
+    for (i < n) {
+        c.argv[lead + i] = args[i];
+        i                = i + 1;
+    }
+    ret res[Command, fail.Fail].ok{c};
+}
+
+# the command's leading words joined by spaces, as a person would retype them
+# before the run's own arguments
+pub fun line(a: *A.Allocator, c: *Command) res[str, fail.Fail] {
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < c.lead) {
+        total = total + str_len(c.argv[i]::str) + 1;
+        i     = i + 1;
+    }
+    val res_allocate: res[*u8, A.Error] = A.allocate[u8](a, total + 1);
+    if (sel res_allocate.err) { ret res[str, fail.Fail].err{fail.refused(res_allocate.err)}; }
+    var at: usize = 0;
+    i = 0;
+    for (i < c.lead) {
+        if (i > 0) {
+            res_allocate.ok[at] = ' ';
+            at                  = at + 1;
+        }
+        val w: str   = c.argv[i]::str;
+        val l: usize = str_len(w);
+        var k: usize = 0;
+        for (k < l) {
+            res_allocate.ok[at + k] = w[k];
+            k                       = k + 1;
+        }
+        at = at + l;
+        i  = i + 1;
+    }
+    res_allocate.ok[at] = 0;
+    ret res[str, fail.Fail].ok{res_allocate.ok::str};
+}
+
+# release the words a command owns; the run's own arguments are the caller's
+pub fun command_dnit(a: *A.Allocator, c: *Command) {
+    if (c.argv == nil) { ret; }
+    var i: usize = 0;
+    for (i < c.lead) {
+        if (c.argv[i] != nil) { str_free(a, c.argv[i]::str); }
+        i = i + 1;
+    }
+    A.deallocate[*u8](a, c.argv, c.len + 1);
+    c.argv = nil;
+}
+
+fun failed(a: *A.Allocator, c: *Command, f: fail.Fail) res[Command, fail.Fail] {
+    command_dnit(a, c);
+    ret res[Command, fail.Fail].err{f};
+}
+
+fun dup(a: *A.Allocator, s: str) res[str, fail.Fail] {
+    val res_str_dup: res[str, A.Error] = str_dup(a, s);
+    if (sel res_str_dup.err) { ret res[str, fail.Fail].err{fail.refused(res_str_dup.err)}; }
+    ret res[str, fail.Fail].ok{res_str_dup.ok};
+}

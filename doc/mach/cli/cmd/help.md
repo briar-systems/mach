@@ -1,178 +1,45 @@
+[mach](../../README.md) / [cli](../README.md) / [cmd](README.md) / **help**
+
 # mach.cli.cmd.help
 
-## def HelpRouteKind
+`mach help`, and the page any command renders for `--help`
+
+Source: [`src/cli/cmd/help.mach`](../../../../src/cli/cmd/help.mach)
+
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
+
+| Functions | |
+| :--- | :--- |
+| [`page`](#page) | write the page of the command a parsed line matched to stdout: std.args' page of its usage, text, nested commands and flags |
+
+| Constants | |
+| :--- | :--- |
+| [`COMMAND`](#constants) | `mach help`, and the page any command renders for `--help` |
+| [`POLICY`](#constants) | what mach holds `mach help` to beyond the parse |
+
+---
+
+## Functions
+
+### page
 
 ```mach
-pub def HelpRouteKind: u8
+pub fun page(a: *std.allocator.Allocator, line: *std.args.Parsed) err[mach.base.fail.Fail]
 ```
 
-what a help request resolved to
+write the page of the command a parsed line matched to stdout: std.args' page of its usage,
+text, nested commands and flags. the root's page is the overview
 
-## val HELP_ROUTE_NONE
+| Parameter | |
+| :--- | :--- |
+| `a` | holds the text of a refusal |
+| `line` | a parsed line whose command is the page's |
+| **returns** | ok, or the write that failed |
 
-```mach
-pub val HELP_ROUTE_NONE: HelpRouteKind = 0
-```
+## Constants
 
-argv is not a help request
-
-## val HELP_ROUTE_OVERVIEW
-
-```mach
-pub val HELP_ROUTE_OVERVIEW: HelpRouteKind = 1
-```
-
-the command overview
-
-## val HELP_ROUTE_COMMAND
-
-```mach
-pub val HELP_ROUTE_COMMAND: HelpRouteKind = 2
-```
-
-one command's page
-
-## val HELP_ROUTE_MALFORMED
-
-```mach
-pub val HELP_ROUTE_MALFORMED: HelpRouteKind = 3
-```
-
-a help request that names an unknown command or has the wrong shape
-
-## val HELP_ROUTE_ACTION
-
-```mach
-pub val HELP_ROUTE_ACTION: HelpRouteKind = 4
-```
-
-one action's block of a command that takes actions
-
-## val HELP_ROUTE_UNKNOWN_ACTION
-
-```mach
-pub val HELP_ROUTE_UNKNOWN_ACTION: HelpRouteKind = 5
-```
-
-a help request naming an action its command does not have
-
-## rec HelpRoute
-
-```mach
-pub rec HelpRoute;
-```
-
-where a help request routes
-
-kind: the HELP_ROUTE_* value
-command: the command whose page to render, for HELP_ROUTE_COMMAND and the two action routes
-action: the action whose block to render, for HELP_ROUTE_ACTION
-token: the unknown command word, for HELP_ROUTE_MALFORMED (empty when the shape itself was
-         wrong), or the unknown action word, for HELP_ROUTE_UNKNOWN_ACTION
-
-## fun resolve_help_route
-
-```mach
-pub fun resolve_help_route(argc: usize, argv: **u8) HelpRoute;
-```
-
-decide whether argv is a help request and which page it wants
-`mach help`, `mach -h`, `mach --help`, and `mach help help` route to the overview;
-`mach help <cmd>` and `mach <cmd> -h|--help` to the command page, and `mach help <cmd> <action>`
-and `mach <cmd> <action> -h|--help` to one action's block when the command takes actions. a help
-word with other extra arguments, an unknown command followed by a help token, or a help token anywhere else
-among the arguments is malformed; tokens after `--` are not inspected for commands that
-truncate at the separator. fewer than two arguments is not a help request
-
-argc: process argument count
-argv: process arguments, argv[0] the program
-ret: the route; HELP_ROUTE_NONE when argv is not a help request
-
-## fun render_overview_at
-
-```mach
-pub fun render_overview_at(a: *A.Allocator, out: *writer.Writer, requested_width: usize) err[outcome.Fail];
-```
-
-write the command overview wrapped to a width
-
-a: allocator for the text buffer
-out: the destination
-requested_width: columns; clamped to the range 56 to 240
-ret: ok, or an error when the command schema is invalid, the buffer could not be built,
-                 or the write failed
-
-## fun render_overview
-
-```mach
-pub fun render_overview(a: *A.Allocator, out: *writer.Writer) err[outcome.Fail];
-```
-
-write the command overview at the terminal width read from COLUMNS, 100 when unset or
-not a number
-
-a: allocator for the text buffer
-out: the destination
-ret: as render_overview_at
-
-## fun render_command_page_at
-
-```mach
-pub fun render_command_page_at(a: *A.Allocator, out: *writer.Writer, id: args.CommandId,
-requested_width: usize) err[outcome.Fail];
-```
-
-write one command's help page wrapped to a width
-
-a: allocator for the text buffer
-out: the destination
-id: the command; an id with no record is an error
-requested_width: columns; clamped to the range 56 to 240
-ret: ok, or an error when the command schema is invalid, the command is unknown, the
-                 buffer could not be built, or the write failed
-
-## fun render_command_page
-
-```mach
-pub fun render_command_page(a: *A.Allocator, out: *writer.Writer, id: args.CommandId) err[outcome.Fail];
-```
-
-write one command's help page at the terminal width read from COLUMNS, 100 when unset or
-not a number
-
-a: allocator for the text buffer
-out: the destination
-id: the command
-ret: as render_command_page_at
-
-## fun render_action_page_at
-
-```mach
-pub fun render_action_page_at(a: *A.Allocator, out: *writer.Writer, action: args.DepAction,
-requested_width: usize) err[outcome.Fail];
-```
-
-write one action's block wrapped to a width
-
-a: allocator for the text buffer
-out: the destination
-action: the action; one with no record is an error
-requested_width: columns; clamped to the range 56 to 240
-ret: ok, or an error when the schema is invalid, the action is unknown, the buffer
-                 could not be built, or the write failed
-
-## fun render_route
-
-```mach
-pub fun render_route(a: *A.Allocator, out: *writer.Writer, fault: *writer.Writer, route: *HelpRoute) i64;
-```
-
-render a resolved help route
-
-a: allocator for the text buffer
-out: overview, command and action pages go here
-fault: malformed-request and unknown-action errors go here
-route: from resolve_help_route
-ret: exit.OK for a rendered page, exit.USER for a malformed request, an unknown action or
-       HELP_ROUTE_NONE, or the code `exit.of` maps a rendering failure to
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "help", aliases: args.NO_WORDS, help: "show help for a command", usage: "[command [action]]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: 2, passthrough: false}` | `mach help`, and the page any command renders for `--help` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach help` to beyond the parse |
 

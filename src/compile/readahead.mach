@@ -1,0 +1,437 @@
+# files read and parsed ahead of the load walk. the walk stays on the owner thread and follows `use`
+# lines in order; each module it parses proposes the files its `use` and `fwd` paths may name, and a
+# worker reads, lexes and parses each into a tree and a name table of its own. when the walk reaches a
+# file it takes what was read ahead for that path, or reads and parses it as it would alone. a
+# finished job proposes in turn the files its own tree names, so the frontier runs ahead of the walk
+# as far as the threads keep up, not one module deep. the owner
+# merges a taken parse where a single thread would have made it, its names in the order the parse
+# interned them and its diagnostics in the order they were reported, so every id is the one a single
+# thread issues. a proposal costs no id: it is spelled out and located by text, and a file the walk
+# never reaches is dropped unread or unmerged
+#
+# a worker reads only the file system and the overlays (provider `peek`) and writes only its job.
+# each job allocates on a heap of its own over the session's span pool, which takes no lock, so the
+# threads do not queue on the session's heap. a merge copies the tree onto the parse query's
+# allocator and the job's heap goes whole
+
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.fnv1a;
+use std.memory;
+use std.sync.atomic;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.allocator.heap;
+
+use mach.base.diagnostic;
+use mach.base.fail;
+use mach.base.intern;
+use mach.base.role;
+use base_source: mach.base.source;
+use mach.base.source.provider;
+use mach.compile.workers;
+use mach.front.ast;
+use ast_decl:     mach.front.ast.decl;
+use front_lexer:  mach.front.lexer;
+use front_parser: mach.front.parser;
+use mach.front.parser.state;
+use front_path:   mach.front.path;
+use report_phase: mach.report.phase;
+use mach.session;
+
+val QUEUED:  i64 = 0;
+val RUNNING: i64 = 1;
+val DONE:    i64 = 2;
+
+# what a job made of its path
+# ---
+# ra:     the read-ahead it belongs to
+# path:   the file, owned through the read-ahead's allocator
+# src:    where the job's heap draws its spans, the session's pool
+# hp:     the job's own heap, which holds everything below while `heaped`. one thread at a time
+#         uses it: the one running the job, then the owner once it is DONE
+# ja:     its allocator, taking no lock
+# heaped: the heap is up
+# state:  QUEUED, RUNNING or DONE, claimed by whichever thread runs it first
+# read:   peek gave its text
+# text:   that text
+# usable: it was lexed and parsed with nothing refused, so a merge reproduces the parse exactly
+# tree:   the parse, its names the job's and its file FILE_NIL
+# names:  the names the parse interned, in the order it interned them
+# diags:  what the lexer and the parser reported, in order, placed in FILE_NIL
+# status: the parse's status when it returned one
+# fatal:  the parse's refusal when it returned none
+# failed: the parse returned a refusal
+# handed: the walk took its text
+# taken:  the parse query took its tree
+# spread: the files its tree names were proposed
+rec Job {
+    ra:     *ReadAhead;
+    path:   str;
+    src:    heap.Source;
+    hp:     heap.Heap;
+    ja:     A.Allocator;
+    heaped: bool;
+    state:  i64;
+    read:   bool;
+    text:   provider.Text;
+    usable: bool;
+    tree:   *ast.Ast;
+    names:  intern.Interner;
+    diags:  diagnostic.DiagnosticStore;
+    status: report_phase.PhaseStatus;
+    fatal:  state.ParseFail;
+    failed: bool;
+    handed: bool;
+    taken:  bool;
+    spread: bool;
+}
+
+# a parse the walk took, which the parse query merges
+pub rec Taken {
+    tree:   *ast.Ast;
+    names:  *intern.Interner;
+    diags:  *diagnostic.DiagnosticStore;
+    status: report_phase.PhaseStatus;
+    fatal:  state.ParseFail;
+    failed: bool;
+}
+
+# a:       owns the jobs and their paths; spans: what each job's heap draws from
+# sources: the walk's sources, which locate on the owner and read on any thread
+# crew:    the threads; slots: free task indices, each in-flight job holding one (slot_job)
+# pending: proposed jobs not yet handed to a thread, newest last and handed first: the walk goes
+#          depth first, so it takes the first file a module names itself while the threads read
+#          on past it
+pub rec ReadAhead {
+    a:        *A.Allocator;
+    spans:    *heap.Pool;
+    sources:  provider.Provider;
+    crew:     workers.Crew;
+    jobs:     Vector[*Job];
+    by_path:  map.MapBy[str, u32];
+    slots:    Vector[u32];
+    slot_job: *u32;
+    width:    u32;
+    pending:  Vector[u32];
+}
+
+fun path_hash(k: *str) u64 {
+    ret fnv1a.step_bytes(fnv1a.FNV_INIT, (@k)::*u8, str_len(@k));
+}
+
+fun path_eq(x: *str, y: *str) bool {
+    val n: usize = str_len(@x);
+    ret n == str_len(@y) && memory.equal[char](@x, @y, n);
+}
+
+# a read-ahead on `threads` threads for session `s` over the walk's `sources`, or false when it cannot be had (one thread, a
+# session with no span pool, storage, or a thread the host refused), holding nothing then. `ra` must
+# not move while it is open
+pub fun open(ra: *ReadAhead, s: *session.Session, sources: provider.Provider, threads: u32) bool {
+    if (threads <= 1 || s.spans == nil) { ret false; }
+    val width: u32 = 2 * threads;
+    @ra        = ReadAhead{a: s.alloc, spans: s.spans, sources: sources, width: width};
+    ra.jobs    = collections_vector.init[*Job](s.alloc);
+    ra.by_path = map.init_by[str, u32](s.alloc, path_hash, path_eq);
+    ra.slots   = collections_vector.init[u32](s.alloc);
+    ra.pending = collections_vector.init[u32](s.alloc);
+    var made: bool = false;
+    fin {
+        if (!made) { storage_dnit(ra); }
+    }
+    val res_slots: res[*u32, A.Error] = A.allocate[u32](s.alloc, width::usize);
+    if (sel res_slots.err) { ret false; }
+    ra.slot_job = res_slots.ok;
+    var i: u32 = 0;
+    for (i < width) {
+        val res_pushed: res[usize, A.Error] = collections_vector.push[u32](?ra.slots, width - 1 - i);
+        if (sel res_pushed.err) { ret false; }
+        i = i + 1;
+    }
+    if (!workers.open(?ra.crew, s.alloc, threads, width::usize, width::usize)) { ret false; }
+    made = true;
+    ret true;
+}
+
+# stop the threads, dropping what is still queued, and give back every job the walk left
+pub fun close(ra: *ReadAhead) {
+    workers.close(?ra.crew);
+    var draining: bool = true;
+    for (draining) {
+        val opt_index: opt[u32] = workers.finished_now(?ra.crew);
+        draining = sel opt_index.some;
+    }
+    workers.dnit(?ra.crew);
+    storage_dnit(ra);
+}
+
+fun storage_dnit(ra: *ReadAhead) {
+    var i: usize = 0;
+    for (i < ra.jobs.len) {
+        job_free(ra, ra.jobs.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[*Job](?ra.jobs);
+    map.dnit_by[str, u32](?ra.by_path);
+    collections_vector.dnit[u32](?ra.slots);
+    collections_vector.dnit[u32](?ra.pending);
+    if (ra.slot_job != nil) { A.deallocate[u32](ra.a, ra.slot_job, ra.width::usize); }
+    ra.slot_job = nil;
+}
+
+fun job_free(ra: *ReadAhead, j: *Job) {
+    heap_free(j);
+    str_free(ra.a, j.path);
+    A.deallocate[Job](ra.a, j, 1);
+}
+
+# the files a parsed module's `use` and `fwd` paths may name proposed: each path and each of its
+# prefixes of two segments or more, as the load resolves a path to its longest prefix that is a
+# module. `sources` locates them, `text` is the module's source. proposing is best effort: a
+# path that cannot be spelled or located is left for the walk. a file read ahead proposed its uses
+# when it finished, so `path` names it to skip it
+pub fun propose_uses(ra: *ReadAhead, path: str, tree: *ast.Ast, text: str) {
+    var key:       str       = path;
+    val opt_known: opt[*u32] = map.get_by[str, u32](?ra.by_path, ?key);
+    if (sel opt_known.some && ra.jobs.data[(@opt_known.some)::usize].spread) {
+        pump(ra);
+        ret;
+    }
+    spread_tree(ra, tree, text);
+    pump(ra);
+}
+
+fun spread_tree(ra: *ReadAhead, tree: *ast.Ast, text: str) {
+    var i: usize = 0;
+    for (i < tree.decls.len) {
+        val d: *ast_decl.Decl = ?tree.decls.data[i];
+        if (d.kind == ast_decl.DECL_KIND_USE) { propose_path(ra, ?ra.sources, text, d.data.use_.path); }
+        or (d.kind == ast_decl.DECL_KIND_FWD) { propose_path(ra, ?ra.sources, text, d.data.fwd_.path); }
+        i = i + 1;
+    }
+}
+
+# a finished job's uses proposed, on the owner
+fun spread(ra: *ReadAhead, j: *Job) {
+    if (j.spread || j.tree == nil) { ret; }
+    j.spread = true;
+    spread_tree(ra, j.tree, j.text.data);
+}
+
+# the job in `slot` finished: its slot freed and its uses proposed
+fun job_done(ra: *ReadAhead, slot: u32) {
+    slot_free(ra, slot);
+    spread(ra, ra.jobs.data[ra.slot_job[slot]::usize]);
+}
+
+fun propose_path(ra: *ReadAhead, sources: *provider.Provider, text: str, path: base_source.Span) {
+    var at: base_source.Span = path;
+    for (at.len != 0 && front_path.prefix(text, at).len != 0) {
+        val res_fqn: res[str, A.Error] = front_path.path_text(ra.a, text, at);
+        if (sel res_fqn.err) { ret; }
+        val res_site: res[opt[str], fail.Fail] = provider.module_site(sources, ra.a, res_fqn.ok);
+        str_free(ra.a, res_fqn.ok);
+        if (sel res_site.err)     { ret; }
+        if (sel res_site.ok.some) { propose(ra, res_site.ok.some); }
+        at = front_path.prefix(text, at);
+    }
+}
+
+# the file at `path`, owned through the read-ahead's allocator, queued once
+fun propose(ra: *ReadAhead, path: str) {
+    var key:       str       = path;
+    val opt_known: opt[*u32] = map.get_by[str, u32](?ra.by_path, ?key);
+    if (sel opt_known.some) {
+        str_free(ra.a, path);
+        ret;
+    }
+    val res_job: res[*Job, A.Error] = A.allocate[Job](ra.a, 1);
+    if (sel res_job.err) {
+        str_free(ra.a, path);
+        ret;
+    }
+    val j: *Job = res_job.ok;
+    @j = Job{ra: ra, path: path, state: QUEUED, status: report_phase.accepted()};
+    val index:      u32                 = ra.jobs.len::u32;
+    val res_pushed: res[usize, A.Error] = collections_vector.push[*Job](?ra.jobs, j);
+    if (sel res_pushed.err) {
+        job_free(ra, j);
+        ret;
+    }
+    val res_indexed: res[bool, A.Error] = map.insert_by[str, u32](?ra.by_path, j.path, index);
+    if (sel res_indexed.err) { ret; }
+    val res_queued: res[usize, A.Error] = collections_vector.push[u32](?ra.pending, index);
+}
+
+# free the slots of jobs that finished, then hand pending jobs to free slots
+fun pump(ra: *ReadAhead) {
+    var drained: bool = true;
+    for (drained) {
+        val opt_index: opt[u32] = workers.finished_now(?ra.crew);
+        drained = false;
+        if (sel opt_index.some) {
+            job_done(ra, opt_index.some);
+            drained = true;
+        }
+    }
+    hand(ra);
+}
+
+# pending jobs handed to free slots, newest first
+fun hand(ra: *ReadAhead) {
+    for (ra.pending.len != 0 && ra.slots.len != 0) {
+        val index: u32 = ra.pending.data[ra.pending.len - 1];
+        collections_vector.truncate[u32](?ra.pending, ra.pending.len - 1);
+        val j: *Job = ra.jobs.data[index::usize];
+        if (atomic.load(?j.state) != QUEUED) { cnt; }
+        val slot: u32 = ra.slots.data[ra.slots.len - 1];
+        collections_vector.truncate[u32](?ra.slots, ra.slots.len - 1);
+        ra.slot_job[slot] = index;
+        if (!workers.submit(?ra.crew, slot, j::ptr, task_run)) {
+            slot_free(ra, slot);
+            ret;
+        }
+    }
+}
+
+fun slot_free(ra: *ReadAhead, slot: u32) {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[u32](?ra.slots, slot);
+}
+
+fun task_run(raw: ptr) {
+    val j:      *Job = raw::*Job;
+    var queued: i64  = QUEUED;
+    if (!atomic.cas(?j.state, ?queued, RUNNING)) { ret; }
+
+    $if (role.CHECKED) {
+        var own: [2]ptr = [2]ptr{(?j.names)::ptr, (?j.diags)::ptr};
+        role.permit(?own[0], 2);
+    }
+
+    job_run(j);
+    $if (role.CHECKED) { role.permit(nil, 0); }
+
+    atomic.store(?j.state, DONE);
+}
+
+# read, lex and parse the job's file, as the parse query would with no file id yet: the tree, the
+# names and the reports are the job's own
+fun job_run(j: *Job) {
+    val ra: *ReadAhead = j.ra;
+    heap.pool_source(?j.src, ra.spans);
+    val err_begun: err[A.Error] = heap.init(?j.hp, ?j.src, 0);
+    if (sel err_begun.err) { ret; }
+    j.heaped = true;
+    val err_wired: err[A.Error] = heap.allocator_owned(?j.ja, ?j.hp);
+    if (sel err_wired.err) { ret; }
+    j.names = intern.init(?j.ja);
+    j.diags = diagnostic.store_init(?j.ja);
+
+    val opt_text: opt[provider.Text] = provider.module_peek(?ra.sources, ?j.ja, j.path);
+    if (sel opt_text.none) { ret; }
+    j.read = true;
+    j.text = opt_text.some;
+    val res_tok: res[front_lexer.TokenStream, fail.Fail] = front_lexer.tokenize(j.text.data, ?j.ja, base_source.FILE_NIL);
+    if (sel res_tok.err) { ret; }
+    var stream: front_lexer.TokenStream = res_tok.ok;
+    fin { front_lexer.dnit(?stream, ?j.ja); }
+    val res_tree: res[*ast.Ast, A.Error] = A.allocate[ast.Ast](?j.ja, 1);
+    if (sel res_tree.err) { ret; }
+    j.tree  = res_tree.ok;
+    @j.tree = ast.init(?j.ja, base_source.FILE_NIL);
+    val err_lexed: err[fail.Fail] = front_lexer.emit_diagnostics(?stream, ?j.diags);
+    if (sel err_lexed.err) { ret; }
+    val res_parse: res[report_phase.PhaseStatus, state.ParseFail] = front_parser.parse(?stream, j.tree, ?j.names, ?j.diags);
+    if (sel res_parse.err) {
+        j.failed = true;
+        j.fatal  = res_parse.err;
+    }
+    or { j.status = res_parse.ok; }
+    j.usable = j.diags.lost == 0 && plain(?j.diags);
+}
+
+# the job's heap torn down whole, with everything on it
+fun heap_free(j: *Job) {
+    if (!j.heaped) { ret; }
+    val err_freed: err[A.Error] = heap.dnit(?j.hp);
+    j.heaped = false;
+    j.read   = false;
+    j.usable = false;
+    j.tree   = nil;
+}
+
+# whether every report the job holds is a bare one, which a merge places again exactly
+fun plain(diags: *diagnostic.DiagnosticStore) bool {
+    var i: usize = 0;
+    for (i < diags.items.len) {
+        val d: *diagnostic.Diagnostic = ?diags.items.data[i];
+        if (d.children.len != 0 || d.related.len != 0 || d.fixes.len != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the text the walk reads at `path`: what was read ahead, waiting for it if a thread is on it, or
+# none for the walk to read itself. the text stays the read-ahead's
+pub fun text_for(ra: *ReadAhead, path: str) opt[provider.Text] {
+    var key:       str       = path;
+    val opt_known: opt[*u32] = map.get_by[str, u32](?ra.by_path, ?key);
+    if (sel opt_known.none) { ret opt[provider.Text].none{}; }
+    val j: *Job = ra.jobs.data[(@opt_known.some)::usize];
+    pump(ra);
+    finished(ra, j);
+    if (!j.read) { ret opt[provider.Text].none{}; }
+    j.handed = true;
+    ret opt[provider.Text].some{provider.Text{data: j.text.data, owned: false}};
+}
+
+# the parse read ahead for the file at `path`, once the walk took its text, for the parse query to
+# merge and then `release`; none when there is none or it cannot be merged exactly
+pub fun parse_for(ra: *ReadAhead, path: str) opt[Taken] {
+    var key:       str       = path;
+    val opt_known: opt[*u32] = map.get_by[str, u32](?ra.by_path, ?key);
+    if (sel opt_known.none) { ret opt[Taken].none{}; }
+    val j: *Job = ra.jobs.data[(@opt_known.some)::usize];
+    if (!j.handed || j.taken || !j.usable) { ret opt[Taken].none{}; }
+    j.taken = true;
+    ret opt[Taken].some{Taken{tree: j.tree, names: ?j.names, diags: ?j.diags, status: j.status, fatal: j.fatal, failed: j.failed}};
+}
+
+# what was read ahead for the file at `path` given back once its parse was merged, the tree, names
+# and reports the merge copied going with the job's heap
+pub fun release(ra: *ReadAhead, path: str) {
+    var key:       str       = path;
+    val opt_known: opt[*u32] = map.get_by[str, u32](?ra.by_path, ?key);
+    if (sel opt_known.some) { heap_free(ra.jobs.data[(@opt_known.some)::usize]); }
+}
+
+# `j` run to the end: on the owner when no thread took it, else waited for
+fun finished(ra: *ReadAhead, j: *Job) {
+    var queued: i64 = QUEUED;
+    if (atomic.cas(?j.state, ?queued, RUNNING)) {
+        job_run(j);
+        atomic.store(?j.state, DONE);
+        spread(ra, j);
+        hand(ra);
+        ret;
+    }
+    for (atomic.load(?j.state) != DONE) {
+        val opt_index: opt[u32] = workers.finished(?ra.crew);
+        if (sel opt_index.none) { ret; }
+        job_done(ra, opt_index.some);
+        hand(ra);
+    }
+}

@@ -1,0 +1,210 @@
+# agreement: one package pinned at one commit across a whole dependency closure. every
+# project of the closure records the commits of the dependencies it declares, so two
+# projects, one reached through a path dependency, can pin the same package differently
+# and a build would mix two versions of it with nothing saying so. identity is the
+# dependency key, which the closure already holds equal to the dependency's project id.
+# pins are compared among declarations that select the same source and ref: declarations
+# that select differently are the root's override or a conflict, which the closure walk
+# already notes or refuses, and a version range is reconciled by resolution, so a
+# requirer's pin of it is only a seed
+use collections_vector: std.collections.vector;
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.vector.Vector;
+use std_format: std.format;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_is_empty;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+
+use mach.base.diagnostic;
+use manifest_load: mach.manifest.load;
+use mach.package;
+use package_closure: mach.package.closure;
+use mach.package.report;
+
+# the first pin seen for an identity: the commit, and the gitlink that records it
+rec Seen {
+    commit: str;
+    place:  str;
+}
+
+# one line per pin that differs from the first one seen for its identity, in closure order
+# ---
+# op:   the operation
+# reqs: the realized closure
+# out:  receives the lines, owned by `op.a`; free with `lines_dnit`
+# ret:  err naming the first failure to read a manifest or a pin
+pub fun disagreements(op: *package_closure.Operation, reqs: *Vector[package_closure.Request], out: *Vector[str]) err[fail.Fail] {
+    val a:    *A.Allocator   = op.a;
+    var seen: Map[str, Seen] = map.init[str, Seen](a);
+    var keep: Vector[str]    = collections_vector.init[str](a);
+    fin {
+        var i: usize = 0;
+        for (i < keep.len) {
+            str_free(a, keep.data[i]);
+            i = i + 1;
+        }
+        collections_vector.dnit[str](?keep);
+        map.dnit[str, Seen](?seen);
+    }
+
+    val err_root: err[fail.Fail] = project_pins(op, op.root, ?seen, ?keep, out);
+    if (sel err_root.err) { ret err_root; }
+    var i: usize = 0;
+    for (i < reqs.len) {
+        val r: *package_closure.Request = ?reqs.data[i];
+        i = i + 1;
+        var dir: str = r.src_path;
+        if (r.is_git) {
+            val res_full: res[str, fail.Fail] = package.dep_full_of(a, op.root, r.id);
+            if (sel res_full.err) { ret err[fail.Fail].err{res_full.err}; }
+            val err_held: err[fail.Fail] = kept(a, ?keep, res_full.ok);
+            if (sel err_held.err) { ret err_held; }
+            dir = res_full.ok;
+        }
+        val err_read: err[fail.Fail] = project_pins(op, dir, ?seen, ?keep, out);
+        if (sel err_read.err) { ret err_read; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the refusal of a closure that pins a package at more than one commit, ok when `lines` is
+# empty: every line past the first is reported to the operation's report and the first is the
+# failure, so every command that walks a closure refuses a disagreement alike
+pub fun refused(op: *package_closure.Operation, lines: *Vector[str]) err[fail.Fail] {
+    if (lines.len == 0) { ret err[fail.Fail].ok{}; }
+    var k: usize = 1;
+    for (k < lines.len) {
+        report.fault(op.rep, fail.user(diagnostic_kind.DEP_CONFLICT, lines.data[k]));
+        k = k + 1;
+    }
+    val res_first: res[str, fail.Fail] = diagnostic.text_retain(op.s.interner, lines.data[0]);
+    if (sel res_first.err) { ret err[fail.Fail].err{res_first.err}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_CONFLICT, res_first.ok)};
+}
+
+# free every line in a vector and then the vector itself
+# ---
+# a:     the allocator that owns the lines
+# lines: the vector to release
+pub fun lines_dnit(a: *A.Allocator, lines: *Vector[str]) {
+    var i: usize = 0;
+    for (i < lines.len) {
+        str_free(a, lines.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[str](lines);
+}
+
+# take ownership of `s` so it outlives the walk, or the refusal of the list, `s` then released
+fun kept(a: *A.Allocator, keep: *Vector[str], s: str) err[fail.Fail] {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[str](keep, s);
+    if (sel res_pushed.err) {
+        str_free(a, s);
+        ret err[fail.Fail].err{fail.refused(res_pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a copy of `s` the walk keeps, or the refusal to copy or keep it
+fun kept_copy(a: *A.Allocator, keep: *Vector[str], s: str) res[str, fail.Fail] {
+    val res_copied: res[str, A.Error] = str_dup(a, s);
+    if (sel res_copied.err) { ret res[str, fail.Fail].err{fail.refused(res_copied.err)}; }
+    val err_held: err[fail.Fail] = kept(a, keep, res_copied.ok);
+    if (sel err_held.err) { ret res[str, fail.Fail].err{err_held.err}; }
+    ret res[str, fail.Fail].ok{res_copied.ok};
+}
+
+# the pins the project at `dir` records for the dependencies its manifest takes from git,
+# each checked against the first pin seen for its identity. a project in no place that
+# records pins records none
+fun project_pins(op: *package_closure.Operation, dir: str, seen: *Map[str, Seen], keep: *Vector[str],
+    out: *Vector[str]) err[fail.Fail] {
+    val a:          *A.Allocator         = op.a;
+    val res_inside: res[bool, fail.Fail] = op.pins.tracked(op.pins.ctx, dir);
+    if (sel res_inside.err) { ret err[fail.Fail].err{res_inside.err}; }
+    if (!res_inside.ok)     { ret err[fail.Fail].ok{}; }
+    val res_path: res[str, A.Error] = types_path.join(a, dir, manifest_load.MANIFEST_FILE);
+    if (sel res_path.err) { ret err[fail.Fail].err{fail.refused(res_path.err)}; }
+    val path: str = res_path.ok;
+    fin { str_free(a, path); }
+    val res_doc: res[manifest_load.Doc, fail.Fail] = package_closure.parse_file(a, op.s.sources, path);
+    if (sel res_doc.err) { ret err[fail.Fail].err{res_doc.err}; }
+    var doc: manifest_load.Doc = res_doc.ok;
+    fin { manifest_load.doc_dnit(a, ?doc); }
+    val opt_deps: opt[*toml_value.Table] = toml_lookup.get_table(?doc.table, "dep");
+    if (sel opt_deps.none) { ret err[fail.Fail].ok{}; }
+    val deps: *toml_value.Table = opt_deps.some;
+    val n:    usize             = toml_lookup.table_len(deps);
+    var i:    usize             = 0;
+    for (i < n) {
+        val opt_key: opt[str] = toml_lookup.table_key(deps, i);
+        if (sel opt_key.none) { brk; }
+        val key:       str                    = opt_key.some;
+        val opt_value: opt[*toml_value.Value] = toml_lookup.table_value(deps, i);
+        if (sel opt_value.none) { brk; }
+        val value: *toml_value.Value = opt_value.some;
+        i = i + 1;
+        if (value.tag != toml_value.TYPE_TABLE) { cnt; }
+        val url: str = package_closure.key_text(?value.data.table, "git");
+        if (str_is_empty(url))                                                     { cnt; }
+        if (!str_is_empty(package_closure.key_text(?value.data.table, "version"))) { cnt; }
+        val res_pin: res[opt[str], fail.Fail] = op.pins.read(op.pins.ctx, dir, key);
+        if (sel res_pin.err) { ret err[fail.Fail].err{res_pin.err}; }
+        val opt_pin: opt[str] = res_pin.ok;
+        if (sel opt_pin.none) { cnt; }
+        val res_commit: res[str, fail.Fail] = kept_copy(a, keep, opt_pin.some);
+        str_free(op.s.build_alloc, opt_pin.some);
+        if (sel res_commit.err) { ret err[fail.Fail].err{res_commit.err}; }
+        val commit:   str                 = res_commit.ok;
+        val res_full: res[str, fail.Fail] = package.dep_full_of(a, dir, key);
+        if (sel res_full.err) { ret err[fail.Fail].err{res_full.err}; }
+        val err_full_held: err[fail.Fail] = kept(a, keep, res_full.ok);
+        if (sel err_full_held.err) { ret err_full_held; }
+        val res_kept_copy: res[str, fail.Fail] = kept_copy(a, keep, key);
+        if (sel res_kept_copy.err) { ret err[fail.Fail].err{res_kept_copy.err}; }
+        val id: str = res_kept_copy.ok;
+
+        # one repository spelled relative to two manifests is one group
+        val res_source: res[str, fail.Fail] = package.git_source(a, dir, url);
+        if (sel res_source.err) { ret err[fail.Fail].err{res_source.err}; }
+        val res_group: res[str, std_format.FormatError] = std_format.sprint(a, "{}\n{}\n{}", key, res_source.ok, package_closure.key_text(?value.data.table, "ref"));
+        str_free(a, res_source.ok);
+        if (sel res_group.err) { ret err[fail.Fail].err{fail.format_refused(res_group.err)}; }
+        val err_group_held: err[fail.Fail] = kept(a, keep, res_group.ok);
+        if (sel err_group_held.err) { ret err_group_held; }
+        val group:     str        = res_group.ok;
+        val opt_first: opt[*Seen] = map.get[str, Seen](seen, ?group);
+        if (sel opt_first.none) {
+            val res_put: res[bool, A.Error] = map.insert[str, Seen](seen, group, Seen{commit: commit, place: res_full.ok});
+            if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+            cnt;
+        }
+        if (str_equals(opt_first.some.commit, commit)) { cnt; }
+        val res_line: res[str, std_format.FormatError] = std_format.sprint(a,
+            "dependency '{}' is pinned at two commits, {} at {} and {} at {}. pin it at one commit across the closure",
+            id, opt_first.some.commit, opt_first.some.place, commit, res_full.ok);
+        if (sel res_line.err) { ret err[fail.Fail].err{fail.format_refused(res_line.err)}; }
+        val res_pushed: res[usize, A.Error] = collections_vector.push[str](out, res_line.ok);
+        if (sel res_pushed.err) {
+            str_free(a, res_line.ok);
+            ret err[fail.Fail].err{fail.refused(res_pushed.err)};
+        }
+    }
+    ret err[fail.Fail].ok{};
+}

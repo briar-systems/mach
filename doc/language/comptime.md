@@ -1,46 +1,47 @@
 # Comptime channel
 
-The `$` prefix opens the **comptime channel** — the compiler-owned namespace a
+The `$` prefix opens the **comptime channel**, the compiler-owned namespace a
 program reads at compile time. It is read-only: `$` *selects and expands*, it
-never executes or mutates. Everything that touches comptime in Mach —
-conditional compilation, intrinsics, target queries — uses one of the shapes on
+never executes or mutates. Everything that touches comptime in Mach
+(conditional compilation, intrinsics, target queries) uses one of the shapes on
 this channel.
 
 ## The shapes
 
 | Shape | Meaning | Direction |
 |---|---|---|
-| `$mach.*` / `$project.*` / `$bin.*` | Rooted compiler-owned read | compiler → developer |
-| `$sym(args)` | Comptime function call (intrinsic) | call |
+| `$mach.*` / `$project.*` / `$bin.*` | Rooted compiler-owned read | compiler to developer |
+| `$<name>(args)` | Comptime function call (intrinsic) | call |
 | `$if`, `$or` | Comptime control flow | structural |
 
-> Per-declaration codegen attributes (symbol rename, library pin, inline,
+> Per-declaration codegen properties (symbol rename, library pin, inline,
 > align, section) are written as **`#[...]` decorators**, not `$`-comptime
-> shapes — see [decorators.md](decorators.md). A comptime directive takes no
-> `=`; a stray one is a parse error at the directive's terminator.
+> shapes. See [decorators.md](decorators.md). A comptime directive takes no
+> `=`, and a stray one is a parse error at the directive's terminator.
 
 The parser distinguishes these by structure:
 
 - `$<root>.<path>`, where `<root>` is one of the reserved roots `mach`,
-  `project`, `bin` — a read into a compiler-owned tree. The roots are reserved
-  at the top of `$`; user symbols cannot collide with them.
-- `$ident(args)` — comptime call; the closed compiler-intrinsic set lives
+  `project`, `bin`, is a read into a compiler-owned tree. The roots are reserved
+  at the top of `$`, so user symbols cannot collide with them.
+- `$<name>(args)` is a comptime call. The closed compiler-intrinsic set lives
   here.
-- `$if` / `$or` — comptime branches, structurally distinct from runtime
+- `$if` / `$or` are comptime branches, structurally distinct from runtime
   `if` / `or`.
 
 ## Compiler-owned roots
 
 | Root | Reads | Source |
 |---|---|---|
-| `$mach.*` | resolved build os/arch/abi/mode tags, pointer width, compiler identity | active build + compiler |
+| `$mach.*` | resolved build sys/arch/abi/mode tags, pointer width, compiler identity | active build + compiler |
 | `$mach.project.{id,version}` | the **owning** project's metadata | `[project]` in the `mach.toml` of the project that owns the module |
 | `$mach.project.version.{major,minor,patch}` | its structured version components | that `[project].version` |
 | `$mach.source.{file,line,module}` | the module's project-relative file, the line, the module name | the module |
 | `$project.{id,version}` | the **root** project's metadata | `[project]` in the root `mach.toml` |
 | `$project.version.{major,minor,patch}` | structured version components | the root's `[project].version` |
-| `$project.target.{os,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
+| `$project.target.{sys,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
 | `$bin.name` | the artifact being built | the selected build unit (`[artifact.*]`) |
+| `$bin.kind` | that artifact's kind, as the manifest spells it | its `kind` key |
 
 Two roots read a project's identity, and they differ in which project:
 
@@ -58,68 +59,93 @@ dependency's own, so a library that reports its version reads
 
 `$project.target.*` carries the manifest's declared **string** spellings
 (`"linux"`, `"x86_64"`, `"sysv64"`), distinct from `$mach.build.*`'s numeric tags
-used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whole
-version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
-patch}` folds its integer components — both are available. `[project]` has
-exactly the keys `id`, `version`, `mach`, `src`, and `out`
+used for `$mach.{sys,arch,abi}.*` comparison. The v6 spelling
+`$project.target.os` is refused naming `$project.target.sys`, which
+`mach migrate` writes. Flat `$project.version` is the whole
+version **string** (`"2.0.0"`), and the structured `$project.version.{major,minor,
+patch}` folds its integer components. Both are available. `[project]` has
+exactly the keys `id`, `version`, `mach`, `src`, and `work`
 ([manifest.md](manifest.md#project)), and `$project.*` carries exactly `id`
 and `version`. A path the root does not carry, `$project.name` and
-`$project.description` included, reports `` unknown `$project.*` path `` at
-the path. See
+`$project.description` included, reports `` unknown `$project.*` path ``
+(`comptime.path_unknown`) at the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
 `$bin.name` is the table key of the artifact the module is compiled for. A build
 compiles one artifact, and a test build tests one, so every module reads that
-artifact's key. An editor
+artifact's key, a dependency's modules included. An editor
 session analyzes the project as the union of every artifact, and there a module
 reads the artifact whose walk reached it first: the primary artifact when its
 walk reaches the module, otherwise the first artifact in manifest order that
-does; a module first reached behind a gate decided later reads its importer's.
+does. A module first reached behind a gate decided later reads its importer's.
+
+`$bin.kind` is the `kind` of that same artifact as a string, spelled as the
+manifest spells it: `"bin"`, `"shared"`, `"static"`, `"object"` or
+`"module"`. It is set per artifact exactly as `$bin.name` is, so under the
+editor's union, and under `mach test` with several artifacts selected, a module
+reads the kind of the artifact whose name it reads. A single file built outside a
+project is an executable named after the file: `mach build tool.mach` reads
+`"tool"` and `"bin"`. A project that declares no artifact is refused before any
+module is read (`artifact.none_declared`), by `mach build`, `mach check` and
+`mach test` alike. Where a module is analyzed with no artifact selected, reading
+either reports `comptime.path_unavailable`.
+
+```mach fragment
+$if ($bin.kind == "shared") { ... }               # only in a shared library
+```
 
 ```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version
-$if ($project.target.os == "windows") { ... }    # the declared os string
+$if ($project.target.sys == "windows") { ... }    # the declared sys string
 ```
 
 ## The bare `$ident` is rejected
 
-A standalone bare `$ident` — `$mode`, `$foo` — is **none** of the shapes above
-and is rejected with one teaching diagnostic, owned by the comptime evaluator:
+A standalone bare `$ident` such as `$mode` or `$foo` is **none** of the shapes
+above and is rejected with one teaching diagnostic, `comptime.path_root`, owned
+by the comptime evaluator:
 
-> comptime parameters are referenced without `$`; comptime paths are rooted:
-> `` $mach ``, `` $project ``, `` $bin ``
+> comptime parameters are referenced without `$`. a comptime path starts at
+> `$mach`, `$project` or `$bin`
 
-A comptime **parameter** is referenced by its bare name (no `$`); every comptime
-**path** is rooted. The rule applies identically in a `$if` gate and in value
-position — sema and lowering both defer to the evaluator's single verdict rather
-than each carrying their own.
+A comptime **parameter** is referenced by its bare name (no `$`), and every
+comptime **path** is rooted. The rule applies identically in a `$if` gate and in
+value position. Sema and lowering both defer to the evaluator's single verdict
+rather than each carrying their own.
 
 ## Which binding a name denotes
 
 An identifier in the comptime channel denotes the declaration it resolves to,
-under the ordinary scoping rules — never whichever binding happens to share its
+under the ordinary scoping rules, never whichever binding happens to share its
 spelling. A block-scoped binding shadows an outer one of the same name here
 exactly as it does at runtime:
 
-```mach error array length is not a comptime constant
+```mach error the array length must be a comptime constant
 val N: i64 = 9;
 
 fun f(k: i64) i64 {
     val N:  i64 = k; # shadows the module constant
-    var xs: [N]i64; # error: array length is not a comptime constant
+    var xs: [N]i64; # error: the array length must be a comptime constant
     ret xs[0];
 }
 ```
 
 The inner `N` is decided at runtime, so it has no comptime value, and the
 constant it shadows is not what the expression names. Reading such a name in a
-comptime position is refused:
+comptime position is refused, here as `array.length_not_const` with the reason
+in parentheses:
 
 > identifier names a runtime binding, so it has no comptime value
 
-A binding marked `$` — a comptime value parameter, an `$each` loop variable —
+A binding marked `$`, a comptime value parameter or an `$each` loop variable,
 *is* a comptime binding, and shadows an outer name of its own spelling in the
-same way. Inside the `$each` below the name `N` is the element, not the 9:
+same way. It holds a value only where its instance or iteration binds one, so a
+comptime parameter sizes a type in each instance of its function's body (see
+[fun.md](fun.md)), and a module constant read inside that body, or by another
+constant's initializer, still reads the constant, whatever binding shares its
+spelling. An `$each` loop variable over a constant array sizes a type in each
+iteration the same way. Inside the `$each` below the name `N` is the element,
+not the 9:
 
 ```mach
 use std.print;
@@ -145,26 +171,28 @@ fun main(argc: i64, argv: **u8) i64 {
 
 - No reflection-via-`$<Type>.*` subtree. Types are not first-class
   comptime values.
-- No decl-attached prefix sugar (`$inline pub fun ...` does not exist) —
-  use `#[...]` decorators (see [decorators.md](decorators.md)).
-- No comptime function definitions, and no comptime *execution* — the channel
+- No decl-attached prefix sugar (`$inline pub fun ...` does not exist). Use
+  `#[...]` decorators (see [decorators.md](decorators.md)).
+- No comptime function definitions, and no comptime *execution*. The channel
   selects and expands, it never runs a loop or mutates state. `$each` is not a
   counterexample: it splices its body once per element of a fixed comptime
   sequence (a variadic pack, `$fields(T)`, or a constant array `val`), a bounded
   structural expansion resolved at compile time, not an iterated computation.
-- No compile-time evaluation of user functions, ever: a call in a `val`
-  initializer is a runtime call. A lookup table is committed as generator
+- No compile-time evaluation of user functions, ever: a call in a local `val`
+  initializer is a runtime call, and a call in a module-scope `val` initializer
+  is refused as `global.init_not_constant` ("function calls are not
+  comptime-evaluable"). A lookup table is committed as generator
   output next to its generator and held to it by a `test` (equality with the
   generator when it is deterministic, the property it searched for when it is
   randomised, and no startup fallback that repairs a bad constant before the
-  test sees it), or built at startup into a module-private `var`; a
+  test sees it), or built at startup into a module-private `var`. A
   module-scope `val` lands in read-only data.
-- No bare `$ident` — see above.
+- No bare `$ident`. See above.
 
 ## See also
 
-- [comptime-mach.md](comptime-mach.md) — the `$mach.*` namespace
-- [decorators.md](decorators.md) — `#[...]` codegen decorators
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`,
-  `$is_record`, `$type_name`, …
-- [comptime-control.md](comptime-control.md) — `$if` / `$or`
+- [comptime-mach.md](comptime-mach.md): the `$mach.*` namespace
+- [decorators.md](decorators.md): `#[...]` codegen decorators
+- [comptime-intrinsics.md](comptime-intrinsics.md): `$size_of`,
+  `$is_record`, `$type_name`, ...
+- [comptime-control.md](comptime-control.md): `$if` / `$or`

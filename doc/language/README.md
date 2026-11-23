@@ -1,24 +1,24 @@
 # Mach language reference
 
-Per-element reference docs. Each file covers one language component;
-read the index below or follow `see also` links to navigate.
+Per-element reference docs. Each file covers one language component.
+Read the index below or follow `see also` links to navigate.
 
-This directory is the authoritative reference for the Mach 5 dialect. Each
-file is a focused doc with grammar, examples, and neighboring links; start
-from the index below.
+This directory is the reference for the Mach language. Each file is a focused
+doc with grammar, examples, and neighboring links. Start from the index below.
 
 ## Files and structure
 
-- [files.md](files.md) — extensions, `lib.mach` / `main.mach` conventions
-- [modules.md](modules.md) — module tree, path separator, shadow-module pattern
-- [use.md](use.md) — imports
-- [fwd.md](fwd.md) — re-exports
+- [files.md](files.md) - extensions, the `src/bin/` / `src/lib/` entry conventions
+- [modules.md](modules.md) - module tree, path separator, shadow-module pattern
+- [use.md](use.md) - imports
+- [fwd.md](fwd.md) - re-exports
 
 ## Declarations
 
-- [visibility.md](visibility.md) — `pub` and `ext` modifiers
-- [decorators.md](decorators.md) — codegen decorators, `#[name]` (`symbol`, `library`, `inline`, `align`, `section`, `embed`)
-- [def.md](def.md) — type alias
+- [visibility.md](visibility.md) - `pub` and `ext` modifiers
+- [decorators.md](decorators.md) - decorators, `#[<name>]`, and where each one applies
+- [gpu.md](gpu.md) - the GPU decorators: pipeline stages, the shader interface, target handles and instructions
+- [def.md](def.md) - type alias
 - [rec.md](rec.md) - record
 - [uni.md](uni.md) - raw union
 - [tag.md](tag.md) - tagged value
@@ -44,44 +44,49 @@ from the index below.
 
 - [comptime.md](comptime.md) - channel overview
 - [comptime-mach.md](comptime-mach.md) - $mach.* compiler-owned namespace
-- [decorators.md](decorators.md) - codegen decorators, #[name] (replaces the removed $sym.attr setters)
-- [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $length_of, $align_of, $offset_of, $type_of, $fields, $cases, $is_tag, $discriminant_of, $pointee_of, $is_record, $is_union, $is_pointer, $is_integer, $is_float, $is_secret, $holds_secret, $type_name, $each, $error
+- [comptime-intrinsics.md](comptime-intrinsics.md) - the `$<name>(...)` intrinsics and `$each`
 - [comptime-control.md](comptime-control.md) - $if / $or
 
 ## Low-level
 
-- [asm.md](asm.md) — inline assembly
-- [policy.md](policy.md) — compiler vs stdlib boundary
+- [asm.md](asm.md) - inline assembly
+- [policy.md](policy.md) - compiler vs stdlib boundary
 
 ## Diagnostics
 
-- [diagnostics.md](diagnostics.md) — diagnostic keys, the code registry and its never-reused rule
-- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics=json`, the versioned NDJSON record schema
+- [diagnostics.md](diagnostics.md) - diagnostic keys, the code registry and its never-reused rule
+- [report-records.md](report-records.md) - `--report json` and `--report lines`, the versioned record schema
+- [readout.md](readout.md) - what `-v` and `-vv` show for build, check and test, on which stream, and when
 
 ## Formal grammar
 
-- [grammar.md](grammar.md) — full EBNF grammar of the implemented dialect,
+- [grammar.md](grammar.md) - full EBNF grammar of the implemented dialect,
   derived from the lexer and parser
 
 ## Conventions
 
-- [documentation.md](documentation.md) — docstring style for functions,
+- [documentation.md](documentation.md) - docstring style for functions,
   types, modules, and values
-- The ```` ```mach ```` blocks on these pages are compiled by `test/run.sh --docs`.
-  A plain block compiles, and runs when it declares a main. ```` ```mach fragment ````
-  marks a block that is not a whole program, and ```` ```mach error <text> ```` a block
-  whose compile fails with `<text>` in the output. A block showing several files starts
-  each with `# file: src/<path>.mach`, in a project whose id is `example`. See
-  [test/README.md](../../test/README.md#doc-blocks).
+- The ```` ```mach ```` blocks on these pages are illustrations and are not compiled.
+  ```` ```mach fragment ```` marks a block that is not a whole program, and
+  ```` ```mach error <text> ```` a block whose compile fails with `<text>`. A block showing
+  several files starts each with `# file: src/<path>.mach`, in a project whose id is
+  `example`.
 
 ## Build system
 
-- [manifest.md](manifest.md) — the `mach.toml` manifest reference
-- [ir-output.md](ir-output.md) — `--emit-ir` and its two forms, and which one is stable for tooling
-- `mach --help` and `mach help <command>` — the command-line reference
+- [manifest.md](manifest.md) - the `mach.toml` manifest reference
+- [dependencies.md](dependencies.md) - how dependencies are resolved, pinned and verified
+- [build.md](build.md) - which targets, profiles and artifacts a command builds
+- [ir-output.md](ir-output.md) - `--emit ir`, which writes mirl's text of each module
+- `mach --help` and `mach help <command>` - the command-line reference
 
 The supported, source-stable surface of the compiler is the editor API
-(`mach.lang.editor`, documented by its docstrings and rendered by
+(`mach.editor`, documented by its docstrings and rendered by
 `mach doc`), the command line, and the manifest schema. Everything else
 under `src/` is internal. Source API authors can mark deprecated declarations with
 [`#[deprecated]`](decorators.md#deprecated--deprecatedstr--source-use-notice), which warns on external use.
+
+## Migration
+
+- [migrate.md](migrate.md) - `mach migrate` and the changes from 6 to 7

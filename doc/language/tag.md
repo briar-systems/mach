@@ -4,7 +4,7 @@ A `tag` is a discriminated aggregate value that represents exactly one active
 case at any moment. Each case has a name and either one explicitly typed payload
 or no payload at all.
 
-This page is the tagged-value contract (#3217): declarations with an
+This page is the tagged-value contract: declarations with an
 explicit discriminator, `Type.case{payload}` construction, `sel` case tests,
 lexical payload guards, the debug-profile discriminator trap, checked layout
 and the reflection intrinsics. There is no flow-sensitive analysis, no `try`
@@ -93,7 +93,7 @@ case takes empty braces. There is no other construction form:
 - The record-literal form (`Reply{value: 1}` or `Reply{empty}`) is a compile error
 - A case selector alone (`Reply.value`) is not a value
 
-```mach error this tag case requires a payload
+```mach error this tag case needs a payload
 tag Reply: u8 { empty; value: i64; }
 
 val missing: Reply = Reply.value{}; # the case declares a payload
@@ -142,11 +142,11 @@ pub tag opt[T]:    u8 { none; some: T; }
 pub tag err[E]:    u8 { err: E; ok; }
 ```
 
-- `res[T, E]` is either an error of type `E` or a value of type `T`; `err: E` is
+- `res[T, E]` is either an error of type `E` or a value of type `T`. `err: E` is
   the first declared case and `ok: T` the second.
-- `opt[T]` is either absence or a value of type `T`; payloadless `none` is
+- `opt[T]` is either absence or a value of type `T`. Payloadless `none` is
   first and `some: T` second.
-- `err[E]` is either an error of type `E` or payloadless success; `err: E` is
+- `err[E]` is either an error of type `E` or payloadless success. `err: E` is
   first and payloadless `ok` second. It is distinct from `opt[E]`, not an alias.
 
 There is no defaulted type argument, general type inference, dummy success
@@ -159,14 +159,14 @@ use std.types.result.res;
 
 tag ParseError: u8 { invalid; overflow; }
 
-val good: res[i64, ParseError] = res[i64, ParseError].ok{42};
-val bad:  res[i64, ParseError] = res[i64, ParseError].err{ParseError.invalid{}};
+val res_good: res[i64, ParseError] = res[i64, ParseError].ok{42};
+val res_bad:  res[i64, ParseError] = res[i64, ParseError].err{ParseError.invalid{}};
 
-val present: opt[i64] = opt[i64].some{42};
-val absent:  opt[i64] = opt[i64].none{};
+val opt_present: opt[i64] = opt[i64].some{42};
+val opt_absent:  opt[i64] = opt[i64].none{};
 
-val finished: err[ParseError] = err[ParseError].ok{};
-val failed:   err[ParseError] = err[ParseError].err{ParseError.overflow{}};
+val err_finished: err[ParseError] = err[ParseError].ok{};
+val err_failed:   err[ParseError] = err[ParseError].err{ParseError.overflow{}};
 ```
 
 Default initialization of `opt[T]` selects `none`. Default initialization of
@@ -174,9 +174,9 @@ both `res[T, E]` and `err[E]` selects `err` with a zero-initialized error
 payload. The case names `ok`, `err`, `some` and `none` are members of their
 tags, not keywords.
 
-Their layouts and closed case sets are part of std's SemVer contract; they ship
-in std 2.0.0 paired with Mach 5.0.0. They are std declarations like any other:
-the compiler has no knowledge of the three names, they resolve only through an
+Their layouts and closed case sets are part of std's SemVer contract. They first
+shipped in std 2.0.0 paired with Mach 5.0.0. They are std declarations like any
+other: the compiler has no knowledge of the three names, they resolve only through an
 import or a declaration in scope, and a module may declare its own `res`, `opt`
 or `err` as a tag or as anything else. Declaring one twice in a module is the
 ordinary duplicate definition. A module that spells `res` without importing it
@@ -213,9 +213,9 @@ The operand is a place: a binding, a field, an index or a dereference, followed
 by exactly one case name of that place's tag type. A pointer to a tag is a place
 too: `sel p.case` with `p: *Reply` auto-dereferences the pointer once and tests
 its pointee, exactly as the payload place `p.value` already reads through it. A
-call or other temporary is not a place. The result is an ordinary `bool`, so it
-composes with `!`, `&&` and `||`, can initialize a `bool` binding, and can be
-returned.
+call or other temporary is not a place. The result is a `u1`, the type of std's
+`bool`, so it composes with `!`, `&&` and `||`, can initialize a `bool` binding,
+and can be returned.
 
 ```mach
 use std.types.bool.bool;
@@ -237,7 +237,7 @@ fun tests(reply: Reply, next: opt[i64], a: opt[i64], b: opt[i64]) bool {
 
 `sel` takes a place, so a call result is refused:
 
-```mach error `sel` tests a place
+```mach error `sel` needs a place
 tag Reply: u8 { empty; value: i64; }
 
 fun make() Reply {
@@ -259,8 +259,8 @@ refuses one.
 gate on a module `val` constructed with `C.case{...}` tests the constant's
 selected case, guards `C.case` in its arm the same way a runtime chain arm
 does, and its payload reads fold to the constant payload. A comptime `sel` on
-anything that is not a constant tag element (a parameter, a local, a module
-`var`, or a constant of another module) is rejected with a located diagnostic
+anything that is not a constant tag element (a parameter, a local, or a module
+`var`) is rejected with a located diagnostic
 at the condition, and a payload read of a case the constant does not hold is a
 compile-time error rather than the runtime undefined behavior, because comptime
 state is never stale.
@@ -284,6 +284,28 @@ fun read_value(reply: Reply) i64 {
 }
 ```
 
+A chain's final bare `or` stands where that remainder does: when every arm before
+it tests one place with `sel`, `!sel` or a `||` of `sel` tests, and they leave one
+case untested, the `or` body is guarded for that case, whether or not the arms
+exit. An arm `sel P.a || sel P.b` tests both cases. It opens no guard in its own
+block, but the arms after it know neither case holds.
+
+```mach
+tag Shape: u8 { dot; line: i64; square: i64; }
+
+fun size(s: Shape) i64 {
+    if (sel s.dot) {
+        ret 0;
+    }
+    or (sel s.line) {
+        ret s.line;
+    }
+    or {
+        ret s.square * s.square; # the one case the arms left untested
+    }
+}
+```
+
 A payload read outside a guard is a compile error:
 
 ```mach error a tag payload requires a `sel` guard
@@ -298,15 +320,19 @@ Inside a condition, the right operand of `&&` is guarded by a `sel P.c` that is
 its left operand, because `&&` short-circuits. `||`, `!` and every other
 operator open no guard.
 
+A chain whose arms test one place this way and leave no case untested always
+enters one of its arms, so it needs no bare `or` to close it, and a function
+that returns from every arm does not reach the end of its body (see
+[fun.md](fun.md#a-body-with-a-result-ends-in-ret)).
+
 A guard is matched by spelling, so a guarded place must be a path of
-identifiers, fields, dereferences and indexes by a name or a literal, `sel`
-rejects anything else, and reassigning an index binding inside the guard is not
-tracked and leaves the debug-profile discriminator check as the only net.
+identifiers, fields, dereferences and indexes by a name or a literal, and `sel`
+rejects anything else.
 
 Inside a guard the payload place is ordinary storage: reading it copies under
 the existing value rules, writing it keeps the selected case, and `?value.case`
 yields a typed pointer to naturally aligned storage. Whole-value assignment to
-the guarded place is a compile error; rebind to a new name instead.
+the guarded place is a compile error. Rebind to a new name instead.
 
 ```mach error cannot assign to this place inside a guard
 tag Reply: u8 { empty; value: i64; }
@@ -323,22 +349,54 @@ fun reset(reply: Reply) i64 {
 
 The check covers the guarded place and every object it is reached through by
 value (`b.r = ...` under `sel b.r.value` is refused too). A pointer ends that
-chain: under `sel p.value` with `p: *Reply`, reassigning `p` or writing
-`@p = ...` is not tracked, because the guard covers the storage the pointer
-reached when the test ran, and a write through a pointer is the ordinary
-raw-memory obligation below.
+chain: under `sel p.value` with `p: *Reply`, writing `@p = ...` is not tracked,
+because a write through a pointer is the ordinary raw-memory obligation below,
+and reassigning `p` ends the guard as the next paragraph says.
+
+Assigning anything else the place's spelling names is allowed and ends the
+guard: a name standing as an index or a range count (`i` under
+`sel items[i].value`), a pointer the place is reached through (`p` under
+`sel p.value`), or a range over an object the place indexes. From there on the
+spelling may name a tag no `sel` tested, so a payload read after the assignment
+is refused with `tag.payload_unguarded`. After the assignment means the rest of
+the region past it, also when it sits in a nested `if` that may not have run;
+the whole of a loop that holds it, condition included, when the guard opened
+outside that loop, because a later iteration runs after an earlier one's
+assignment; and a `fin` body when the rest of the fin's block holds it, because
+the fin replays when the block ends. A guard opened inside a loop body is tested
+again on every iteration, so an `i = i + 1` that closes such a body ends nothing
+a later read relies on. Read the payload before the assignment, bind it to a name
+across it, or test the case again after it. A name changed through a pointer to
+it, such as `?i` handed to a call, is not tracked, because the language does not
+track what a pointer can reach.
+
+```mach error the guard for this payload ended
+tag Reply: u8 { empty; value: i64; }
+
+fun second(replies: *Reply) i64 {
+    var i: u64 = 0;
+    if (sel replies[i].value) {
+        i = i + 1;
+        ret replies[i].value; # replies[i] is now an element no `sel` tested
+    }
+    ret 0;
+}
+```
 
 A payload read whose case is no longer selected is undefined behavior of the
 same class as a stale pointer read. A raw pointer to a payload does not pin a
 case or extend a lifetime. There is no borrow checker, proof analysis or runtime
-validator. In the debug profile only, each guarded payload access compares the
-discriminator and traps on mismatch.
+validator. In the debug profile only, a guarded payload access compares the
+discriminator and traps on mismatch. The comparison is left out where the value
+is a local or parameter that nothing takes the address of, in whole or in part,
+since no pointer to it exists and a write by name under the guard is refused or
+ends the guard.
 
 ## Layout and representation
 
 A tag is laid out with its discriminator at byte offset zero in target byte
 order. The discriminator type is the one the declaration names after the tag
-name (`tag Name: u8 { ... }`), one of `u8`, `u16`, `u32` or `u64`; a type too
+name (`tag Name: u8 { ... }`), one of `u8`, `u16`, `u32` or `u64`, and a type too
 narrow to number every declared case is rejected. Declaration order determines
 case codes, starting at zero. Single-case tags still include a discriminator.
 
@@ -349,16 +407,51 @@ maximum of discriminator alignment, payload alignment, and any explicit
 `#[align(N)]` decorator. Total size is the aligned extent of the common payload
 area. Tags with no payloads contain only the discriminator and trailing padding.
 
+A byte of a tag is never public under one case and secret under another. Two
+cases share bytes only where they agree on the class of every byte both cover,
+the comparison a `uni`'s variants must pass: secret against secret, public
+against public, a pointer that reaches a secret only against a pointer to the
+same storage, and padding counting as public, since a public payload's padding
+can be read through a pointer to it. The payloads are placed in areas after the
+discriminator: taking the cases in declaration order, each joins the first area
+whose every case it agrees with, or opens a new one, and the areas follow the
+discriminator in ascending order of alignment, ties in the order they were
+opened. Each area holds its payloads at its own offset, sized and aligned as the
+largest of them. A payloadless case is in no area, a generic case typed by a
+parameter is placed at each instance, and a nested tag's bytes are classed by
+its own layout. A tag whose payloads all agree, which is every tag with no
+secret anywhere below it, has the single payload area described above.
+
+The rule costs size only where payloads disagree: `res[^u64, E]` with a
+one-byte `E` stays 16 bytes (the error at offset 1, the secret at 8), while
+`tag T: u8 { p: u64; s: ^u64; }` grows from 16 to 24 bytes and
+`res[[4]^u64, u64]` from 40 to 48. At worst every payload has an area of its
+own, which is no larger than laying the payloads out one after another in any
+order, and merging agreeing payloads into one area never makes it larger, as
+long as no payload with no bytes is aligned past one byte. A by-value tag is passed and returned like any aggregate of its size.
+
 Packing with `#[packed]` places the payload immediately after the discriminator
-at offset `D` with base alignment 1. Explicit alignment raises object alignment
+at offset `D` with base alignment 1, and each further area immediately after the
+one before it, in the order they were opened. Explicit alignment raises object alignment
 and rounds total size without repacking nested payloads. Packed value access
 uses legal unaligned operations. A typed payload pointer must not promise
 stronger alignment than its storage provides.
 
+Debug information describes a tag as a structure laid out the same way. Its
+first member, `tag`, holds the discriminator as an enumeration that names every
+case by its code, and each case with a payload follows as a member named for the
+case at the offset of the payload area that holds it. `tag` is a keyword, so no
+case can take that name.
+
 Construction captures the active payload before overwriting the destination and
-zeroes tag-owned gaps, inactive payload suffix bytes, and tail padding. Active
-payload representation rules remain unchanged, including raw union bytes.
-Replacing a larger case clears the bytes that become inactive.
+writes the discriminator and the active payload. Nothing else is written: the
+tag-owned gaps, the payload bytes past the active case and the tail padding are
+unspecified, and replacing a larger case leaves the bytes that become inactive
+as they were. A tag that holds a secret is the exception, as every secret
+aggregate is: those bytes are zeroed wherever a value of it is built (see
+[secrecy.md](secrecy.md#padding-of-secret-aggregates)). Zeroing any other tag
+is an explicit action, `std.memory.zero`. Active payload representation rules
+remain unchanged, including raw union bytes.
 
 Representation-changing `::` and `:~` casts are rejected when either by-value
 representation contains a tag, including through records, arrays, or unions.
@@ -373,7 +466,13 @@ payload qualifiers.
 ## Secrecy and ownership
 
 A public tag has a public discriminator, while each payload retains its declared
-secrecy. Outer `^Tag` also protects the active case. Secret-dependent case tests
+secrecy. A tag may mix public and secret payloads, unlike a `uni`, because no
+two of its cases share a byte at two classes (see
+[Layout and representation](#layout-and-representation)): a stale pointer to a
+payload, kept past a write that switched the tag to another case, reads only
+bytes of the class its type states. Building a value of a tag that holds a
+secret zeroes it whole, so a new case leaves none of the old case's bytes behind.
+Outer `^Tag` also protects the active case. Secret-dependent case tests
 must obey the constant-time rules. Copies preserve potentially
 secret storage across all cases and use the fixed public type extent, rather
 than choosing a copy size from a secret active case.
@@ -388,7 +487,9 @@ and are not returned by value inside results.
 
 Tags support comptime reflection through three intrinsics:
 
-- `$is_tag(T)` returns true for public tag shapes, including canonical tags
+- `$is_tag(T)` is true for public tag shapes, including canonical tags, and is
+  false for `^T`. Like every type predicate it is written only as a `$if` gate
+  condition
 - `$cases(T)` yields a comptime sequence of case descriptors
 - `$discriminant_of(T)` returns the unsigned integer type used for the discriminator
 
@@ -415,11 +516,11 @@ after specialization.
 `#[deprecated]` and `#[deprecated("msg")]` apply to a `tag` declaration and,
 inside the body, to a single case, where it is the only decorator a case
 accepts. A deprecated case warns at every external construction, `sel` test
-and payload place that names it; see [decorators.md](decorators.md).
+and payload place that names it (see [decorators.md](decorators.md)).
 
 `#[volatile]` on a tag makes every access to its storage, discriminator and
-payload alike, a volatile access; see
-[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
+payload alike, a volatile access (see
+[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)).
 
 ## See also
 

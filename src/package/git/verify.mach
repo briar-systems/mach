@@ -1,0 +1,535 @@
+# verify: what `mach dep verify` holds a git dependency to. the enclosing repository must
+# stage its gitlink and register it in .gitmodules with the declared source; the checkout
+# must be a repository root at that gitlink, match its committed tree, keep every symlink
+# inside itself, and satisfy every exact selector and version range the closure declares
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_is_empty;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.intern;
+use compile_load: mach.compile.load;
+use mach.compile.project;
+use manifest_version: mach.manifest.version;
+use mach.session;
+
+use compile_closure: mach.compile.closure;
+use mach.host.listing;
+use manifest_model: mach.manifest.model;
+use mach.package;
+use mach.package.git;
+use git_checkout: mach.package.git.checkout;
+
+fun symlink_seen(links: *Vector[str], rel: str) bool {
+    var i: usize = 0;
+    for (i < links.len) {
+        if (str_equals(links.data[i], rel)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the target a symlink committed at HEAD names, as git stores it
+fun symlink_target(s: *session.Session, gi: *git.Inspector, alias: str, git_dir: str,
+    git_prefix: str, rel: str) res[str, fail.Fail] {
+    val res_spec: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "HEAD:{}{}", git_prefix, rel);
+    if (sel res_spec.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(res_spec.err))}; }
+    val spec: str = res_spec.ok;
+    var args: [3]str;
+    args[0] = "cat-file";
+    args[1] = "-p";
+    args[2] = spec;
+    val res_raw: res[str, fail.Fail] = git.query_raw(s.build_alloc, gi, git_dir, ?args[0], 3);
+    str_free(s.build_alloc, spec);
+    if (sel res_raw.ok) { ret res_raw; }
+    val res_msg: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}' has a tracked symlink whose target cannot be verified ({})", alias, fail.describe(res_raw.err));
+    if (sel res_msg.err) { ret res[str, fail.Fail].err{res_raw.err}; }
+    ret res[str, fail.Fail].err{fail.owning(fail.with_text(res_raw.err, res_msg.ok))};
+}
+
+# whether HEAD commits `<git_prefix><rel>` as a symlink, mode 120000
+fun symlink_tracked(s: *session.Session, gi: *git.Inspector, alias: str, git_dir: str,
+    git_prefix: str, rel: str) res[bool, fail.Fail] {
+    val res_mode: res[str, fail.Fail] = git.path_mode(s, gi, alias, git_dir, git_prefix, rel);
+    if (sel res_mode.err) { ret res[bool, fail.Fail].err{res_mode.err}; }
+    val mode:    str  = res_mode.ok;
+    val tracked: bool = str_equals(mode, "120000");
+    str_free(s.build_alloc, mode);
+    ret res[bool, fail.Fail].ok{tracked};
+}
+
+# a symlink's target resolved against the symlink's directory and cleaned, in git's `/`
+# spelling, or err for an absolute target or one that escapes the checkout
+fun symlink_target_rel(s: *session.Session, rel: str, target: str) res[str, fail.Fail] {
+    if (str_is_empty(target) || target[0] == '/' || target[0] == '\\'
+        || (str_len(target) > 1 && target[1] == ':')) {
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "tracked symlink target must be relative")};
+    }
+    var base_len: usize = str_len(rel);
+    for (base_len > 0 && rel[base_len - 1] != '/') { base_len = base_len - 1; }
+    val res_base: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, rel, 0, base_len);
+    if (sel res_base.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(res_base.err))}; }
+    val base:       str                              = res_base.ok;
+    val res_joined: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}{}", base, target);
+    str_free(s.build_alloc, base);
+    if (sel res_joined.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(res_joined.err))}; }
+    val joined:    str                           = res_joined.ok;
+    val res_clean: res[types_path.Path, A.Error] = types_path.clean(s.build_alloc, joined);
+    str_free(s.build_alloc, joined);
+    if (sel res_clean.err) { ret res[str, fail.Fail].err{fail.refused(res_clean.err)}; }
+    val clean:   str  = res_clean.ok;
+    val escaped: bool = str_equals(clean, "..")
+        || (str_len(clean) > 2 && clean[0] == '.' && clean[1] == '.' && types_path.is_separator(clean[2]));
+    if (escaped) {
+        str_free(s.build_alloc, clean);
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "tracked symlink target escapes dependency package")};
+    }
+    # the target is kept in git's spelling, whatever separator the host cleaned it to
+    var i: usize = 0;
+    for (clean[i] != 0) {
+        if (types_path.is_separator(clean[i])) { clean[i] = '/'; }
+        i = i + 1;
+    }
+    ret res[str, fail.Fail].ok{clean};
+}
+
+# follow a chain of tracked symlinks from `rel`, refusing a cycle or a target that escapes the
+# checkout. the chain ends at a target that is no tracked symlink
+fun symlink_chain(s: *session.Session, gi: *git.Inspector, alias: str,
+    git_dir: str, git_prefix: str, root: str, rel: str,
+    links: *Vector[str]) err[fail.Fail] {
+    if (symlink_seen(links, rel)) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "tracked symlink cycle in dependency package")}; }
+    val res_copied: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, rel, 0, str_len(rel));
+    if (sel res_copied.err) { ret err[fail.Fail].err{fail.message(fail.str_text(res_copied.err))}; }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[str](links, res_copied.ok);
+    if (sel res_pushed.err) {
+        str_free(s.build_alloc, res_copied.ok);
+        ret err[fail.Fail].err{fail.refused(res_pushed.err)};
+    }
+
+    val res_target: res[str, fail.Fail] = symlink_target(s, gi, alias, git_dir, git_prefix, rel);
+    if (sel res_target.err) { ret err[fail.Fail].err{res_target.err}; }
+    val target:   str                 = res_target.ok;
+    val res_next: res[str, fail.Fail] = symlink_target_rel(s, rel, target);
+    str_free(s.build_alloc, target);
+    if (sel res_next.err) { ret err[fail.Fail].err{res_next.err}; }
+    val next: str = res_next.ok;
+    fin { str_free(s.build_alloc, next); }
+    val res_resolved: res[str, fail.Fail] = compile_load.join_path(s.build_alloc, root, next);
+    if (sel res_resolved.err) { ret err[fail.Fail].err{res_resolved.err}; }
+    val resolved: str = res_resolved.ok;
+    fin { str_free(s.build_alloc, resolved); }
+    val res_meta: res[fs.Metadata, io_error.Error] = fs.metadata_link(resolved);
+    if (sel res_meta.err) { ret err[fail.Fail].ok{}; }
+    val meta: fs.Metadata = res_meta.ok;
+    if (!fs.meta_is_symlink(?meta)) { ret err[fail.Fail].ok{}; }
+    val res_next_tracked: res[bool, fail.Fail] = symlink_tracked(s, gi, alias, git_dir, git_prefix, next);
+    if (sel res_next_tracked.err) { ret err[fail.Fail].err{res_next_tracked.err}; }
+    if (!res_next_tracked.ok)     { ret err[fail.Fail].ok{}; }
+    ret symlink_chain(s, gi, alias, git_dir, git_prefix, root, next, links);
+}
+
+# walk a checkout from the directory `rel`, refusing a directory the committed tree holds as
+# something other than a directory or a gitlink, skipping one it does not hold, and checking
+# the chain of every tracked symlink
+fun realization_symlinks_walk(s: *session.Session, gi: *git.Inspector, alias: str,
+    git_dir: str, git_prefix: str, root: str, rel: str) err[fail.Fail] {
+    val res_join_path: res[str, fail.Fail] = compile_load.join_path(s.build_alloc, root, rel);
+    if (sel res_join_path.err) { ret err[fail.Fail].err{res_join_path.err}; }
+    val at: str = res_join_path.ok;
+    fin { str_free(s.build_alloc, at); }
+    val res_listed: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(s.build_alloc, at);
+    if (sel res_listed.err) { ret err[fail.Fail].err{fail.refusal(s.build_alloc, diagnostic_kind.FS_READ, fail.Op{verb: "list", role: "the dependency checkout directory", path: at}, fail.Cause.fs{res_listed.err})}; }
+    var entries: Vector[fs.Listed] = res_listed.ok;
+    fin { fs.listed_dnit(?entries); }
+    val res_names: res[Vector[str], fail.Fail] = listing.names(s.build_alloc, at, ?entries);
+    if (sel res_names.err) { ret err[fail.Fail].err{res_names.err}; }
+    var names: Vector[str] = res_names.ok;
+    fin { collections_vector.dnit[str](?names); }
+    sort.sort[str](names.data, names.len);
+    var i: usize = 0;
+    for (i < names.len) {
+        val res_child: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}{}", rel, names.data[i]);
+        if (sel res_child.err) { ret err[fail.Fail].err{fail.message(fail.format_text(res_child.err))}; }
+        val child: str = res_child.ok;
+        fin { str_free(s.build_alloc, child); }
+        val res_path: res[str, fail.Fail] = compile_load.join_path(s.build_alloc, root, child);
+        if (sel res_path.err) { ret err[fail.Fail].err{res_path.err}; }
+        val child_path: str = res_path.ok;
+        fin { str_free(s.build_alloc, child_path); }
+        val res_meta: res[fs.Metadata, io_error.Error] = fs.metadata_link(child_path);
+        if (sel res_meta.err) { ret err[fail.Fail].err{fail.refusal(s.build_alloc, diagnostic_kind.FS_STAT, fail.Op{verb: "inspect", role: "the dependency checkout entry", path: child_path}, fail.Cause.io{res_meta.err})}; }
+        val meta: fs.Metadata = res_meta.ok;
+        if (fs.meta_is_dir(?meta)) {
+            val res_mode: res[str, fail.Fail] = git.path_mode(s, gi, alias, git_dir, git_prefix, child);
+            if (sel res_mode.err) { ret err[fail.Fail].err{res_mode.err}; }
+            val mode: str = res_mode.ok;
+            fin { str_free(s.build_alloc, mode); }
+            if (str_is_empty(mode) || str_equals(mode, "160000")) {
+                i = i + 1;
+                cnt;
+            }
+            if (!str_equals(mode, "040000")) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_TREE_MISMATCH, "dependency directory does not match its committed tree")}; }
+            val res_nested: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}/", child);
+            if (sel res_nested.err) { ret err[fail.Fail].err{fail.message(fail.format_text(res_nested.err))}; }
+            val nested: str = res_nested.ok;
+            fin { str_free(s.build_alloc, nested); }
+            val err_walk: err[fail.Fail] = realization_symlinks_walk(s, gi, alias, git_dir, git_prefix, root, nested);
+            if (sel err_walk.err) { ret err_walk; }
+        }
+        or (fs.meta_is_symlink(?meta)) {
+            var links: Vector[str] = collections_vector.init[str](s.build_alloc);
+            fin { package.name_vector_dnit(s.build_alloc, ?links); }
+            var err_verify:  err[fail.Fail]       = err[fail.Fail].ok{};
+            val res_tracked: res[bool, fail.Fail] = symlink_tracked(s, gi, alias, git_dir, git_prefix, child);
+            if (sel res_tracked.err) { err_verify = err[fail.Fail].err{res_tracked.err}; }
+            or (sel res_tracked.ok) {
+                if (res_tracked.ok) {
+                    err_verify = symlink_chain(s, gi, alias, git_dir, git_prefix, root, child, ?links);
+                }
+            }
+            if (sel err_verify.err) { ret err_verify; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# `realization_symlinks_walk` over a whole checkout
+fun realization_symlinks(s: *session.Session, gi: *git.Inspector, alias: str,
+    git_dir: str, git_prefix: str, root: str) err[fail.Fail] {
+    ret realization_symlinks_walk(s, gi, alias, git_dir, git_prefix, root, "");
+}
+
+# refuse a declaring project root that is not inside a git work tree
+fun declaring_manifest(s: *session.Session, gi: *git.Inspector, alias: str,
+    parent_root: str) err[fail.Fail] {
+    ret git.require_root(s, gi, alias, parent_root, "declaring package identity");
+}
+
+# the gitlink the declaring repository stages for the dependency, interned, once its staged
+# .gitmodules registers the dependency's path with the manifest's source, as `source` resolves it
+fun parent_gitlink(s: *session.Session, gi: *git.Inspector, alias: str,
+    parent_root: str, dir_dep: str, source: str) res[intern.StrId, fail.Fail] {
+    val err_manifest: err[fail.Fail] = declaring_manifest(s, gi, alias, parent_root);
+    if (sel err_manifest.err) { ret res[intern.StrId, fail.Fail].err{err_manifest.err}; }
+
+    val err_gm_tracked: err[fail.Fail] = git.require_tracked(s, gi, alias, parent_root, ".gitmodules", "staged dependency metadata");
+    if (sel err_gm_tracked.err) { ret res[intern.StrId, fail.Fail].err{err_gm_tracked.err}; }
+    val err_gm_clean: err[fail.Fail] = git.require_matches_index(s, gi, alias, parent_root, ".gitmodules", "staged dependency metadata");
+    if (sel err_gm_clean.err) { ret res[intern.StrId, fail.Fail].err{err_gm_clean.err}; }
+
+    val res_rel: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}/{}", dir_dep, alias);
+    if (sel res_rel.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(res_rel.err))}; }
+    val rel: str = res_rel.ok;
+    fin { str_free(s.build_alloc, rel); }
+
+    val res_gm_sha: res[str, fail.Fail] = git.index_entry_field(s, gi, alias, parent_root, ".gitmodules", 1, "staged dependency metadata");
+    if (sel res_gm_sha.err) { ret res[intern.StrId, fail.Fail].err{res_gm_sha.err}; }
+    val gm_sha: str = res_gm_sha.ok;
+    fin { str_free(s.build_alloc, gm_sha); }
+    val res_modules_spec: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "--blob={}", gm_sha);
+    if (sel res_modules_spec.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(res_modules_spec.err))}; }
+    val modules_spec: str = res_modules_spec.ok;
+    fin { str_free(s.build_alloc, modules_spec); }
+
+    val res_path_key: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "submodule.{}.path", rel);
+    if (sel res_path_key.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(res_path_key.err))}; }
+    val path_key: str = res_path_key.ok;
+    fin { str_free(s.build_alloc, path_key); }
+    var config_args: [4]str;
+    config_args[0] = "config";
+    config_args[1] = modules_spec;
+    config_args[2] = "--get-all";
+    config_args[3] = path_key;
+    val res_path: res[str, fail.Fail] = git.query_named(s, gi, alias, parent_root, ?config_args[0], 4, ".gitmodules path");
+    if (sel res_path.err) { ret res[intern.StrId, fail.Fail].err{res_path.err}; }
+    val observed_path: str = res_path.ok;
+    fin { str_free(s.build_alloc, observed_path); }
+    if (!str_equals(observed_path, rel)) { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_GITMODULES_MISMATCH, "dependency .gitmodules path does not match its package-owned realization")}; }
+
+    val res_url_key: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "submodule.{}.url", rel);
+    if (sel res_url_key.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(res_url_key.err))}; }
+    val url_key: str = res_url_key.ok;
+    fin { str_free(s.build_alloc, url_key); }
+    config_args[3] = url_key;
+    val res_url: res[str, fail.Fail] = git.query_named(s, gi, alias, parent_root, ?config_args[0], 4, ".gitmodules URL");
+    if (sel res_url.err) { ret res[intern.StrId, fail.Fail].err{res_url.err}; }
+    val observed_url: str = res_url.ok;
+    fin { str_free(s.build_alloc, observed_url); }
+    if (!str_equals(observed_url, source)) { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_GITMODULES_MISMATCH, "dependency .gitmodules URL does not match manifest source")}; }
+
+    val res_mode: res[str, fail.Fail] = git.index_entry_field(s, gi, alias, parent_root, rel, 0, "staged gitlink");
+    if (sel res_mode.err) { ret res[intern.StrId, fail.Fail].err{res_mode.err}; }
+    val mode_text: str = res_mode.ok;
+    fin { str_free(s.build_alloc, mode_text); }
+    if (!str_equals(mode_text, "160000")) { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_GITLINK, "dependency path is not a staged gitlink")}; }
+    val res_sha: res[str, fail.Fail] = git.index_entry_field(s, gi, alias, parent_root, rel, 1, "staged gitlink");
+    if (sel res_sha.err) { ret res[intern.StrId, fail.Fail].err{res_sha.err}; }
+    val gitlink: str = res_sha.ok;
+    fin { str_free(s.build_alloc, gitlink); }
+    if (!git.object_id_valid(gitlink)) { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_GITLINK, "dependency path is not a staged gitlink")}; }
+    val res_content: res[intern.StrId, A.Error] = intern.add(s.interner, gitlink);
+    if (sel res_content.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(res_content.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{res_content.ok};
+}
+
+# the way out of a pin outside a selection: re-pin it, and for a requirer's selection also
+# the root override; the root's own selection has nothing above it to override it
+fun repin_remedy(s: *session.Session, alias: str, project_root: str, root_own: bool) res[str, fail.Fail] {
+    var res_sprint: res[str, std_format.FormatError];
+    if (root_own) {
+        res_sprint = std_format.sprint(s.build_alloc, "run `mach dep update <path> {}` for project '{}' to re-pin it to the root's selection", alias, project_root);
+    }
+    or {
+        res_sprint = std_format.sprint(s.build_alloc, "run `mach dep update <path> {}` for project '{}' to re-pin it, or declare the identity at the root to override", alias, project_root);
+    }
+    if (sel res_sprint.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(res_sprint.err))}; }
+    ret res[str, fail.Fail].ok{res_sprint.ok};
+}
+
+# refuse a `commit/` or `tag/` selector that does not resolve to the pinned commit. a branch
+# or an empty selector holds at any pin
+fun selector_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str, dep_dir: str, ref: str, pin: str,
+    root_own: bool) err[fail.Fail] {
+    if (str_is_empty(ref) || str_starts_with(ref, "branch/")) { ret err[fail.Fail].ok{}; }
+    var want:  str  = "";
+    var owned: bool = false;
+    fin {
+        if (owned) { str_free(s.build_alloc, want); }
+    }
+    if (str_starts_with(ref, "commit/")) { want = (?ref[7])::str; }
+    or (str_starts_with(ref, "tag/")) {
+        val res_spec: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "refs/tags/{}^{{commit}}", (?ref[4])::str);
+        if (sel res_spec.err) { ret err[fail.Fail].err{fail.message(fail.format_text(res_spec.err))}; }
+        val spec: str = res_spec.ok;
+        var args: [4]str;
+        args[0] = "rev-parse";
+        args[1] = "--verify";
+        args[2] = "--quiet";
+        args[3] = spec;
+        val res_query: res[str, fail.Fail] = git.query(s.build_alloc, gi, dep_dir, ?args[0], 4);
+        str_free(s.build_alloc, spec);
+        if (sel res_query.err) {
+            val res_sprint: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+                "dependency '{}' has exact ref '{}', required by {}, which names a tag the checkout does not have. run `mach dep update <path> {}` or `mach dep pull <path>` for project '{}'", alias, ref, chain, alias, project_root);
+            if (sel res_sprint.err) { ret err[fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, res_sprint.ok)};
+        }
+        want  = res_query.ok;
+        owned = true;
+    }
+    or { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "dependency ref kind is invalid")}; }
+    val ok: bool = str_equals(want, pin);
+    if (ok) { ret err[fail.Fail].ok{}; }
+    val res_remedy: res[str, fail.Fail] = repin_remedy(s, alias, project_root, root_own);
+    if (sel res_remedy.err) { ret err[fail.Fail].err{res_remedy.err}; }
+    val res_sprint: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}' has exact ref '{}', required by {}, which resolves to '{}', but the realized commit is '{}'. {}",
+        alias, ref, chain, want, pin, res_remedy.ok);
+    str_free(s.build_alloc, res_remedy.ok);
+    if (sel res_sprint.err) { ret err[fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, res_sprint.ok)};
+}
+
+# check a requirer's git selector, a version range or an exact ref, against the commit the
+# dependency is realized at
+# ---
+# s:            the session
+# gi:           the inspector whose git runs the checks
+# alias:        the dependency identity
+# chain:        the requiring chain, as a refusal names it
+# project_root: the root project
+# dir_dep:      the dependency root's name under the project, dep
+# d:            the requirer's declaration, where a path declaration always holds
+# content:      the realized content, `git/<commit>` for a git checkout
+# root_own:     the root declares the identity itself, which shapes the remedy a refusal names
+# ret:          err naming the selector the pinned commit does not satisfy
+pub fun requirer_selector_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str,
+    dir_dep: str, d: *manifest_model.DepDef, content: intern.StrId, root_own: bool) err[fail.Fail] {
+    if (intern.str_is_nil(d.git))   { ret err[fail.Fail].ok{}; }
+    if (intern.str_is_nil(content)) { ret err[fail.Fail].ok{}; }
+    val content_text: str = intern.text(s.interner, content);
+    if (!str_starts_with(content_text, "git/")) { ret err[fail.Fail].ok{}; }
+    val pin:         str                 = (?content_text[4])::str;
+    val res_dep_dir: res[str, fail.Fail] = compile_closure.build_dep_root(s.build_alloc, project_root, dir_dep, alias);
+    if (sel res_dep_dir.err) { ret err[fail.Fail].err{res_dep_dir.err}; }
+    val dep_dir: str = res_dep_dir.ok;
+    fin { str_free(s.build_alloc, dep_dir); }
+    if (!intern.str_is_nil(d.version)) {
+        ret range_satisfied(s, gi, alias, chain, project_root, dep_dir, intern.text(s.interner, d.version), pin, root_own);
+    }
+    if (intern.str_is_nil(d.ref)) { ret err[fail.Fail].ok{}; }
+    ret selector_satisfied(s, gi, alias, chain, project_root, dep_dir, intern.text(s.interner, d.ref), pin, root_own);
+}
+
+# a version selection holds when the pinned commit carries a release tag, read offline
+# from the checkout's refs, whose version the requirer's range contains
+fun range_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str,
+    dep_dir: str, want: str, pin: str, root_own: bool) err[fail.Fail] {
+    val a:       *A.Allocator        = s.build_alloc;
+    val res_rel: res[str, fail.Fail] = git_checkout.release_at(a, gi, dep_dir, pin);
+    if (sel res_rel.err) { ret err[fail.Fail].err{res_rel.err}; }
+    val have: str = res_rel.ok;
+    fin { str_free(a, have); }
+    var res_sprint: res[str, std_format.FormatError];
+    if (str_is_empty(have)) {
+        val res_tagged: res[bool, fail.Fail] = git_checkout.has_tags(a, gi, dep_dir);
+        if (sel res_tagged.err) { ret err[fail.Fail].err{res_tagged.err}; }
+        if (!res_tagged.ok) {
+            res_sprint = std_format.sprint(a,
+                "dependency '{}' is required by {} at version '{}', but pinned commit '{}' has no readable release, because its checkout at {} holds no tags. run `mach dep pull <path>` for project '{}' to fetch them",
+                alias, chain, want, pin, dep_dir, project_root);
+        }
+        or {
+            res_sprint = std_format.sprint(a,
+                "dependency '{}' is required by {} at version '{}', but no release tag in its checkout names pinned commit '{}'. run `mach dep pull <path>` for project '{}' to fetch its tags, or `mach dep update <path> {}` to pin a release",
+                alias, chain, want, pin, project_root, alias);
+        }
+    }
+    or {
+        val res_parse_range: res[manifest_version.Range, manifest_version.RangeError] = manifest_version.parse_range(want);
+        if (sel res_parse_range.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.VERSION_INVALID_RANGE, res_parse_range.err.reason)}; }
+        val res_parse_version: res[manifest_version.Version, str] = manifest_version.parse_version(have);
+        if (sel res_parse_version.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.VERSION_INVALID, res_parse_version.err)}; }
+        var r: manifest_version.Range   = res_parse_range.ok;
+        var v: manifest_version.Version = res_parse_version.ok;
+        if (manifest_version.satisfies(?r, ?v)) { ret err[fail.Fail].ok{}; }
+        val res_remedy: res[str, fail.Fail] = repin_remedy(s, alias, project_root, root_own);
+        if (sel res_remedy.err) { ret err[fail.Fail].err{res_remedy.err}; }
+        res_sprint = std_format.sprint(a, "dependency '{}' is required by {} at version '{}', but the pinned release is {}. {}", alias, chain, want, have, res_remedy.ok);
+        str_free(a, res_remedy.ok);
+    }
+    if (sel res_sprint.err) { ret err[fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_VERSION_UNMET, res_sprint.ok)};
+}
+
+# check a git dependency's checkout: its staged gitlink when the parent is a repository root,
+# the checkout being a repository root at that pin, an exact commit ref, a clean work tree and
+# its symlinks, answering the realized content `git/<pin>`, interned
+fun checkout(s: *session.Session, gi: *git.Inspector, alias: str,
+    parent_root: str, dep_dir: str, dir_dep: str,
+    d: *manifest_model.DepDef, source: str, authority: u8) res[intern.StrId, fail.Fail] {
+    var gitlink: str = "";
+    if (authority == git.AUTHORITY_REPO) {
+        val res_gitlink: res[intern.StrId, fail.Fail] = parent_gitlink(s, gi, alias, parent_root, dir_dep, source);
+        if (sel res_gitlink.err) { ret res[intern.StrId, fail.Fail].err{res_gitlink.err}; }
+        val gitlink_id:  intern.StrId = res_gitlink.ok;
+        val opt_gitlink: opt[str]     = intern.get(s.interner, gitlink_id);
+        if (sel opt_gitlink.none) { ret res[intern.StrId, fail.Fail].err{fail.message("dependency gitlink is not interned")}; }
+        gitlink = opt_gitlink.some;
+    }
+
+    val err_child_root: err[fail.Fail] = git.require_root(s, gi, alias, dep_dir, "checkout identity");
+    if (sel err_child_root.err) { ret res[intern.StrId, fail.Fail].err{err_child_root.err}; }
+    val res_child_prefix: res[str, fail.Fail] = git.declaring_prefix(s, gi, alias, dep_dir);
+    if (sel res_child_prefix.err) { ret res[intern.StrId, fail.Fail].err{res_child_prefix.err}; }
+    val child_prefix: str = res_child_prefix.ok;
+    fin { str_free(s.build_alloc, child_prefix); }
+    if (!str_is_empty(child_prefix)) { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_REPOSITORY_ROOT, "dependency checkout must be the repository root")}; }
+
+    var head_args: [2]str;
+    head_args[0] = "rev-parse";
+    head_args[1] = "HEAD";
+    val res_head: res[str, fail.Fail] = git.query_named(s, gi, alias, dep_dir, ?head_args[0], 2, "checkout HEAD");
+    if (sel res_head.err) { ret res[intern.StrId, fail.Fail].err{res_head.err}; }
+    val head: str = res_head.ok;
+    fin { str_free(s.build_alloc, head); }
+    if (!str_is_empty(gitlink) && !str_equals(head, gitlink)) {
+        val res_sprint: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}' is checked out at '{}', but the recorded gitlink is '{}'. run `mach dep pull <path>` for project '{}' to restore the pin, or `mach dep update <path> {}` to re-pin it to the manifest",
+            alias, head, gitlink, parent_root, alias);
+        if (sel res_sprint.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, res_sprint.ok)};
+    }
+    var pin: str = gitlink;
+    if (str_is_empty(pin)) { pin = head; }
+
+    # a version range selects releases; whether the pin is one the range accepts is checked with the closure's ranges
+    var ref: str = "tag/";
+    if (intern.str_is_nil(d.version)) {
+        val opt_ref: opt[str] = intern.get(s.interner, d.ref);
+        if (sel opt_ref.none) { ret res[intern.StrId, fail.Fail].err{fail.message("dependency Git ref is not interned")}; }
+        ref = opt_ref.some;
+    }
+    if (str_starts_with(ref, "commit/")) {
+        if (!str_equals((?ref[7])::str, pin)) {
+            val res_sprint: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+                "dependency '{}' has exact commit ref '{}', but the realized commit is '{}'",
+                alias, ref, pin);
+            if (sel res_sprint.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+            ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, res_sprint.ok)};
+        }
+    }
+    or (str_starts_with(ref, "tag/") || str_starts_with(ref, "branch/")) {}
+    or                                                                   { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "dependency ref kind is invalid")}; }
+
+    var status_args: [3]str;
+    status_args[0] = "status";
+    status_args[1] = "--porcelain=v1";
+    status_args[2] = "--untracked-files=all";
+    val res_status: res[str, fail.Fail] = git.query_named(s, gi, alias, dep_dir, ?status_args[0], 3, "checkout cleanliness");
+    if (sel res_status.err) { ret res[intern.StrId, fail.Fail].err{res_status.err}; }
+    val status: str = res_status.ok;
+    fin { str_free(s.build_alloc, status); }
+    if (!str_is_empty(status)) {
+        val res_sprint: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}' has a dirty checkout\n{}", alias, status);
+        if (sel res_sprint.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_DIRTY, res_sprint.ok)};
+    }
+    val err_links: err[fail.Fail] = realization_symlinks(s, gi, alias, dep_dir, "", dep_dir);
+    if (sel err_links.err) { ret res[intern.StrId, fail.Fail].err{err_links.err}; }
+    val res_content_text: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "git/{}", pin);
+    if (sel res_content_text.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(res_content_text.err))}; }
+    val content_text: str                        = res_content_text.ok;
+    val res_content:  res[intern.StrId, A.Error] = intern.add(s.interner, content_text);
+    str_free(s.build_alloc, content_text);
+    if (sel res_content.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(res_content.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{res_content.ok};
+}
+
+# what `mach dep verify` checks of one realized git dependency
+# ---
+# s:           the session
+# gi:          the inspector, started here when still pending
+# alias:       the dependency identity
+# parent_root: the root of the project that declares it
+# dep_dir:     the dependency's checkout directory
+# dir_dep:     the dependency root's name under the parent, dep
+# d:           the declaration
+# source:      the source its `git` names, as the closure resolved it (package.git_source)
+# ret:         the realized content `git/<commit>`, interned, which the closure's selectors
+#              are checked against, err naming the first mismatch
+pub fun realized(s: *session.Session, gi: *git.Inspector, alias: str, parent_root: str,
+    dep_dir: str, dir_dep: str, d: *manifest_model.DepDef, source: str) res[intern.StrId, fail.Fail] {
+    val err_inspector_require: err[fail.Fail] = git.inspector_require(s.build_alloc, gi);
+    if (sel err_inspector_require.err) { ret res[intern.StrId, fail.Fail].err{err_inspector_require.err}; }
+    val res_auth: res[u8, fail.Fail] = git.project_root_authority(s, gi, alias, parent_root);
+    if (sel res_auth.err) { ret res[intern.StrId, fail.Fail].err{res_auth.err}; }
+    val authority: u8 = res_auth.ok;
+    ret checkout(s, gi, alias, parent_root, dep_dir, dir_dep, d, source, authority);
+}

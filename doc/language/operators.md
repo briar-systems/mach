@@ -22,7 +22,11 @@ finite dividend over an infinite divisor gives the dividend unchanged, its sign
 and a zero dividend's sign included, as C `fmod` does. Where the result is NaN,
 only the NaN is defined, not its sign or payload. In a constant expression a
 zero divisor is refused as division by zero, and the other cases fold to the
-same results as at run time.
+same results as at run time, except a NaN on a target that leaves it unspecified
+([A NaN in a constant on a target that leaves it unspecified](#a-nan-in-a-constant-on-a-target-that-leaves-it-unspecified)).
+On `spirv` a float `%` is computed to this definition by code the compiler
+provides, not by `OpFRem`, which is an `intrinsic`'s
+([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)).
 
 ```mach
 use std.print;
@@ -59,17 +63,18 @@ width. See [types.md](types.md#128-bit-integers).
 same-width product with a `^T` result: the operator means the same thing on a
 secret, and nothing declassifies. What the operand's secrecy changes is
 whether the target may execute it. A secret `/` or `%` is always refused, and a
-secret `*` compiles only where the instruction set declares the exact multiply
-it emits (the low half, a high half or the widening product, at that operand
-width) as data-independent-timing under a condition the build meets: on x86-64
-every scalar cell unconditionally, on aarch64 under PSTATE.DIT on linux and
-darwin, on riscv64 with `m` and `zkt` selected, and nowhere else. An undeclared
-cell is a compile error at lowering, never a slower substitute. The widening
-form above carries through: `(a::^u128) * (b::^u128)` over 64-bit secrets is
-the 64-bit widening cell, and its halves are `^u64`. The per-instruction-set
-table and the conditions are in
+secret `*` compiles in any function. Inside a `#[constant_time]` function it
+compiles only where mirl's selection emits rows that masc classifies as
+data-independent-timing under the function's mode for the exact multiply (the
+low half, a high half or the widening product, at that operand width): on
+x86-64 every scalar cell unconditionally, on aarch64 under PSTATE.DIT, which
+the function holds as its mode says, and on riscv64 with `m` and `zkt`
+selected. Any other is a compile error, never a slower substitute. The
+widening form above carries through: `(a::^u128) * (b::^u128)` over 64-bit
+secrets is the 64-bit widening cell, and its halves are `^u64`. The
+per-instruction-set table and the conditions are in
 [secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set), and
-`$mach.build.ct_mul(op, width)` answers the same question at comptime
+`$mach.build.ct_mul(op, width)` answers the question at comptime
 ([comptime-mach.md](comptime-mach.md)).
 
 ### Half-precision arithmetic
@@ -91,7 +96,7 @@ use std.runtime;
 fun main(argc: i64, argv: **u8) i64 {
     val third: f16 = 1.0f16 / 3.0; # 0.333251953125, the nearest binary16
     val r:     f16 = 5.5f16 % 3.0; # 2.5, exact
-    val lt:    u8  = third < 0.3333333333333333f64; # 1: compared exactly, not rounded
+    val lt:    u1  = third < 0.3333333333333333f64; # 1: compared exactly, not rounded
     if (third:~u16 != 0x3555 || r != 2.5 || lt != 1) { ret 1; }
     ret 0;
 }
@@ -114,18 +119,19 @@ never a call:
 | riscv64, riscv32 | binary64, the conversions inline | binary64, the widening inline |
 | riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
 | riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
-| spirv with `float16` | native, the core float instructions on `OpTypeFloat 16` | native |
-| spirv without `float16` | binary32, the conversions inline | binary32, the widening inline |
+| riscv without `f` or `d` | binary16 helpers, integer code ([types.md](types.md#floats-on-a-target-with-no-float-unit)) | binary16 helper |
+| spirv with `Float16` | native, the core float instructions on `OpTypeFloat 16` | native |
+| spirv without `Float16` | binary32, the conversions inline | binary32, the widening inline |
 
 aarch64 without `fp16` computes in binary64 even though `fcvt` converts to
 binary32, because that conversion quiets a signaling operand and the half unit
 would give a signaling NaN priority. Where the NaN the operation makes is the
 target's (see [A NaN between float widths](#a-nan-between-float-widths)), every
 path above makes the one the target's native half instruction would.
-x86-64's native rows under AVX-512 FP16 are #4159.
+x86-64 takes the rows above with or without AVX-512 FP16, which mach does not
+emit.
 
-That is proven, not assumed: the exhaustive proof `test/run.sh --f16proof`
-(#3804) checks every pair of `f16` operands for each operator, and every input of
+That was proven, not assumed: an exhaustive proof checked every pair of `f16` operands for each operator, and every input of
 the `f16` conversions, against a reference computed in integers. On x86-64 with
 and without `x86-64-v3`, aarch64 with and without `fp16`, and riscv64 with and
 without `zfh` (under qemu-user), every result is bit-identical to it, NaNs by the
@@ -171,8 +177,8 @@ before the loop.
 
 ## Comparison
 
-`==` `!=` `<` `>` `<=` `>=` — produce `u8` (`1` or `0`). Mach has no compiler
-`bool`; `bool` is a stdlib alias for `u8`. Comparisons relate **mathematical
+`==` `!=` `<` `>` `<=` `>=` produce `u1` (`1` or `0`). `bool` is a stdlib
+alias, not a compiler type. Comparisons relate **mathematical
 values**, so the result is identical in either operand order:
 
 - **integer vs integer** — any signedness and width mix is legal and compares
@@ -186,7 +192,7 @@ values**, so the result is identical in either operand order:
 - **pointer vs pointer** — every one of the six operators accepts two
   pointer-like operands (a pointer, a `ptr`, a function, or `nil`), whatever
   their pointee types and whatever their pointees' secrecy. Addresses order as
-  unsigned values of pointer width, and the result is a public `u8` even when
+  unsigned values of pointer width, and the result is a public `u1` even when
   both pointees are secret: ordering reveals no more than the `==` beside it,
   and no address comes back out of it. See
   [secrecy.md](secrecy.md#comparing-and-ordering-addresses).
@@ -195,6 +201,16 @@ values**, so the result is identical in either operand order:
 
 On the seeded vector types, a comparison produces a
 same-shape unsigned **mask** vector (lane-wise) — see [SIMD vectors](#simd-vectors).
+
+On `spirv` a comparison of numbers is one instruction: `==` and `!=` on integers
+are `OpIEqual` and `OpINotEqual`, `<` and `<=` are `OpULessThan`, `OpSLessThan` and
+their `Equal` forms, and `>` and `>=` are the same instructions with the operands
+exchanged. On floats `==`, `<` and `<=` are the ordered `OpFOrdEqual`,
+`OpFOrdLessThan` and `OpFOrdLessThanEqual`, `>` and `>=` exchange their operands
+the same way, and `!=` is the unordered `OpFUnordNotEqual`. The comparisons no
+operator writes, the greater-than instructions and the other ordered and unordered
+float relations, are an `intrinsic`'s
+([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)).
 
 `==` / `!=` on an **aggregate value** (a `rec`, `uni`, or whole `tag`) is a compile error.
 Comparing representations would silently relate padding bytes and unwritten union
@@ -208,18 +224,18 @@ equality, no payload equality and no ordering. Test which case is active with th
 
 ## Logical
 
-`&&` `||` `!` — short-circuiting. Operands are `u8` (`0` is false, nonzero is
-true); the result is `u8` (`1` or `0`).
+`&&` `||` `!` — short-circuiting. Operands are `u1`; the result is `u1` (`1` or
+`0`).
 
 ```mach fragment
-val ok: u8 = (x > 0) && (y < 100);
+val ok: u1 = (x > 0) && (y < 100);
 ```
 
 ## Unary
 
 - `-` numeric negation
 - `~` bitwise NOT (integer)
-- `!` logical NOT (`u8`)
+- `!` logical NOT (`u1`)
 
 On a float, `-` is the IEEE-754 sign-bit flip and is exact for every operand, so
 `-0.0` is negative zero — a constant distinct from `0.0`, whether it is folded at
@@ -248,7 +264,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach error cannot take the address of a call result
+```mach error cannot take the address of a call result. `?` needs a place, such as a binding, a field, an element or a dereference
 fun g() i64 {
     ret 1;
 }
@@ -261,9 +277,21 @@ fun addresses(x: i64) {
 }
 ```
 
-Each of those reads, in full, `cannot take the address of a call result: `?`
-applies to a place (a binding, a field, an element, or a dereference)`. Bind
+Each of those reads, in full, `` cannot take the address of a call result. `?`
+needs a place, such as a binding, a field, an element or a dereference ``. Bind
 the temporary to a `var` and take that binding's address.
+
+### Where locals lie
+
+A program cannot know where a call's locals are placed. A pointer to a local
+comes only from taking its address with `?`, and a pointer value that existed
+before a call began does not point into that call's locals. So a program may
+not reach a local by arithmetic on another address: a pointer made from an
+integer, from another local's address or from a parameter, that happens to land
+on a local whose address was never taken or on a local of a call that began
+after the pointer was made, has no defined result. The compiler may keep such a
+local in a register, or copy to and from it as though nothing else could
+overlap it.
 
 ## Index
 
@@ -361,7 +389,7 @@ fun main(argc: i64, argv: **u8) i64 {
 Reading `@p::u64` as dereference-then-convert is refused, because the cast
 applies to `p` and a `u64` cannot be dereferenced:
 
-```mach error dereference of non-pointer type
+```mach error only a pointer can be dereferenced
 fun widen(p: *i64) u64 {
     ret @p::u64; # error: @(p::u64) dereferences a u64
 }
@@ -372,8 +400,8 @@ the scalar `::` above, so `i32x4::f32x4` converts every lane numerically and
 `i8x4::i64x4` sign-extends every lane. Both sides need the same lane count
 (`i32x4::i64x2` is an error even though the two are the same size), and any
 pair of lane types is allowed, including equal-size integer and float lanes
-and a signedness change. A lane converts exactly as its scalar would on the
-same target, including NaN, the infinities and values outside the
+and a signedness change. A lane converts exactly as its scalar would,
+including NaN, the infinities and values outside the
 destination type. There is no cast between a vector and a scalar. The raw
 bits of a vector are `:~`, which, like every `:~`, needs only equal byte
 sizes (`i32x4:~f32x4`, `i32x4:~i64x2`).
@@ -412,6 +440,52 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+### Float to integer
+
+`::` from a float to an integer truncates toward zero. When the truncated value
+lies outside the integer type's range, or the float is a NaN, the result
+depends on when the cast is evaluated:
+
+- **At compile time** the cast is refused (`comptime.cast_range`), the way a
+  division by zero is, and the error names the value and the type. This holds
+  for every integer width and both signednesses: `300.5::u8`, `(-1.0)::u32` and a
+  NaN cast to `i32` in a constant expression are errors. The parentheses matter:
+  `-1.0::u32` is `-(1.0::u32)` ([Cast](#cast)), a negation of the in-range `1`
+  that wraps to `4294967295`.
+- **At run time** the cast saturates: a value below the type's minimum gives
+  the minimum, one above its maximum gives the maximum, and a NaN gives 0, the
+  same on every target.
+
+### A NaN in a constant on a target that leaves it unspecified
+
+A compile-time float operation whose result is a NaN gives the NaN the target's
+own operation returns, by the rule mirl's target model states for the result's
+format: the canonical NaN on riscv, with hardware floats or without, the first
+NaN operand, quieted, on x86-64, and on aarch64 the first signaling NaN operand,
+or else the first NaN operand, quieted. An invalid operation with no NaN operand gives the target's
+default NaN, negative on x86-64 and positive on aarch64. binary16 takes the rule
+of the format the target computes it in. Where the model gives no defined NaN
+result, a float operation whose result would be a NaN, arithmetic or a
+conversion between float widths, is not folded at compile time, so it is never
+miscompiled. SPIR-V and wasm32 are the targets that leave it unspecified: Vulkan
+defines no NaN result unless the module states a float-controls execution mode,
+and mach never states one, and WebAssembly lets the engine choose the NaN an
+operation returns. A format whose rule mirl's target model does not state yet
+is refused the same way, as a toolchain gap that closes when mirl states the
+rule.
+
+- **Where a constant is required**, a module `val`, an array length, a `$if`
+  condition or a comptime argument, it has no value and is refused
+  (`comptime.nan_unspecified`). The error names the target, and says whether
+  the target model states the NaN as unspecified or states no rule for the
+  format yet. This holds for a NaN anywhere in the expression, so `$if` over a
+  comparison of such a NaN is refused too.
+- **In a function body** on spirv or wasm32 the operation runs on the device or
+  in the engine, as it would with operands known only at run time.
+
+`:~` is not an operation on the value, so a NaN read from its bits is a constant
+on every target.
+
 ### `f16` conversions
 
 `::` to and from `f16` follows the rule of the other float widths:
@@ -427,8 +501,8 @@ fun main(argc: i64, argv: **u8) i64 {
   magnitude 65520 or more overflows to infinity. Every integer width converts,
   `u8` to `u64` and `i8` to `i64`.
 - **`f16` to an integer** truncates toward zero. A value out of the integer's
-  range, an infinity or a NaN gives the target's result for the same conversion
-  from `f64`, the rule every float width follows.
+  range, an infinity or a NaN follows the rule of every float width
+  ([Float to integer](#float-to-integer)).
 - **`:~`** reads an `f16`'s bits as a `u16` or an `i16` and back, exactly, NaN
   payloads included.
 
@@ -458,7 +532,7 @@ same result:
 - riscv with `zfhmin`: `fcvt.s.h` and `fcvt.h.s`, and with `d` also `fcvt.d.h`
   and `fcvt.h.d`; with `zfh` the integer conversions (`fcvt.w.h`, `fcvt.h.w` and
   their unsigned and, on riscv64, 64-bit forms);
-- spirv with `float16`: the core float conversions.
+- spirv with `Float16`: the core float conversions.
 
 Every other conversion is inline integer code on the binary16 encoding, joined to
 the target's binary64 conversion for an integer, never a call. Vectors convert lane by lane with the
@@ -474,15 +548,20 @@ because it is what the target's own conversion instruction does:
 |---|---|
 | x86-64, aarch64 | keeps its sign and the top of its payload, with the quiet bit set |
 | riscv32, riscv64 | the canonical NaN, positive and quiet with an empty payload |
-| spirv | the canonical NaN (SPIR-V leaves the payload unspecified, so a device may differ) |
+| spirv | unspecified: a device may return any NaN |
+| wasm32 | unspecified: an engine may return any NaN |
 
 A conversion folded at compile time follows the build target's rule, so a folded
-`::` gives the bits the same `::` gives at run time on that target. An `f16`
+`::` gives the bits the same `::` gives at run time on that target. Where the
+toolchain's target model gives no defined NaN for the format converted to, the
+NaN has no rule to follow, so a constant that converts one is refused
+([A NaN in a constant on a target that leaves it unspecified](#a-nan-in-a-constant-on-a-target-that-leaves-it-unspecified)). An `f16`
 conversion the target has no instruction for follows the same rule. `:~` never
 converts, so it reads and writes a NaN's bits exactly on every target.
 
-Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
-erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
+`::` and `:~` may add the `^` secret qualifier to a value, a by-value aggregate
+or a pointer value, but never to what a pointer reaches, and neither may drop it.
+Neither can erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
 are rejected when either by-value representation contains a tag, including through
 records, arrays, or union variants. Transparent aliases preserve the tag type.
 The only secrecy downgrade is the `:>T` strip cast, which removes outer secrecy
@@ -516,9 +595,10 @@ A vector shift shifts each lane by the count in the same lane, and each lane
 follows the scalar operator exactly: `>>` is arithmetic on signed lanes and
 logical on unsigned ones, a lane count at or above the lane width saturates
 (`0`, or the sign fill for an arithmetic `>>`), and a lane count that is a
-compile-time constant at or above the width is an error. A uniform count is
-the same count in every lane of a literal, which is the form every baseline
-instruction set shifts by in one instruction:
+compile-time constant at or above the width is an error. Whether a target
+packs a shift depends on its lane type alone, never on what the count holds.
+A uniform count, the same count in every lane of a literal, can take a shorter
+sequence, as one instruction on every baseline instruction set:
 
 ```mach
 use std.runtime;
@@ -535,7 +615,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach error a vector shift count is a vector of the shifted type, never a scalar
+```mach error a vector shift count must be a vector of the shifted type, not a scalar
 fun f(x: u32x4) u32x4 {
     ret x << 3;
 }
@@ -555,25 +635,52 @@ where the target has one, else a **defined unrolled scalar expansion** with
 lane-identical results (see [policy.md](policy.md)). Neither choice changes the
 answer, so nothing about the surface depends on it.
 
-The cost does change, so the build says where it is paid. Each operation that
-falls back to the scalar expansion is one warning at its own site, never one per
-lane. The warning names the operation, its lanes and the target:
+The cost does change, so a build with debug information says where it is paid.
+An operation whose lanes a vector unit of the target holds, but which no unit
+the build selects computes, is taken one lane at a time, and each such
+operation is one warning at its own site, never one per lane. The warning names
+the operation, its lane count and its lane type:
 
 ```
-warning[vector.scalarize]: vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+warning[vector.scalarize] the vector divide over 4 lanes of 32-bit integers is split into scalar operations, because no vector unit of the target computes it
+  @ src/main.mach:3:41
+3 | fun div(a: i32x4, b: i32x4) i32x4 { ret a / b; }
+  |                                         ^
 ```
 
-Every packed row in a target's catalog declares the extension its instruction
-needs, and the warning reads those rows. When a row declared under an extension
-would pack the operation, the warning names that extension in place of "no
-packed form", for example "declaring `sse41` in the target's `extensions` packs it", and
-declaring it in [`[target.<name>].extensions`](manifest.md#instruction-set-extensions)
-makes the warning go away. Code that is portable on purpose silences the key
-with `allow = ["vector.scalarize"]` in its profile, a declaration that
-scalarizes on purpose acknowledges it with
-[`#[expect("vector.scalarize")]`](decorators.md#expectkey--acknowledge-a-warning), and
-[`simd = "require"`](manifest.md#profilename) turns the same sites into errors
-with the same text.
+The warning says that what the source wrote as one vector operation is not one
+on this target, where another type or another target may make it one. A lane type no
+unit holds is no such case: on a target with no vector unit at all, as riscv64
+without `v`, every vector operation is scalar code and none of them warns. The
+site comes from the debug information, so a build without it (`debug = false`
+in the profile, or `--no-debug`) reports none. Code that is portable on purpose
+silences the key with `allow = ["vector.scalarize"]` in its profile, and a
+declaration that scalarizes on purpose acknowledges it with
+[`#[expect("vector.scalarize")]`](decorators.md#expectkey--acknowledge-a-warning).
+
+[`simd = "require"`](manifest.md#profilename) makes every scalar expansion an
+error, `vector.scalarize_refused`, in every build, with debug information or
+without. It covers more than the warning does: an operation a unit computes
+for none of its lanes, one whose lanes no unit holds (an `i32x5` on x86-64),
+on a target with no vector unit, every vector operation, and an operation of a
+constant-time function that the function computes lane by lane because the
+target does not time the vector form against the lanes under the modes the
+function is checked under (riscv64 with `zkt` and without `zvkt`, see
+[secrecy](secrecy.md#soft-and-hard)). The error names
+the function and the operation, and stands at the operation's site where the
+build records one:
+
+```
+error[vector.scalarize_refused] 'example.main.div' has a vector divide over 4 lanes of 32-bit integers that no vector unit of the target computes, so `simd = "require"` refuses its scalar expansion
+  @ src/main.mach:3:41
+3 | fun div(a: i32x4, b: i32x4) i32x4 { ret a / b; }
+  |                                         ^
+```
+
+An operation no target has an instruction for, as an integer vector divide,
+is scalar code everywhere, so `require` refuses it on every target. Code that
+builds under `require` writes those lanes itself, as a loop or one scalar
+operation per lane, where the cost is in plain sight.
 
 Integer `*` is where this is most visible today:
 
@@ -582,31 +689,62 @@ Integer `*` is where this is most visible today:
 | `i8x16 * i8x16` | scalar expansion | packed `mul .16b` | scalar expansion |
 | `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
 | `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
-| `i64x2 * i64x2` | packed `pmuludq` triple (`vpmullq` under `avx512dq` and `avx512vl`) | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+| `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
-Shifts realize by the count's form: a count that is the same value in every
-lane shifts every lane by that one scalar, and any other count shifts each lane
-by its own.
+A shift is packed or expanded by its operator, its lane type and the
+target's features, so a debug build and an optimised one, and a count written
+in the shift or held in a local or a parameter, all get the same answer under
+`simd = "require"`. What the count holds only picks the sequence: on x86_64 a
+count the backend sees is the same value in every lane shifts every lane by
+that one value in one instruction. It sees one where the shift's operand is a
+literal of one value in every lane (`x >> u32x4{n, n, n, n}`), or, in a build
+that promotes locals to registers (`-O`), a local holding one. Any other count
+is shifted in the vector registers once per lane, by that lane's count, and
+the lanes merged by packed shuffles, so no lane passes through a general
+register.
 
 | shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
 |---|---|---|---|
-| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | packed `shl` / `ushr` / `sshr` by a constant, `dup` then `ushl` / `sshl` by a register | scalar expansion |
-| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | packed, as above | scalar expansion |
-| uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | packed, as above | scalar expansion |
-| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512VL) | packed `ushl` / `sshl` | scalar expansion |
-| per-lane count on 8- and 16-bit lanes | scalar expansion | packed `ushl` / `sshl` | scalar expansion |
+| `<<`, `>>` on 32- and 64-bit lanes (not arithmetic `>>` on 64-bit lanes) | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else one `psll*` / `psrl*` / `psra*` by a register per lane merged by `punpck*qdq` and `pshufd`, or one of them for a uniform count | packed `ushl` / `sshl` | scalar expansion |
+| `<<`, `>>` on 16-bit lanes | packed: one `psllw` / `psrlw` / `psraw` by a register per lane, paired into doublewords by `pslld`, `psrld` and `por` and merged as above, or one of them for a uniform count (`vpsllvw` is AVX-512BW) | packed `ushl` / `sshl` | scalar expansion |
+| arithmetic `>>` on 64-bit lanes | scalar expansion (`vpsraq` and `vpsravq` are AVX-512) | packed `sshl` | scalar expansion |
+| `<<`, `>>` on 8-bit lanes | scalar expansion (SSE has no byte shift) | packed `ushl` / `sshl` | scalar expansion |
 
 The x86_64 packed instructions saturate a count at or above the lane width on
-their own, so they need none of the scalar shift's range test. aarch64's
-`ushl` and `sshl` read only a count's low byte, as a signed amount that shifts
-right when negative, so a count is first clamped with `uqshl` and `ushr` to at
-most 127, which every lane width saturates at, and negated for a right shift.
-A constant count at or above the width is the fill itself. SPIR-V leaves an
+their own: `psll`, `psrl` and `psra` read the whole low quadword of the count
+register as unsigned, and `vpsllv`, `vpsrlv` and `vpsravd` each lane's count,
+so they need none of the scalar shift's range test. aarch64's `ushl` and
+`sshl` read only a count's low byte, as a signed amount that shifts right when
+negative, so `<<` and a logical `>>` clear every lane whose count is past the
+width less one (`cmhi` against a splat of it, then `bic`), shifting by the
+count, negated for `>>`, which is exact below the width, and an arithmetic
+`>>` shifts by the count clamped to the width less one (`umin`, or `cmhi` and
+`bsl` on 64-bit lanes) and negated, which fills with the sign past it. SPIR-V leaves an
 `OpShift*` by the component width or more undefined, so it packs the shift
 beside an `OpULessThan` against the width and an `OpSelect` of 0, or of the
 shift by the width less one for an arithmetic `>>`, where the count is out of
 range. A uniform count is splatted by `OpCompositeConstruct`, since `OpShift*`
 takes a count per component.
+
+A comparison is one packed compare where the target has one, its result already
+the mask, and a short fixed sequence otherwise. `>` and `>=` are `<` and `<=`
+with the operands exchanged, and the float compares give the scalar operators'
+answer on a nan: `==`, `<` and `<=` are false and `!=` is true.
+
+| shape | x86_64 | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| `==` on 8-, 16-, 32-bit lanes | `pcmpeqb` / `pcmpeqw` / `pcmpeqd` | `cmeq` | scalar expansion |
+| `==` on 64-bit lanes | `pcmpeqq` under `sse41`, else `pcmpeqd`, `pshufd` and `pand` | `cmeq` | scalar expansion |
+| `!=` | `==`, then `pxor` with all ones | `cmeq` and `not` | scalar expansion |
+| signed `<`, `<=` on 8-, 16-, 32-bit lanes | `pcmpgt*`, and `pxor` with all ones for `<=` | `cmgt`, `cmge` | scalar expansion |
+| signed `<`, `<=` on 64-bit lanes | `pcmpgtq` under `sse42`, else scalar expansion | `cmgt`, `cmge` | scalar expansion |
+| unsigned `<`, `<=` on 8-bit lanes | `pminub` and `pcmpeqb`, and `pxor` with all ones for `<` | `cmhi`, `cmhs` | scalar expansion |
+| unsigned `<`, `<=` on 16-bit lanes | `pminuw` and `pcmpeqw` under `sse41`, else `psubusw` and a compare with zero | `cmhi`, `cmhs` | scalar expansion |
+| unsigned `<`, `<=` on 32-bit lanes | `pminud` and `pcmpeqd` under `sse41`, else both sign bits flipped and `pcmpgtd` | `cmhi`, `cmhs` | scalar expansion |
+| unsigned `<`, `<=` on 64-bit lanes | both sign bits flipped and `pcmpgtq` under `sse42`, else scalar expansion | `cmhi`, `cmhs` | scalar expansion |
+| `==`, `!=`, `<`, `<=` on `f32` and `f64` lanes | `cmpps` / `cmppd` with `eq`, `neq`, `lt` and `le` | `fcmeq`, `fcmeq` and `not`, `fcmgt`, `fcmge` | scalar expansion |
+
+The complement `~` is `pxor` with all ones on x86_64 and `not` on aarch64.
 
 Operators never widen implicitly, so a widening multiply is spelled as two lane
 casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands
@@ -628,15 +766,16 @@ extend-then-multiply path where the vector register is 128 bits. x86-64 under
 32-byte product. Either path gives the same lanes.
 
 `f16` lanes realize per target as [types.md](types.md#simd-vectors) lists: packed
-on aarch64 with `fp16` and on spirv with `float16`, through packed `f32` lanes on
-x86-64 with `f16c` (and for comparisons on aarch64 without `fp16`), and otherwise
-each lane's scalar `f16` operation
+on aarch64 with `fp16` and on spirv with `Float16`, through packed `f32` lanes on
+x86-64 with `f16c` (and for comparisons on aarch64 without `fp16`), as `f32` lanes of
+integer code on the lanes' encodings at the vector's width on spirv without `Float16`, and
+otherwise each lane's scalar `f16` operation
 ([Half-precision arithmetic](#half-precision-arithmetic)). Every form gives each
 lane the bits of the scalar operation.
 
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
 profile (see [manifest.md](manifest.md)), which turns the shortfall into a
-build error naming the operation, its lane width, the function and the target.
+build error naming the function, the operation and its lanes.
 
 A comparison produces the same-shape **unsigned mask** vector — one lane per input
 lane, all-ones bits (`0xFF…`) for true and all-zeros for false, exactly what the
@@ -644,7 +783,7 @@ hardware compare yields. There is no vector-bool type. The mask element is the
 unsigned integer of the input's lane width: `f32x4` / `i32x4` / `u32x4` → `u32x4`;
 `f64x2` / `i64x2` → `u64x2`; `f16x8` / `i16x8` → `u16x8`; `i8x16` → `u8x16`. Select/blend is
 not an operator; it is the library idiom `(mask & a) | (~mask & b)` over matching
-integer lanes (the tier-3 simd library, #2021).
+integer lanes (the tier-3 simd library).
 
 ```mach fragment
 val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};

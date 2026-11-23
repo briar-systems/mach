@@ -1,0 +1,386 @@
+# a semantic type spelled as a program writes it, for diagnostics and debug names
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use std_format: std.format;
+use std.memory;
+use std.types.bool.bool;
+use std.types.char.char;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use base_catalog: mach.base.catalog;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.stack;
+use mach.front.ast;
+use ast_id:   mach.front.ast.id;
+use ast_type: mach.front.ast.type;
+use mach.session;
+use mach.type;
+use type_kind: mach.type.kind;
+use type_prim: mach.type.prim;
+
+# a type kind neither pass of the spelling names: a defect, since the type
+# table only holds members of the catalog
+fun unknown_kind(s: *session.Session, k: type_kind.TypeKind, where: str) fail.Fail {
+    ret fail.message_of(base_catalog.catalog_interned(s.interner, s.alloc, base_catalog.unknown_member_in("TypeKind", k::u32, where)));
+}
+
+# the spelling recurses as deep as a type nests, so each pass asks for stack before it
+# descends; a type has no place of its own, so the phase asking reports this where it stands
+fun nesting() fail.Fail {
+    ret fail.user(diagnostic_kind.SYNTAX_NESTING_DEPTH, "a type nests too deeply to be spelled");
+}
+
+# spell a semantic type as a program writes it, in a fresh nul-terminated buffer
+# ---
+# s:   session whose type store and allocator are used
+# t:   type to spell, the error or nil type spells `<error>`
+# ret: the spelling, owned by the caller and released with type_str_free, or the
+#      failure when the type nests too deeply, names no stored type, reaches a kind
+#      the spelling does not name, or the allocation is refused
+pub fun type_to_str(s: *session.Session, t: type_kind.TypeId) res[str, fail.Fail] {
+    val res_len: res[usize, fail.Fail] = type_str_len(s, t);
+    if (sel res_len.err) { ret res[str, fail.Fail].err{res_len.err}; }
+    val len:     usize               = res_len.ok;
+    val res_buf: res[*char, A.Error] = A.allocate[char](s.alloc, len + 1);
+    if (sel res_buf.err) { ret res[str, fail.Fail].err{fail.refused(res_buf.err)}; }
+    val buf:                str                   = res_buf.ok;
+    val res_write_type_str: res[usize, fail.Fail] = write_type_str(s, buf, 0, t);
+    if (sel res_write_type_str.err) {
+        type_str_free_sized(s, buf, len);
+        ret res[str, fail.Fail].err{res_write_type_str.err};
+    }
+    buf[res_write_type_str.ok] = 0;
+    ret res[str, fail.Fail].ok{buf};
+}
+
+# the annotation `tid` of the syntax `a` as its source spells it, each run of white space one
+# space, released with `type_str_free`; none where the node or its source is gone
+pub fun annotation_str(s: *session.Session, a: *ast.Ast, tid: ast_id.TypeId) res[opt[str], fail.Fail] {
+    if (a == nil || ast_id.type_is_nil(tid)) { ret res[opt[str], fail.Fail].ok{opt[str].none{}}; }
+    val opt_type: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_type.none) { ret res[opt[str], fail.Fail].ok{opt[str].none{}}; }
+    val opt_file: opt[*base_source.SourceFile] = base_source.get(s.sources, a.file_id);
+    if (sel opt_file.none) { ret res[opt[str], fail.Fail].ok{opt[str].none{}}; }
+    val text:  str   = opt_file.some.text;
+    val start: usize = opt_type.some.span.offset::usize;
+    val end:   usize = start + opt_type.some.span.len::usize;
+    var len:   usize = 0;
+    var i:     usize = start;
+    for (i < end) {
+        if (!is_space(text[i]) || (i > start && !is_space(text[i - 1]))) { len = len + 1; }
+        i = i + 1;
+    }
+    val res_buf: res[*char, A.Error] = A.allocate[char](s.alloc, len + 1);
+    if (sel res_buf.err) { ret res[opt[str], fail.Fail].err{fail.refused(res_buf.err)}; }
+    val buf: str   = res_buf.ok;
+    var at:  usize = 0;
+    i = start;
+    for (i < end) {
+        if (!is_space(text[i])) {
+            buf[at] = text[i];
+            at      = at + 1;
+        }
+        or (i > start && !is_space(text[i - 1])) {
+            buf[at] = ' ';
+            at      = at + 1;
+        }
+        i = i + 1;
+    }
+    buf[at] = 0;
+    ret res[opt[str], fail.Fail].ok{opt[str].some{buf}};
+}
+
+fun is_space(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+# a buffer the write pass never terminated
+fun type_str_free_sized(s: *session.Session, buf: str, len: usize) {
+    A.deallocate[char](s.alloc, buf, len + 1);
+}
+
+# release a spelled type; a nil spelling owns nothing
+pub fun type_str_free(s: *session.Session, owned: str) {
+    if (owned == nil) { ret; }
+    A.deallocate[char](s.alloc, owned, str_len(owned) + 1);
+}
+
+# the spelled length of a type; a kind no arm names is an internal failure
+fun type_str_len(s: *session.Session, t: type_kind.TypeId) res[usize, fail.Fail] {
+    if (type_kind.is_error(t) || type_kind.is_nil(t)) { ret res[usize, fail.Fail].ok{7}; }
+    if (stack.exhausted())                            { ret res[usize, fail.Fail].err{nesting()}; }
+
+    val opt_type: opt[*type.Type] = type.get(s.types, t);
+    if (!sel opt_type.some) { ret res[usize, fail.Fail].err{fail.message("typename: a type id names no type in the store")}; }
+    val tp: *type.Type         = opt_type.some;
+    val k:  type_kind.TypeKind = tp.kind;
+
+    if (type_prim.is_prim(k))        { ret res[usize, fail.Fail].ok{type_prim.prim_spelling_len(k)}; }
+    if (k == type_kind.TYPE_POINTER) { ret len_after(s, 1, tp.data.pointer.base); }
+    if (k == type_kind.TYPE_SECRET)  { ret len_after(s, 1, tp.data.secret.base); }
+    if (k == type_kind.TYPE_ARRAY) {
+        ret len_after(s, 1 + decimal_len(tp.data.array.count::usize) + 1, tp.data.array.base);
+    }
+    if (k == type_kind.TYPE_VECTOR) {
+        val tail:     usize                 = 1 + decimal_len(tp.data.vector.lanes::usize);
+        val opt_prim: opt[type_kind.TypeId] = type.prim(s.types, tp.data.vector.element);
+        if (sel opt_prim.some) { ret len_after(s, tail, opt_prim.some); }
+        ret res[usize, fail.Fail].ok{tail};
+    }
+    if (k == type_kind.TYPE_HANDLE) {
+        ret res[usize, fail.Fail].ok{name_str_len(s, tp.data.handle.name)};
+    }
+    if (k == type_kind.TYPE_ABI) {
+        ret res[usize, fail.Fail].ok{name_str_len(s, tp.data.abi.name)};
+    }
+    if (k == type_kind.TYPE_REC || k == type_kind.TYPE_UNI || k == type_kind.TYPE_TAG) {
+        ret res[usize, fail.Fail].ok{name_str_len(s, tp.data.nominal.name)};
+    }
+    if (k == type_kind.TYPE_GENERIC_PARAM) {
+        ret res[usize, fail.Fail].ok{name_str_len(s, tp.data.generic_param.name)};
+    }
+    if (k == type_kind.TYPE_INSTANCE) { ret instance_str_len(s, tp); }
+    if (k == type_kind.TYPE_FUN)      { ret fun_str_len(s, tp); }
+    if (k == type_kind.TYPE_PACK)     { ret res[usize, fail.Fail].ok{3}; }
+    if (k == type_kind.TYPE_CASE_SELECTOR) {
+        ret len_after(s, 1 + name_str_len(s, tp.data.case_selector.case_name), tp.data.case_selector.tag_type);
+    }
+    ret res[usize, fail.Fail].err{unknown_kind(s, k, "the type spelling's sizing pass")};
+}
+
+# `fixed` plus the spelled length of `t`
+fun len_after(s: *session.Session, fixed: usize, t: type_kind.TypeId) res[usize, fail.Fail] {
+    val res_inner: res[usize, fail.Fail] = type_str_len(s, t);
+    if (sel res_inner.err) { ret res_inner; }
+    ret res[usize, fail.Fail].ok{fixed + res_inner.ok};
+}
+
+# writes the spelling of a type at `k` and answers the cursor after it; a kind
+# no arm names is an internal failure
+fun write_type_str(s: *session.Session, buf: str, k: usize, t: type_kind.TypeId) res[usize, fail.Fail] {
+    if (type_kind.is_error(t) || type_kind.is_nil(t)) { ret res[usize, fail.Fail].ok{write_kw(buf, k, "<error>")}; }
+    if (stack.exhausted())                            { ret res[usize, fail.Fail].err{nesting()}; }
+
+    val opt_type: opt[*type.Type] = type.get(s.types, t);
+    if (!sel opt_type.some) { ret res[usize, fail.Fail].err{fail.message("typename: a type id names no type in the store")}; }
+    val tp:   *type.Type         = opt_type.some;
+    val kind: type_kind.TypeKind = tp.kind;
+
+    if (type_prim.is_prim(kind)) { ret res[usize, fail.Fail].ok{write_kw(buf, k, type_prim.prim_name(kind))}; }
+    if (kind == type_kind.TYPE_POINTER) {
+        ret write_type_str(s, buf, write_char(buf, k, '*'), tp.data.pointer.base);
+    }
+    if (kind == type_kind.TYPE_SECRET) {
+        ret write_type_str(s, buf, write_char(buf, k, '^'), tp.data.secret.base);
+    }
+    if (kind == type_kind.TYPE_ARRAY) {
+        var w: usize = write_char(buf, k, '[');
+        w = write_decimal(buf, w, tp.data.array.count::usize);
+        w = write_char(buf, w, ']');
+        ret write_type_str(s, buf, w, tp.data.array.base);
+    }
+    if (kind == type_kind.TYPE_VECTOR) {
+        var w:        usize                 = k;
+        val opt_prim: opt[type_kind.TypeId] = type.prim(s.types, tp.data.vector.element);
+        if (sel opt_prim.some) {
+            val res_write_type_str: res[usize, fail.Fail] = write_type_str(s, buf, w, opt_prim.some);
+            if (sel res_write_type_str.err) { ret res_write_type_str; }
+            w = res_write_type_str.ok;
+        }
+        w = write_char(buf, w, 'x');
+        ret res[usize, fail.Fail].ok{write_decimal(buf, w, tp.data.vector.lanes::usize)};
+    }
+    if (kind == type_kind.TYPE_HANDLE) {
+        ret res[usize, fail.Fail].ok{write_name(s, buf, k, tp.data.handle.name)};
+    }
+    if (kind == type_kind.TYPE_ABI) {
+        ret res[usize, fail.Fail].ok{write_name(s, buf, k, tp.data.abi.name)};
+    }
+    if (kind == type_kind.TYPE_REC || kind == type_kind.TYPE_UNI || kind == type_kind.TYPE_TAG) {
+        ret res[usize, fail.Fail].ok{write_name(s, buf, k, tp.data.nominal.name)};
+    }
+    if (kind == type_kind.TYPE_GENERIC_PARAM) {
+        ret res[usize, fail.Fail].ok{write_name(s, buf, k, tp.data.generic_param.name)};
+    }
+    if (kind == type_kind.TYPE_INSTANCE) {
+        ret write_instance(s, buf, k, tp);
+    }
+    if (kind == type_kind.TYPE_FUN) {
+        ret write_fun(s, buf, k, tp);
+    }
+    if (kind == type_kind.TYPE_PACK) {
+        ret res[usize, fail.Fail].ok{write_kw(buf, k, "...")};
+    }
+    if (kind == type_kind.TYPE_CASE_SELECTOR) {
+        val res_write_type_str: res[usize, fail.Fail] = write_type_str(s, buf, k, tp.data.case_selector.tag_type);
+        if (sel res_write_type_str.err) { ret res_write_type_str; }
+        val w: usize = write_char(buf, res_write_type_str.ok, '.');
+        ret res[usize, fail.Fail].ok{write_name(s, buf, w, tp.data.case_selector.case_name)};
+    }
+    ret res[usize, fail.Fail].err{unknown_kind(s, kind, "the type spelling's write pass")};
+}
+
+fun instance_str_len(s: *session.Session, tp: *type.Type) res[usize, fail.Fail] {
+    var total: usize = instance_name_len(s, tp);
+    total = total + 1;
+    val args_start: u32 = tp.data.instance.args_start;
+    val args_len:   u32 = tp.data.instance.args_len;
+    var i:          u32 = 0;
+    for (i < args_len) {
+        if (i > 0) { total = total + 2; }
+        val res_arg: res[usize, fail.Fail] = type_str_len(s, instance_arg(s, args_start + i));
+        if (sel res_arg.err) { ret res_arg; }
+        total = total + res_arg.ok;
+        i     = i + 1;
+    }
+    total = total + 1;
+    ret res[usize, fail.Fail].ok{total};
+}
+
+fun write_instance(s: *session.Session, buf: str, k: usize, tp: *type.Type) res[usize, fail.Fail] {
+    var w: usize = write_instance_name(s, buf, k, tp);
+    w = write_char(buf, w, '[');
+    val args_start: u32 = tp.data.instance.args_start;
+    val args_len:   u32 = tp.data.instance.args_len;
+    var i:          u32 = 0;
+    for (i < args_len) {
+        if (i > 0) { w = write_kw(buf, w, ", "); }
+        val res_write_type_str: res[usize, fail.Fail] = write_type_str(s, buf, w, instance_arg(s, args_start + i));
+        if (sel res_write_type_str.err) { ret res_write_type_str; }
+        w = res_write_type_str.ok;
+        i = i + 1;
+    }
+    w = write_char(buf, w, ']');
+    ret res[usize, fail.Fail].ok{w};
+}
+
+# the type at `idx` in the shared parameter store, or the error type when absent
+fun instance_arg(s: *session.Session, idx: u32) type_kind.TypeId {
+    val opt_arg: opt[type_kind.TypeId] = type.get_param(s.types, idx);
+    if (!sel opt_arg.some) { ret type_kind.TYPE_ERROR; }
+    ret opt_arg.some;
+}
+
+fun instance_name_len(s: *session.Session, tp: *type.Type) usize {
+    val generic_nominal: type_kind.TypeId = tp.data.instance.nominal;
+    val name:            intern.StrId     = nominal_name_of(s, generic_nominal);
+    if (intern.str_is_nil(name)) { ret 6; }
+    ret name_str_len(s, name);
+}
+
+fun write_instance_name(s: *session.Session, buf: str, k: usize, tp: *type.Type) usize {
+    val generic_nominal: type_kind.TypeId = tp.data.instance.nominal;
+    val name:            intern.StrId     = nominal_name_of(s, generic_nominal);
+    if (intern.str_is_nil(name)) { ret write_kw(buf, k, "<anon>"); }
+    ret write_name(s, buf, k, name);
+}
+
+fun nominal_name_of(s: *session.Session, t: type_kind.TypeId) intern.StrId {
+    if (type_kind.is_error(t) || type_kind.is_nil(t)) { ret intern.STR_NIL; }
+    val opt_type: opt[*type.Type] = type.get(s.types, t);
+    if (!sel opt_type.some) { ret intern.STR_NIL; }
+    val tp: *type.Type = opt_type.some;
+    if (tp.kind != type_kind.TYPE_REC && tp.kind != type_kind.TYPE_UNI && tp.kind != type_kind.TYPE_TAG) { ret intern.STR_NIL; }
+    ret tp.data.nominal.name;
+}
+
+# the decorator a function type marked with a constant-time mode is spelled with, an empty string for one with none
+fun timed_prefix(tp: *type.Type) str {
+    if (tp.data.fn.timed == type.TIMED_SOFT) { ret "#[constant_time(\"soft\")] "; }
+    if (tp.data.fn.timed == type.TIMED_HARD) { ret "#[constant_time(\"hard\")] "; }
+    ret "";
+}
+
+fun fun_str_len(s: *session.Session, tp: *type.Type) res[usize, fail.Fail] {
+    var total:        usize = 4 + str_len(timed_prefix(tp));
+    val params_start: u32   = tp.data.fn.params_start;
+    val params_len:   u32   = tp.data.fn.params_len;
+    var i:            u32   = 0;
+    for (i < params_len) {
+        if (i > 0) { total = total + 2; }
+        val res_param: res[usize, fail.Fail] = type_str_len(s, instance_arg(s, params_start + i));
+        if (sel res_param.err) { ret res_param; }
+        total = total + res_param.ok;
+        i     = i + 1;
+    }
+    if (tp.data.fn.c_variadic) {
+        if (params_len > 0) { total = total + 2; }
+        total = total + 3;
+    }
+    total = total + 1;
+    if (!type_kind.is_nil(tp.data.fn.ret_type)) {
+        ret len_after(s, total + 1, tp.data.fn.ret_type);
+    }
+    ret res[usize, fail.Fail].ok{total};
+}
+
+fun write_fun(s: *session.Session, buf: str, k: usize, tp: *type.Type) res[usize, fail.Fail] {
+    var w: usize = write_kw(buf, k, timed_prefix(tp));
+    w = write_kw(buf, w, "fun");
+    w = write_char(buf, w, '(');
+    val params_start: u32 = tp.data.fn.params_start;
+    val params_len:   u32 = tp.data.fn.params_len;
+    var i:            u32 = 0;
+    for (i < params_len) {
+        if (i > 0) { w = write_kw(buf, w, ", "); }
+        val res_write_type_str: res[usize, fail.Fail] = write_type_str(s, buf, w, instance_arg(s, params_start + i));
+        if (sel res_write_type_str.err) { ret res_write_type_str; }
+        w = res_write_type_str.ok;
+        i = i + 1;
+    }
+    if (tp.data.fn.c_variadic) {
+        if (params_len > 0) { w = write_kw(buf, w, ", "); }
+        w = write_kw(buf, w, "...");
+    }
+    w = write_char(buf, w, ')');
+    if (!type_kind.is_nil(tp.data.fn.ret_type)) {
+        w = write_char(buf, w, ' ');
+        ret write_type_str(s, buf, w, tp.data.fn.ret_type);
+    }
+    ret res[usize, fail.Fail].ok{w};
+}
+
+fun name_str_len(s: *session.Session, name: intern.StrId) usize {
+    ret str_len(name_str(s, name));
+}
+
+# the spelling of a type's name; an anonymous type, whose name is absent or
+# empty, is spelled `<anon>`
+pub fun name_str(s: *session.Session, name: intern.StrId) str {
+    if (intern.str_is_nil(name)) { ret "<anon>"; }
+    val spelled: str = intern.text(s.interner, name);
+    if (str_len(spelled) == 0) { ret "<anon>"; }
+    ret spelled;
+}
+
+fun write_name(s: *session.Session, buf: str, k: usize, name: intern.StrId) usize {
+    ret write_kw(buf, k, name_str(s, name));
+}
+
+fun write_char(buf: str, k: usize, c: char) usize {
+    buf[k] = c;
+    ret k + 1;
+}
+
+fun write_kw(buf: str, k: usize, text: str) usize {
+    val len: usize = str_len(text);
+    memory.raw_copy((buf::usize + k)::ptr, text::ptr, len);
+    ret k + len;
+}
+
+fun decimal_len(n: usize) usize {
+    var digits: [std_format.DECIMAL_MAX]u8;
+    ret std_format.put_u64(?digits[0], n::u64);
+}
+
+fun write_decimal(buf: str, k: usize, n: usize) usize {
+    ret k + std_format.put_u64((buf::usize + k)::*u8, n::u64);
+}

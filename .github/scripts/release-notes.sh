@@ -26,7 +26,13 @@ tag=$1
 ver=${tag#v}
 
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "no tag $tag"
-prev=$(git describe --tags --abbrev=0 --match 'v*' "$tag^") || die "no release tag before $tag"
+case "$tag" in
+  *-*)
+    printf 'Pre-release %s (%s).\n' "$tag" "$(git rev-parse --short "$tag")"
+    exit 0
+    ;;
+esac
+prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "$tag^") || die "no release tag before $tag"
 
 repo=${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}
 owner=${repo%/*}

@@ -1,0 +1,183 @@
+# the frozen build context: everything the computations of one build read of its cell, its
+# request and its target, captured into the TARGET input so a product that reads it depends on
+# it, and fingerprinted so a change after the freeze is refused rather than read
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.base.fail;
+use base_fingerprint: mach.base.fingerprint;
+use mach.base.wire;
+use mach.compile.request;
+use mach.manifest.template;
+use mach.session.query;
+use target_fingerprint: mach.target.fingerprint;
+use mink_output:        mink.catalog.output;
+
+use mach.compile.codec;
+use mach.compile.project;
+
+# the build context of the last frozen build, keyed 0
+pub val TARGET: query.Kind = query.Kind{name: "build context", role: query.INPUT, owner: query.KEY_UNOWNED};
+
+# capture the build context's bytes: the request's semantic hash, then the configuration identity
+# ---
+# p:     project whose request, cell and target are captured
+# alloc: allocator for the captured bytes
+# ret:   the bytes as a query output the caller owns, or the failure of hashing the request or of taking the bytes
+pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+    var fb: wire.Sink = wire.grown(alloc);
+    fin { wire.dnit(?fb); }
+    val err_written: err[fail.Fail] = write_build_config(?fb, p, alloc);
+    if (sel err_written.err) { ret res[query.QueryOutput, fail.Fail].err{err_written.err}; }
+    ret codec.output(?fb);
+}
+
+# the build identity without the request: the persistent key hashes the request
+# itself, with the project root in canonical form, so the spelled root stays out
+pub fun capture_configuration_identity(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+    var fb: wire.Sink = wire.grown(alloc);
+    fin { wire.dnit(?fb); }
+    write_configuration_identity(?fb, p);
+    ret codec.output(?fb);
+}
+
+# freeze the build context: what every computation reads of the cell, the request and the
+# target is captured once, set as the TARGET input every product that reads it depends on, and
+# fingerprinted from the same bytes, so a later change to it is refused rather than read
+pub fun freeze(p: *project.Project) err[fail.Fail] {
+    val res_captured: res[query.QueryOutput, fail.Fail] = capture_build_config(p, p.s.alloc);
+    if (sel res_captured.err) { ret err[fail.Fail].err{res_captured.err}; }
+    val bytes: query.QueryOutput = res_captured.ok;
+    fin {
+        if (bytes.bytes != nil) { A.deallocate[u8](p.s.alloc, bytes.bytes, bytes.len::usize); }
+    }
+    val err_set: err[fail.Fail] = query.set_input(?p.s.queries, ?TARGET, 0, bytes.bytes, bytes.len);
+    if (sel err_set.err) { ret err_set; }
+    digest_of(bytes, ?p.context_digest);
+    p.context_frozen = true;
+    ret err[fail.Fail].ok{};
+}
+
+# refused when the context a frozen build reads no longer captures to the bytes it was frozen at
+pub fun unchanged(p: *project.Project) err[fail.Fail] {
+    if (!p.context_frozen) { ret err[fail.Fail].ok{}; }
+    val res_captured: res[query.QueryOutput, fail.Fail] = capture_build_config(p, p.s.alloc);
+    if (sel res_captured.err) { ret err[fail.Fail].err{res_captured.err}; }
+    val bytes: query.QueryOutput = res_captured.ok;
+    fin {
+        if (bytes.bytes != nil) { A.deallocate[u8](p.s.alloc, bytes.bytes, bytes.len::usize); }
+    }
+    var digest: [32]u8;
+    digest_of(bytes, ?digest);
+    var i: usize = 0;
+    for (i < 32) {
+        if (digest[i] != p.context_digest[i]) { ret err[fail.Fail].err{fail.message("the build context changed after it was frozen")}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun digest_of(bytes: query.QueryOutput, out: *[32]u8) {
+    var fb: wire.Sink = wire.digest();
+    if (bytes.len != 0) { wire.put_bytes(?fb, bytes.bytes, bytes.len::usize); }
+    wire.digest_final(?fb, out);
+}
+
+fun write_build_config(fb: *wire.Sink, p: *project.Project, a: *A.Allocator) err[fail.Fail] {
+    var digest:            [32]u8;
+    val err_semantic_hash: err[fail.Fail] = request.semantic_hash(a, ?p.req, ?digest[0]);
+    if (sel err_semantic_hash.err) { ret err[fail.Fail].err{err_semantic_hash.err}; }
+    wire.put_bytes(fb, ?digest[0], request.HASH_SIZE);
+    write_configuration_identity(fb, p);
+    ret err[fail.Fail].ok{};
+}
+
+fun write_configuration_identity(fb: *wire.Sink, p: *project.Project) {
+    write_target_fingerprint(fb, p);
+    base_fingerprint.put_name(fb, p.s.interner, p.target_entry.os_name);
+    base_fingerprint.put_name(fb, p.s.interner, p.target_entry.isa_name);
+    base_fingerprint.put_name(fb, p.s.interner, p.target_entry.abi_name);
+    base_fingerprint.put_name(fb, p.s.interner, p.target_entry.platform_name);
+    base_fingerprint.put_name(fb, p.s.interner, p.config.id);
+    base_fingerprint.put_name(fb, p.s.interner, p.config.version);
+    base_fingerprint.put_name(fb, p.s.interner, p.config.bin_name);
+    base_fingerprint.put_name(fb, p.s.interner, p.config.bin_kind);
+    write_artifact_entries(fb, p, p.union_entries, p.union_entry_count);
+    write_artifact_entries(fb, p, p.foreign_entries, p.foreign_entry_count);
+    write_dependency_identities(fb, p);
+    # the root set decides which entries load and how gates are walked
+    wire.put_u8(fb, p.roots::u8);
+    write_requirement_scopes(fb, p);
+}
+
+# the artifact and kind of each of `count` entries the union walk loads, which a module of that artifact reads as
+# `$bin.name` and `$bin.kind`
+fun write_artifact_entries(fb: *wire.Sink, p: *project.Project, entries: *project.ArtifactEntry, count: u32) {
+    wire.put_u32(fb, count);
+    var i: u32 = 0;
+    for (i < count) {
+        base_fingerprint.put_name(fb, p.s.interner, entries[i].artifact);
+        var kind: str = mink_output.STATIC.spelled;
+        if (sel entries[i].kind.row) { kind = entries[i].kind.row.spelled; }
+        wire.put_sized(fb, kind, str_len(kind));
+        i = i + 1;
+    }
+}
+
+# the identity each dependency's modules read as `$mach.project.*`
+fun write_dependency_identities(fb: *wire.Sink, p: *project.Project) {
+    wire.put_u32(fb, p.config.dep_count);
+    var i: u32 = 0;
+    for (i < p.config.dep_count) {
+        base_fingerprint.put_name(fb, p.s.interner, p.config.deps[i].project_id);
+        base_fingerprint.put_name(fb, p.s.interner, p.config.deps[i].manifest.version);
+        i = i + 1;
+    }
+}
+
+# the `{artifact.<id>.out}` vocabulary each project's modules resolve an embed
+# in: sema reads it, so a cell that resolves other requirements is another
+# configuration and a module's products are not reused across the two
+fun write_requirement_scopes(fb: *wire.Sink, p: *project.Project) {
+    wire.put_u32(fb, p.config.req_scope_count);
+    var si: u32 = 0;
+    for (si < p.config.req_scope_count) {
+        val sc: *template.Requirements = ?p.config.req_scopes[si];
+        base_fingerprint.put_name(fb, p.s.interner, sc.owner);
+        var dependency: u8 = 0;
+        if (sc.dependency) { dependency = 1; }
+        wire.put_u8(fb, dependency);
+        wire.put_u32(fb, sc.req_count);
+        var ri: u32 = 0;
+        for (ri < sc.req_count) {
+            base_fingerprint.put_text(fb, sc.reqs[ri].name);
+            base_fingerprint.put_text(fb, sc.reqs[ri].out);
+            ri = ri + 1;
+        }
+        si = si + 1;
+    }
+}
+
+# the target's fingerprint behind its u32 length, measured first
+fun write_target_fingerprint(fb: *wire.Sink, p: *project.Project) {
+    var measured: wire.Sink = wire.measure();
+    target_fingerprint.put(?p.target, ?measured);
+    val opt_failed: opt[fail.Fail] = wire.failure(?measured);
+    if (sel opt_failed.some) {
+        wire.refuse(fb, opt_failed.some);
+        ret;
+    }
+    if (measured.len > 0xFFFFFFFF::usize) {
+        wire.refuse(fb, fail.message("target fingerprint exceeds 32-bit length"));
+        ret;
+    }
+    wire.put_u32(fb, measured.len::u32);
+    target_fingerprint.put(?p.target, fb);
+}

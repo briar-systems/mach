@@ -1,0 +1,268 @@
+# one unit's object, normal or test, made in two steps: a unit is one module, or every module of an
+# artifact where the target's family compiles it whole. `lower` lowers the unit's
+# code into a mirl module on a heap of its own and hands both back as one value, which its
+# owner keeps until `compile` has bound the offers of other modules' bodies it was given,
+# verified it, written it as text when asked and compiled it into an object; `dnit` then tears
+# the heap down. compiling reads the lowered unit and its job and writes only what it returns,
+# so compiles of different units can run side by side on one shared target (mirl#406). each
+# step times the stages it runs and keeps the counts each owner holds of the module, for the
+# readout
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use chrono_duration: std.chrono.duration;
+
+use A: std.allocator;
+use std.allocator.heap;
+use std.collections.slice.Slice;
+use io_writer: std.io.writer;
+
+use mach.base.fail;
+use mach.compile.backend;
+use backend_compile: mach.compile.backend.compile;
+use mach.compile.offer;
+use mach.host.output;
+use mach_lower:    mach.lower;
+use lower_context: mach.lower.context;
+use mach.report.readout;
+use mirl_stats:  mirl.base.stats;
+use mirl_module: mirl.ir.module;
+use mirl.ir.module.Module;
+use text_item:    mirl.ir.text.item;
+use text_printer: mirl.ir.text.printer;
+use mirl.pass.relaxation;
+use mirl.pass.setting.Optimise;
+
+# how mirl compiles a module: its optimisation setting, whether the schedule's own checks run, whether
+# the linker may relax the code, whether the objects state frames for unwind tables, the float relaxations permitted, and whether a vector
+# operation taken lane by lane is refused, as `simd = "require"` asks, and whether the object is closed, as the one
+# object of a finished module that nothing else links against
+pub rec Codegen {
+    optimise: Optimise;
+    checked:  bool;
+    relax:    bool;
+    unwind:   bool;
+    floats:   relaxation.Relaxations;
+    require:  bool;
+    report:   bool;
+    closed:   bool;
+}
+
+# a unit lowered and not yet compiled: the heap its module lives on, the module, the facts
+# its lowering kept and what lowering it measured. it lives where `lower` was told to put it
+# until `dnit`
+# ---
+# lower:     lowering the module into mirl
+# functions: the module's functions, as mirl's module holds them
+# ir_count:  the instructions lowering built into its bodies, as mirl's bodies hold them
+# offers:    the other modules' offers of their bodies the module may bind before it is compiled (compile/offer),
+#            views on the heap of offers handed over, which outlive the compile
+# spent:     compiling the module tore down the heap
+pub rec Lowered {
+    src:       heap.Source;
+    h:         heap.Heap;
+    ir:        A.Allocator;
+    m:         Module;
+    facts:     lower_context.Unit;
+    lower:     chrono_duration.Duration;
+    functions: u64;
+    ir_count:  u64;
+    offers:    Slice[offer.Candidate];
+    spent:     bool;
+}
+
+# how one lowered unit is compiled, all of it read only to the step
+# ---
+# back:     the assembled target, shared by every step and never written
+# codegen:  how mirl compiles the module
+# out:      where the object lives, which outlives the step
+# ir_path:  where mirl's text of the module is written before it compiles, "" for nowhere
+# asm_path: where masc's listing of the object is written as it compiles, "" for nowhere
+# name:     the name of the object it makes, the module's or its test object's, no other object's in a link, which
+#           refusals name and the object's format may name symbols after
+# timed:    whether mirl times and counts its stages, which only a readout reads
+# owner:    the dependency whose code the module is, which a refusal names, nil for the project being built
+pub rec Job {
+    back:     *backend.Back;
+    codegen:  Codegen;
+    out:      *A.Allocator;
+    ir_path:  str;
+    asm_path: str;
+    name:     str;
+    timed:    bool;
+    owner:    str;
+}
+
+# what compiling one lowered unit measured: mach's verifier and mirl's own stages and counts
+# ---
+# verify:   mirl's verifier over the lowered module
+# verifies: the verifier runs mach made over it
+# blocks:   the blocks the unit's heap allocated, lowering and compiling, as std's heap counts them, and not what the
+#           compile allocates on the object's allocator, which outlives the step
+# bytes:    the bytes of those allocations
+# peak:     the most bytes the unit's heap mapped
+# mirl:     mirl's stages and counts, masc's beside them, all zero for an untimed job
+pub rec Stats {
+    verify:   chrono_duration.Duration;
+    verifies: u64;
+    blocks:   u64;
+    bytes:    u64;
+    peak:     u64;
+    mirl:     mirl_stats.Stats;
+}
+
+# a unit's object and the warnings mirl gave compiling it, owned by the caller, and what the
+# compile measured
+pub rec Made {
+    compiled: backend_compile.Compiled;
+    stats:    Stats;
+}
+
+# the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module
+# on a heap drawing its spans from `spans`, the pool every unit of the build shares under its lock, the
+# value held in `out` until `dnit`, or why it was not lowered. the requests' `malloc` holds the facts
+# and any refusal
+pub fun lower(reqs: *lower_context.LowerRequest, count: usize, back: *backend.Back, spans: *heap.Pool, out: *A.Allocator) res[*Lowered, fail.Fail] {
+    val res_machine: res[*lower_context.Machine, fail.Fail] = backend.machine(back);
+    if (sel res_machine.err) { ret res[*Lowered, fail.Fail].err{res_machine.err}; }
+    val res_boxed: res[*Lowered, A.Error] = A.allocate[Lowered](out, 1);
+    if (sel res_boxed.err) { ret res[*Lowered, fail.Fail].err{fail.refused(res_boxed.err)}; }
+    val l: *Lowered = res_boxed.ok;
+    l.spent  = false;
+    l.offers = Slice[offer.Candidate]{data: nil, size: 0};
+    heap.pool_source(?l.src, spans);
+    val err_begun: err[A.Error] = heap.init(?l.h, ?l.src, 0);
+    if (sel err_begun.err) {
+        A.deallocate[Lowered](out, l, 1);
+        ret res[*Lowered, fail.Fail].err{fail.refused(err_begun.err)};
+    }
+    var kept: bool = false;
+    fin {
+        if (!kept) { dnit(out, l); }
+    }
+    val err_wired: err[A.Error] = heap.allocator_owned(?l.ir, ?l.h);
+    if (sel err_wired.err) { ret res[*Lowered, fail.Fail].err{fail.refused(err_wired.err)}; }
+
+    val res_made: res[Module, fail.Fail] = lower_context.module_init(?l.ir, res_machine.ok);
+    if (sel res_made.err) { ret res[*Lowered, fail.Fail].err{res_made.err}; }
+    l.m = res_made.ok;
+    val opt_t_lower: readout.Instant                    = readout.sample();
+    val res_lowered: res[lower_context.Unit, fail.Fail] = mach_lower.lower_modules(reqs, count, ?l.m);
+    l.lower = readout.elapsed(opt_t_lower);
+    if (sel res_lowered.err) { ret res[*Lowered, fail.Fail].err{res_lowered.err}; }
+    l.facts = res_lowered.ok;
+    val size: mirl_module.Size = mirl_module.size(?l.m);
+    l.functions = size.functions::u64;
+    l.ir_count  = size.instructions::u64;
+    kept        = true;
+    ret res[*Lowered, fail.Fail].ok{l};
+}
+
+# tear down what `lower` made in `out`: the heap and the module on it, unless compiling tore them
+# down. the facts are the holder's, who gives them back or hands them on
+pub fun dnit(out: *A.Allocator, l: *Lowered) {
+    if (!l.spent) { val err_freed: err[A.Error] = heap.dnit(?l.h); }
+    A.deallocate[Lowered](out, l, 1);
+}
+
+# the object of the lowered unit `l`, compiled as `job` says, or why it was not made, unplaced.
+# compiling spends the module and tears down the unit's heap, so a lowered unit is compiled once
+pub fun compile(job: *Job, l: *Lowered) res[Made, backend_compile.Unplaced] {
+    fin {
+        val err_freed: err[A.Error] = heap.dnit(?l.h);
+        l.spent = true;
+    }
+    var stats: Stats;
+    stats.mirl = mirl_stats.make();
+    val err_bound: err[fail.Fail] = offer.attach(?l.m, ?l.ir, job.out, l.offers);
+    if (sel err_bound.err) { ret res[Made, backend_compile.Unplaced].err{backend_compile.bare(err_bound.err)}; }
+    val c: Codegen = job.codegen;
+    if (c.checked) {
+        val res_machine: res[*lower_context.Machine, fail.Fail] = backend.machine(job.back);
+        if (sel res_machine.err) { ret res[Made, backend_compile.Unplaced].err{backend_compile.bare(res_machine.err)}; }
+        val opt_t_verify: readout.Instant = readout.sample();
+        val err_verified: err[fail.Fail]  = mach_lower.verify_module(res_machine.ok, job.out, job.name, ?l.m);
+        stats.verify   = readout.elapsed(opt_t_verify);
+        stats.verifies = 1;
+        if (sel err_verified.err) { ret res[Made, backend_compile.Unplaced].err{backend_compile.bare(err_verified.err)}; }
+    }
+
+    if (str_len(job.ir_path) != 0) {
+        var printed:     Printed        = Printed{m: ?l.m, failed: opt[text_printer.Error].none{}};
+        val err_written: err[fail.Fail] = output.writer[Printed](nil, job.out, job.ir_path, ?printed, write_text, 0o644, nil);
+        if (sel printed.failed.some) { ret res[Made, backend_compile.Unplaced].err{backend_compile.bare(printer_fail(printed.failed.some))}; }
+        if (sel err_written.err)     { ret res[Made, backend_compile.Unplaced].err{backend_compile.bare(err_written.err)}; }
+    }
+    var opt_sink: opt[*mirl_stats.Stats] = opt[*mirl_stats.Stats].none{};
+    if (job.timed) { opt_sink = opt[*mirl_stats.Stats].some{?stats.mirl}; }
+    val res_compiled: res[backend_compile.Compiled, backend_compile.Unplaced] = compile_listed(job, ?l.m, opt_sink);
+    if (sel res_compiled.err) { ret res[Made, backend_compile.Unplaced].err{res_compiled.err}; }
+    stats.blocks = heap.allocated_blocks(?l.h)::u64;
+    stats.bytes  = heap.allocated_bytes(?l.h)::u64;
+    stats.peak   = heap.peak_mapped_bytes(?l.h)::u64;
+    ret res[Made, backend_compile.Unplaced].ok{Made{compiled: res_compiled.ok, stats: stats}};
+}
+
+# what a listed compile carries through the writer that streams its listing
+rec Listed {
+    job:   *Job;
+    m:     *Module;
+    stats: opt[*mirl_stats.Stats];
+    made:  res[backend_compile.Compiled, backend_compile.Unplaced];
+}
+
+# the module `m` compiled as `job` says, its listing streamed to the job's asm path when it
+# names one, and its stages timed into `stats` when there is one. a refused compile is the
+# compile's failure, not the listing's
+fun compile_listed(job: *Job, m: *Module, stats: opt[*mirl_stats.Stats]) res[backend_compile.Compiled, backend_compile.Unplaced] {
+    val c: Codegen = job.codegen;
+    if (str_len(job.asm_path) == 0) {
+        ret backend_compile.compile(job.back, job.out, m, c.optimise, c.checked, c.relax, c.unwind, c.floats, c.require, c.report, c.closed, opt[*io_writer.Writer].none{}, stats, job.name, job.owner);
+    }
+    var listed:      Listed         = Listed{job: job, m: m, stats: stats, made: res[backend_compile.Compiled, backend_compile.Unplaced].err{backend_compile.bare(fail.message("the listing's compile did not run"))}};
+    val err_written: err[fail.Fail] = output.writer[Listed](nil, job.out, job.asm_path, ?listed, write_listing, 0o644, nil);
+    if (sel listed.made.err) { ret listed.made; }
+    if (sel err_written.err) {
+        if (sel listed.made.ok) { backend_compile.dnit(job.out, ?listed.made.ok); }
+        ret res[backend_compile.Compiled, backend_compile.Unplaced].err{backend_compile.bare(err_written.err)};
+    }
+    ret listed.made;
+}
+
+fun write_listing(listed: *Listed, out: *io_writer.Writer) err[io_writer.WriteError] {
+    val c: Codegen = listed.job.codegen;
+    listed.made = backend_compile.compile(listed.job.back, listed.job.out, listed.m, c.optimise, c.checked, c.relax, c.unwind, c.floats, c.require, c.report, c.closed, opt[*io_writer.Writer].some{out}, listed.stats, listed.job.name, listed.job.owner);
+    ret err[io_writer.WriteError].ok{};
+}
+
+# what printing a module's text carries through the writer that streams it: the module, and a
+# failure of the printer's own, which is no failure of the writer's
+rec Printed {
+    m:      *Module;
+    failed: opt[text_printer.Error];
+}
+
+# the module's text, a refusal of the writer handed back as the writer's and any other kept for
+# the caller
+fun write_text(printed: *Printed, out: *io_writer.Writer) err[io_writer.WriteError] {
+    val err_written: err[text_printer.Error] = text_item.print(out, printed.m);
+    if (sel err_written.ok) { ret err[io_writer.WriteError].ok{}; }
+    val e: text_printer.Error = err_written.err;
+    if (sel e.write) { ret err[io_writer.WriteError].err{e.write}; }
+    printed.failed = opt[text_printer.Error].some{e};
+    ret err[io_writer.WriteError].ok{};
+}
+
+# why the printer could not write a module's text
+fun printer_fail(e: text_printer.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    ret fail.message(text_printer.describe(e));
+}

@@ -18,7 +18,11 @@ if (cond) {
 - The `if` head opens the chain.
 - Each `or (cond) { ... }` adds another branch.
 - A trailing `or { ... }` is the catch-all.
-- Bodies are blocks; there is no one-statement-without-braces form.
+- Bodies are blocks. There is no one-statement-without-braces form.
+
+A condition has type `u1`, which comparisons and logical operators produce. Any
+other type is refused with `condition.type`, naming `u1`. A v6 condition of type
+`u8` is refused the same way, naming the comparison that replaces it.
 
 An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
 `P.c` inside its block:
@@ -38,7 +42,11 @@ fun read(reply: Reply) i64 {
 
 A guard is a lexical region, not a flow fact. A chain whose every arm exits
 guards the remainder of the enclosing block for the case the chain left
-untested. See [tag.md](tag.md).
+untested, and a chain's final bare `or` is guarded the same way for the one case
+the arms before it left untested. Assigning a name the guarded place is spelled
+with, such as the `i` of `sel items[i].value`, ends the guard from that point on,
+for the whole of a loop that holds the assignment and in a `fin` body that
+replays after it. See [tag.md](tag.md).
 
 ## `for`
 
@@ -84,10 +92,17 @@ ret expr;                   # return a value
 ret;                        # return from a void function
 ```
 
+In a function that states a result type, every path ends in `ret` or in a
+statement control never passes, such as a call to a `#[noreturn]` function. A body
+whose end can be reached is refused with `ret.missing`. A chain of `sel` tests that
+names every case of a tag needs no bare `or`. The rule and how it reads a chain or
+a loop are in [fun.md](fun.md#a-body-with-a-result-ends-in-ret).
+
 ## `brk` / `cnt`
 
-Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
-next iteration.
+Loop control: `brk` exits the enclosing `for`, and `cnt` continues to the
+next iteration. A `brk` or `cnt` with no enclosing `for` in its function is
+refused with `jump.no_loop`.
 
 ```mach
 use std.print;
@@ -109,11 +124,11 @@ fun main(argc: i64, argv: **u8) i64 {
 ```
 
 Both are operand-less, so they are keywords only in their bare `brk;` / `cnt;`
-form. The same word followed by anything else is an ordinary identifier — a
+form. The same word followed by anything else is an ordinary identifier. A
 variable named `cnt` reads and assigns normally (`cnt = x;`), even inside a
 loop that also uses bare `cnt;` for control flow.
 
-## `fin` — deferred block
+## `fin`: deferred block
 
 `fin` schedules a block to execute when its enclosing block exits, in reverse
 order of declaration. Useful for cleanup that should happen regardless of how
@@ -142,26 +157,26 @@ fun main(argc: i64, argv: **u8) i64 {
 
 `fin` is block-scoped: it belongs to the block that declares it and covers
 only the statements after its declaration. A function body is a block, so the
-classic pattern — a `fin` at the top of a function running at every return —
+classic pattern, a `fin` at the top of a function running at every return,
 is the block rule applied to the outermost scope.
 
 - A **normal block exit** replays the block's fins, then execution continues
   after the block.
 - A **loop body** is a block: its fins replay at the end of every iteration,
   with that iteration's values.
-- **`brk` / `cnt`** replay the fins of every scope being exited — everything
-  down through the targeted loop's body, innermost first — before branching.
+- **`brk` / `cnt`** replay the fins of every scope being exited, everything
+  down through the targeted loop's body, innermost first, before branching.
   The loop body's fins replay under `cnt` too: the iteration is ending.
 - **`ret expr;`** fully evaluates the return expression first, then replays
   the fins of every open scope (innermost first), then returns the
-  already-evaluated value — a fin's side effects are never observable in the
+  already-evaluated value. A fin's side effects are never observable in the
   returned value. A bare `ret` likewise, minus the expression.
 
 A `fin` declared inside another fin's body belongs to that body's block and
 replays when the body finishes. Control flow cannot cross a `fin` boundary
-outward: a `ret` inside a fin body is a compile error, as is a `brk` / `cnt`
-whose target loop encloses the fin. A loop fully inside the fin body uses
-`brk` / `cnt` normally.
+outward: a `ret` inside a fin body is refused with `fin.ret`, and a `brk` /
+`cnt` whose target loop encloses the fin is refused with `fin.jump`. A loop
+fully inside the fin body uses `brk` / `cnt` normally.
 
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
 (`fin stmt;`) is rejected, and so is a `ret` inside a `fin` body:
@@ -176,7 +191,8 @@ fun leave() i64 {
 ## Block
 
 `{ ... }` introduces a new lexical scope. Statements inside are evaluated
-in order. Blocks can stand alone:
+in order, and the storage of a local declared in it ends when control leaves it
+(see [val-var.md](val-var.md#scope)). Blocks can stand alone:
 
 ```mach fragment
 {
@@ -196,10 +212,21 @@ compute();
 Assignment is an expression (`x = y;` is an expression statement whose top
 operator is `=`), and so is a call whose result is discarded.
 
+An assignment gives the place the value the right side had before the
+assignment, always. A record, array, tag or union is copied byte for byte, and
+the storage on the two sides may overlap: two members of a `uni` at different
+offsets assigned to each other, or two pointers into one buffer, copy as if the
+whole right side were read before any of the left side is written. So, with
+`p` an integer address such as a `usize` (a pointer takes no `+`),
+`@(p::*[16]u64) = @((p + 8)::*[16]u64);` moves sixteen words down by one word,
+and its mirror moves them up. The one limit on "always" is a pointer that
+reaches a local in a way the language does not define
+([operators.md](operators.md#where-locals-lie)).
+
 ## Failure handling
 
 A function that can fail returns a tag. The caller tests the case with `sel`
-and exits the arm that handles the failure; the exiting chain guards the
+and exits the arm that handles the failure. The exiting chain guards the
 success payload for the rest of the block:
 
 ```mach
@@ -217,17 +244,18 @@ fun parse(input: u8) res[i64, WriteError] {
 }
 
 fun increment(input: u8) res[i64, WriteError] {
-    val flushed: err[WriteError] = flush();
-    if (sel flushed.err) { ret res[i64, WriteError].err{flushed.err}; }
-    val r: res[i64, WriteError] = parse(input);
-    if (sel r.err) { ret res[i64, WriteError].err{r.err}; }
-    ret res[i64, WriteError].ok{r.ok + 1}; # r.ok is guarded: the chain above exits
+    val err_flushed: err[WriteError]     = flush();
+    if (sel err_flushed.err) { ret res[i64, WriteError].err{err_flushed.err}; }
+    val res_parsed: res[i64, WriteError] = parse(input);
+    if (sel res_parsed.err) { ret res[i64, WriteError].err{res_parsed.err}; }
+    ret res[i64, WriteError].ok{res_parsed.ok + 1}; # res_parsed.ok is guarded: the chain above exits
 }
 ```
 
 Every reachable path through the failure arm must leave the block, with `ret`,
-or with `brk` or `cnt` targeting a loop that encloses the chain; an arm that
-falls through opens no guard, and the payload read after it is rejected. See
+or with `brk` or `cnt` targeting a loop that encloses the chain. An arm that
+falls through opens no guard, and the payload read after it is rejected with
+`tag.payload_unguarded`. See
 [tag.md](tag.md) for the guard rules.
 
 ## See also

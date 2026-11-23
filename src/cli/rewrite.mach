@@ -1,0 +1,784 @@
+# the pass a command makes over source files, rewriting each into the text a
+# transform makes of it: a project's own source tree, one named file, or a
+# stream. `mach fmt` and `mach migrate` are two transforms over it
+use std_args: std.args;
+use std.allocator.arena;
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.filesystem.native;
+use std_format: std.format;
+use io_error:   std.io.error;
+use io_writer:  std.io.writer;
+use std.system.file_identity;
+use system_os: std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.intern;
+use base_source:    mach.base.source;
+use cli_diagnostic: mach.cli.diagnostic;
+use mach.host;
+use mach.host.output.remove;
+use manifest_load:  mach.manifest.load;
+use manifest_model: mach.manifest.model;
+use mach.report.layout;
+
+# the text a command makes of one source's text, such as its canonical layout;
+# a refusal `fail.is_reported` holds was reported into the store and marks the
+# source malformed, and any other ends the command. a text it makes beside
+# diagnostics in the store marks the source flagged, for what the command left in
+# it. the last argument is the pass's `context`
+pub def Transform: fun(*A.Allocator, str, *diagnostic.DiagnosticStore, ptr) res[str, fail.Fail];
+
+# the offset of the line that heads a change at the offset `at` of a source's text, such as
+# the table a manifest line stands in, which a diff names beside the change. the text's
+# length where no line heads it
+pub def Heading: fun(str, usize) usize;
+
+# one command's pass over its inputs
+# ---
+# visited:     source files read
+# differing:   files the transform changed (rewritten, or listed by --check)
+# malformed:   files the transform refused as reported; each was left unchanged
+# flagged:     files the transform made a text of and reported diagnostics for, each about
+#              what it left as written
+# diagnostics: the command's report, which a malformed file's diagnostics go through
+# sources:     the source map a refused file's text is loaded into, which its failure points into
+# transform:   the text each source becomes
+# context:     what the command hands its transform
+# heading:     what heads each change a diff prints, nil for none
+# verb:        what the progress line of a rewritten file says was done to it
+pub rec Report {
+    visited:     usize;
+    differing:   usize;
+    malformed:   usize;
+    flagged:     usize;
+    diagnostics: *cli_diagnostic.Report;
+    sources:     *base_source.SourceMap;
+    transform:   Transform;
+    context:     ptr;
+    heading:     Heading;
+    verb:        layout.Verb;
+}
+
+# `--check`, which every command over this pass takes
+pub val CHECK: std_args.Flag = std_args.Flag{long: "check", short: 0, value: nil, repeat: false, negatable: false, help: "report what would change without writing"};
+
+# a pass with nothing read yet
+pub fun report(diagnostics: *cli_diagnostic.Report, sources: *base_source.SourceMap, transform: Transform) Report {
+    ret Report{visited: 0, differing: 0, malformed: 0, flagged: 0, diagnostics: diagnostics, sources: sources, transform: transform, context: nil, heading: nil, verb: layout.FORMATTED};
+}
+
+# the deepest source directory nesting the walk follows
+val MAX_DEPTH: usize = 256;
+
+# how diagnostics and the check listing name the stream
+pub val STREAM_NAME: str = "<stdin>";
+
+# where the transformed text of one input goes
+# ---
+# file:   replace the input file in place and name it on stdout
+# stream: write the transformed text to stdout, whether or not it differs
+# name:   write no source; name the input on stdout when the transform changes it
+# diff:   write no source; print the changes as a unified diff with no context lines
+pub def Sink: u8;
+pub val SINK_FILE:   Sink = 0;
+pub val SINK_STREAM: Sink = 1;
+pub val SINK_NAME:   Sink = 2;
+pub val SINK_DIFF:   Sink = 3;
+
+# one input's destination; SINK_FILE reads dirfd, leaf and mode, SINK_STREAM
+# reads stream, and SINK_NAME and SINK_DIFF read none of them
+# ---
+# sink:   which of the four destinations receives the transformed text
+# dirfd:  the directory holding the input file
+# leaf:   the input file's name within that directory
+# mode:   the input file's permission bits, carried onto the replacement
+# stream: the descriptor the transformed text is written to
+rec Destination {
+    sink:   Sink;
+    dirfd:  usize;
+    leaf:   str;
+    mode:   i32;
+    stream: usize;
+}
+
+# a destination for an input with no file behind it, writing to `stream`
+fun detached(sink: Sink, stream: usize) Destination {
+    ret Destination{sink: sink, dirfd: system_os.INVALID_HANDLE, leaf: nil, mode: 0, stream: stream};
+}
+
+# the input `name` refused for what it is, not for what the machine did: the user's
+fun refused_input(a: *A.Allocator, k: diagnostic_kind.Kind, name: str, detail: str) fail.Fail {
+    ret fail.formatted_user(a, k, "'{}' {}", name, detail);
+}
+
+# the machine's refusal to `verb` `name`, a path the command line named or one found beneath it
+fun os_failure(a: *A.Allocator, verb: str, name: str, code: i64) fail.Fail {
+    ret fail.refusal(a, diagnostic_kind.FS_IO, fail.Op{verb: verb, path: name, given: true}, fail.Cause.native{code});
+}
+
+# close the directory `fd` a step opened and pass on that step's result, the close's refusal
+# taking its place only when the step succeeded
+fun finish_dir(a: *A.Allocator, fd: usize, name: str, result: err[fail.Fail]) err[fail.Fail] {
+    val closed: i64 = system_os.close(fd);
+    if (closed < 0) {
+        # a directory opened read-only loses nothing to a refused close, so the failure going out stands alone
+        if (sel result.err) { ret result; }
+        ret err[fail.Fail].err{os_failure(a, "close", name, closed)};
+    }
+    ret result;
+}
+
+# open a regular file under a directory without following a symlink at the leaf
+fun open_file(a: *A.Allocator, dirfd: usize, leaf: str, name: str, out: *usize) err[fail.Fail] {
+    var info:    system_os.stat_t;
+    val checked: i64 = system_os.stat_path(dirfd, leaf, ?info, system_os.AT_SYMLINK_NOFOLLOW);
+    if (checked < 0) { ret err[fail.Fail].err{os_failure(a, "inspect", name, checked)}; }
+    if ((native.stat_mode(?info) & system_os.S_IFMT) != system_os.S_IFREG) {
+        ret err[fail.Fail].err{refused_input(a, diagnostic_kind.SOURCE_NOT_REGULAR, name, "is not a regular file, and a source must be one")};
+    }
+    val flags:  i32 = system_os.O_RDONLY | host.OPEN_NOFOLLOW | host.OPEN_NONBLOCK;
+    val opened: i64 = system_os.open(dirfd, leaf, flags, 0, out);
+    if (opened < 0) { ret err[fail.Fail].err{os_failure(a, "open", name, opened)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the refusal of the nul byte that ends `bytes`, located on that byte of `name`, whose text up to
+# it is loaded into `sources`
+fun nul_byte(a: *A.Allocator, sources: *base_source.SourceMap, name: str, bytes: *Vector[u8]) fail.Fail {
+    val at:         usize                              = bytes.len - 1;
+    val f:          fail.Fail                          = fail.spanned(fail.user(diagnostic_kind.SOURCE_NUL_BYTE, "source contains a nul byte"), base_source.span(at, 1));
+    val res_loaded: res[base_source.FileId, fail.Fail] = manifest_load.source_load(a, sources, name, bytes.data, bytes.len);
+    if (sel res_loaded.err) { ret res_loaded.err; }
+    ret fail.placed(f, res_loaded.ok);
+}
+
+# the whole file as one nul-terminated string; a nul byte inside is refused
+# since a transform reads its input as a nul-terminated string
+fun read_text(a: *A.Allocator, sources: *base_source.SourceMap, fd: usize, name: str) res[str, fail.Fail] {
+    var bytes: Vector[u8] = collections_vector.init[u8](a);
+    fin { collections_vector.dnit[u8](?bytes); }
+    var chunk: [4096]u8;
+    for {
+        val count: i64 = system_os.read(fd, ?chunk[0], 4096);
+        if (count < 0)  { ret res[str, fail.Fail].err{os_failure(a, "read", name, count)}; }
+        if (count == 0) { brk; }
+        val res_room: res[usize, A.Error] = collections_vector.reserve[u8](?bytes, count::usize);
+        if (sel res_room.err) { ret res[str, fail.Fail].err{fail.refused(res_room.err)}; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            bytes.data[bytes.len] = chunk[i];
+            collections_vector.commit[u8](?bytes, 1);
+            if (chunk[i] == 0) { ret res[str, fail.Fail].err{nul_byte(a, sources, name, ?bytes)}; }
+            i = i + 1;
+        }
+    }
+    val res_copied: res[str, StrError] = str_copy_slice(a, bytes.data::str, 0, bytes.len);
+    if (sel res_copied.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(res_copied.err))}; }
+    ret res[str, fail.Fail].ok{res_copied.ok};
+}
+
+# render the file's diagnostics the way every command does, located by path,
+# line and column through a source map holding this one file
+fun report_diagnostics(a: *A.Allocator, out: *cli_diagnostic.Report, name: str, text: str, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    var sources: base_source.SourceMap = base_source.init(a);
+    fin { base_source.dnit(?sources); }
+    val res_added: res[base_source.FileId, base_source.Error] = base_source.add(?sources, name, text);
+    if (sel res_added.err) { ret err[fail.Fail].err{fail.source_refused(res_added.err)}; }
+    cli_diagnostic.report_store(out, ?sources, diags);
+    ret err[fail.Fail].ok{};
+}
+
+# every byte of `text` to one descriptor, or the first native refusal
+fun write_all(fd: usize, text: str) i64 {
+    val len:     usize = str_len(text);
+    var written: usize = 0;
+    for (written < len) {
+        val n: i64 = system_os.write(fd, (text::usize + written)::*u8, len - written);
+        if (n < 0) { ret n; }
+        written = written + n::usize;
+    }
+    ret 0;
+}
+
+# the transformed text is written to `<leaf>.tmp` beside the source and renamed
+# over it, so an interrupted rewrite leaves the original whole
+fun replace_source(a: *A.Allocator, dirfd: usize, leaf: str, name: str, text: str, mode: i32) err[fail.Fail] {
+    val res_str_join: res[str, StrError] = str_join(a, leaf, ".tmp");
+    if (sel res_str_join.err) { ret err[fail.Fail].err{fail.message(fail.str_text(res_str_join.err))}; }
+    val tmp: str = res_str_join.ok;
+    fin { str_free(a, tmp); }
+    val flags:  i32   = system_os.O_CREAT | system_os.O_TRUNC | system_os.O_WRONLY | host.OPEN_NOFOLLOW;
+    var fd:     usize = system_os.INVALID_HANDLE;
+    val opened: i64   = system_os.open(dirfd, tmp, flags, mode, ?fd);
+    if (opened < 0) { ret err[fail.Fail].err{os_failure(a, "create the temporary beside", name, opened)}; }
+    var failure: i64 = write_all(fd, text);
+    if (host.PERMISSIONS && failure == 0) { failure = system_os.set_mode(fd, mode); }
+    val closed: i64 = system_os.close(fd);
+    # a refused close after a failed write adds nothing: the temporary is unlinked either way
+    if (failure == 0 && closed < 0) { failure = closed; }
+    if (failure == 0)               { failure = system_os.rename(dirfd, tmp, dirfd, leaf); }
+    if (failure < 0) {
+        val written: fail.Fail = os_failure(a, "replace", name, failure);
+        val removed: i64       = system_os.unlink(dirfd, tmp, 0);
+        if (removed < 0) { ret err[fail.Fail].err{fail.with_secondary(a, written, fail.refusal(a, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: "the temporary", path: tmp}, fail.Cause.native{removed}))}; }
+        ret err[fail.Fail].err{written};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the offset of the line after the one at `at`, the end of `text` for the last
+fun line_after(text: str, at: usize) usize {
+    var i: usize = at;
+    for (text[i] != 0 && text[i] != '\n') { i = i + 1; }
+    if (text[i] == '\n') { ret i + 1; }
+    ret i;
+}
+
+# whether the line of `x` at `at` reads as the line of `y` at `to`
+fun same_line(x: str, at: usize, y: str, to: usize) bool {
+    var i: usize = 0;
+    for (x[at + i] == y[to + i]) {
+        if (x[at + i] == 0 || x[at + i] == '\n') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun print_line(out: *io_writer.Writer, mark: str, text: str, at: usize) {
+    var end: usize = line_after(text, at);
+    if (end > at && text[end - 1] == '\n') { end = end - 1; }
+    std_format.write_str(out, mark);
+    io_writer.write_all(out, ?text[at], end - at);
+    std_format.write_str(out, "\n");
+}
+
+# one step of an edit script: a line both texts keep, one dropped from the first, or one added
+# from the second
+val EDIT_KEEP: u8 = 0;
+val EDIT_DROP: u8 = 1;
+val EDIT_ADD:  u8 = 2;
+
+# the offset of each line of `text` into `lines`, then the text's length
+fun lines_of(text: str, lines: *Vector[usize]) err[A.Error] {
+    var at: usize = 0;
+    for (text[at] != 0) {
+        val res_pushed: res[usize, A.Error] = collections_vector.push[usize](lines, at);
+        if (sel res_pushed.err) { ret err[A.Error].err{res_pushed.err}; }
+        at = line_after(text, at);
+    }
+    val res_end: res[usize, A.Error] = collections_vector.push[usize](lines, at);
+    if (sel res_end.err) { ret err[A.Error].err{res_end.err}; }
+    ret err[A.Error].ok{};
+}
+
+fun edit(ops: *Vector[u8], op: u8) err[A.Error] {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[u8](ops, op);
+    if (sel res_pushed.err) { ret err[A.Error].err{res_pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# the shortest edit script from the lines `xs` of `before` to the lines `ys` of `after` (myers),
+# into `ops` last step first. the furthest line of `before` each diagonal k reaches is held at
+# k + bound + 1, and the reaches after step d at d * (d + 1) / 2 of the trace, one per diagonal
+fun edit_script(a: *A.Allocator, before: str, xs: *Vector[usize], after: str, ys: *Vector[usize], ops: *Vector[u8]) err[A.Error] {
+    val n:     usize         = xs.len - 1;
+    val m:     usize         = ys.len - 1;
+    val bound: usize         = n + m;
+    var v:     Vector[usize] = collections_vector.init[usize](a);
+    fin { collections_vector.dnit[usize](?v); }
+    var trace: Vector[usize] = collections_vector.init[usize](a);
+    fin { collections_vector.dnit[usize](?trace); }
+    var i: usize = 0;
+    for (i < 2 * bound + 3) {
+        val res_v: res[usize, A.Error] = collections_vector.push[usize](?v, 0);
+        if (sel res_v.err) { ret err[A.Error].err{res_v.err}; }
+        i = i + 1;
+    }
+    var d:    usize = 0;
+    var done: bool  = false;
+    for (!done) {
+        var kk: usize = bound + 1 - d;
+        for (kk <= bound + 1 + d) {
+            var far: usize = 0;
+            if (kk == bound + 1 - d || (kk != bound + 1 + d && v.data[kk - 1] < v.data[kk + 1])) { far = v.data[kk + 1]; }
+            or                                                                                   { far = v.data[kk - 1] + 1; }
+            var down_at: usize = far + bound + 1 - kk;
+            for (far < n && down_at < m && same_line(before, xs.data[far], after, ys.data[down_at])) {
+                far     = far + 1;
+                down_at = down_at + 1;
+            }
+            v.data[kk] = far;
+            val res_traced: res[usize, A.Error] = collections_vector.push[usize](?trace, far);
+            if (sel res_traced.err) { ret err[A.Error].err{res_traced.err}; }
+            if (far >= n && down_at >= m) {
+                done = true;
+                brk;
+            }
+            kk = kk + 2;
+        }
+        if (!done) { d = d + 1; }
+    }
+    var x: usize = n;
+    var y: usize = m;
+    for (d > 0) {
+        val at:   usize = x + bound + 1 - y;
+        val row:  usize = (d - 1) * d / 2;
+        val low:  usize = bound + 2 - d;
+        val down: bool  = at == bound + 1 - d || (at != bound + 1 + d && trace.data[row + (at - 1 - low) / 2] < trace.data[row + (at + 1 - low) / 2]);
+        var prev: usize = at - 1;
+        if (down) { prev = at + 1; }
+        val px: usize = trace.data[row + (prev - low) / 2];
+        val py: usize = px + bound + 1 - prev;
+        var mx: usize = px + 1;
+        if (down) { mx = px; }
+        for (x > mx) {
+            val err_kept: err[A.Error] = edit(ops, EDIT_KEEP);
+            if (sel err_kept.err) { ret err_kept; }
+            x = x - 1;
+            y = y - 1;
+        }
+        var op: u8 = EDIT_DROP;
+        if (down) { op = EDIT_ADD; }
+        val err_edited: err[A.Error] = edit(ops, op);
+        if (sel err_edited.err) { ret err_edited; }
+        x = px;
+        y = py;
+        d = d - 1;
+    }
+    for (x > 0) {
+        val err_kept: err[A.Error] = edit(ops, EDIT_KEEP);
+        if (sel err_kept.err) { ret err_kept; }
+        x = x - 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# the lines `before` and `after` differ in, as few as a line diff finds. each change is a hunk of
+# a unified diff with no context lines, its header naming where it stands in both texts and the
+# line `heading` finds above it
+fun print_changes(a: *A.Allocator, out: *io_writer.Writer, before: str, after: str, heading: Heading) err[A.Error] {
+    var xs: Vector[usize] = collections_vector.init[usize](a);
+    fin { collections_vector.dnit[usize](?xs); }
+    var ys: Vector[usize] = collections_vector.init[usize](a);
+    fin { collections_vector.dnit[usize](?ys); }
+    var ops: Vector[u8] = collections_vector.init[u8](a);
+    fin { collections_vector.dnit[u8](?ops); }
+    val err_xs: err[A.Error] = lines_of(before, ?xs);
+    if (sel err_xs.err) { ret err_xs; }
+    val err_ys: err[A.Error] = lines_of(after, ?ys);
+    if (sel err_ys.err) { ret err_ys; }
+    val err_script: err[A.Error] = edit_script(a, before, ?xs, after, ?ys, ?ops);
+    if (sel err_script.err) { ret err_script; }
+    var i: usize = ops.len;
+    var x: usize = 0;
+    var y: usize = 0;
+    for (i > 0) {
+        if (ops.data[i - 1] == EDIT_KEEP) {
+            x = x + 1;
+            y = y + 1;
+            i = i - 1;
+            cnt;
+        }
+        val x0: usize = x;
+        val y0: usize = y;
+        for (i > 0 && ops.data[i - 1] != EDIT_KEEP) {
+            if (ops.data[i - 1] == EDIT_DROP) { x = x + 1; }
+            or                                { y = y + 1; }
+            i = i - 1;
+        }
+        hunk_header(out, before, xs.data[x0], x0 + 1, x - x0, y0 + 1, y - y0, heading);
+        var j: usize = x0;
+        for (j < x) {
+            print_line(out, "-", before, xs.data[j]);
+            j = j + 1;
+        }
+        j = y0;
+        for (j < y) {
+            print_line(out, "+", after, ys.data[j]);
+            j = j + 1;
+        }
+    }
+    ret err[A.Error].ok{};
+}
+
+# `@@ -<line>,<count> +<line>,<count> @@` and the heading line of a change, where a change of no
+# lines in one text names the line before it there
+fun hunk_header(out: *io_writer.Writer, before: str, at: usize, lx: usize, nx: usize, ly: usize, ny: usize, heading: Heading) {
+    var from: usize = lx;
+    var to:   usize = ly;
+    if (nx == 0) { from = lx - 1; }
+    if (ny == 0) { to = ly - 1; }
+    std_format.format(out, "@@ -{},{} +{},{} @@", from, nx, to, ny);
+    if (heading != nil) {
+        val head: usize = heading(before, at);
+        if (before[head] != 0) { print_line(out, " ", before, head); }
+        or                     { std_format.write_str(out, "\n"); }
+        ret;
+    }
+    std_format.write_str(out, "\n");
+}
+
+# hand one input's transformed text to its destination. SINK_STREAM writes
+# every time, since a stream operand owes its caller the source whether or not
+# it changed, and the other sinks act only on a difference
+fun emit(a: *A.Allocator, out: *io_writer.Writer, dest: *Destination, name: str, text: str, output: str, differs: bool, heading: Heading, verb: layout.Verb) err[fail.Fail] {
+    if (dest.sink == SINK_STREAM) {
+        val failure: i64 = write_all(dest.stream, output);
+        if (failure < 0) { ret err[fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_IO, fail.Op{verb: "write", role: "standard output for", path: name}, fail.Cause.native{failure})}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (!differs) { ret err[fail.Fail].ok{}; }
+    var texts: [1]str = [1]str{name};
+    if (dest.sink == SINK_NAME) {
+        cli_diagnostic.said_row(out, layout.DIFFERS, ?texts[0], 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (dest.sink == SINK_DIFF) {
+        std_format.format(out, "--- {}\n+++ {}\n", name, name);
+        val err_printed: err[A.Error] = print_changes(a, out, text, output, heading);
+        if (sel err_printed.err) { ret err[fail.Fail].err{fail.refused(err_printed.err)}; }
+        ret err[fail.Fail].ok{};
+    }
+    val err_replaced: err[fail.Fail] = replace_source(a, dest.dirfd, dest.leaf, name, output, dest.mode);
+    if (sel err_replaced.err) { ret err_replaced; }
+    cli_diagnostic.said_row(out, verb, ?texts[0], 1);
+    ret err[fail.Fail].ok{};
+}
+
+# the text of the file at `path`, none when it cannot be read as one
+pub fun text_of(a: *A.Allocator, path: str) opt[str] {
+    val res_parent: res[str, A.Error] = types_path.parent(a, path);
+    if (sel res_parent.err) { ret opt[str].none{}; }
+    fin { str_free(a, res_parent.ok); }
+    var dirfd:  usize = system_os.INVALID_HANDLE;
+    val opened: i64   = remove.open_path(res_parent.ok, ?dirfd);
+    if (opened < 0) { ret opt[str].none{}; }
+    fin { val closed: i64 = system_os.close(dirfd); }
+    var fd:       usize          = system_os.INVALID_HANDLE;
+    val err_open: err[fail.Fail] = open_file(a, dirfd, types_path.filename(path), path, ?fd);
+    if (sel err_open.err) { ret opt[str].none{}; }
+    fin { val closed: i64 = system_os.close(fd); }
+    var sources: base_source.SourceMap = base_source.init(a);
+    fin { base_source.dnit(?sources); }
+    val res_read: res[str, fail.Fail] = read_text(a, ?sources, fd, path);
+    if (sel res_read.err) { ret opt[str].none{}; }
+    ret opt[str].some{res_read.ok};
+}
+
+# the one path every operand takes: named text in, transformed text to the
+# destination, a malformed input reported against its own name and counted
+fun rewrite_text(a: *A.Allocator, name: str, text: str, dest: *Destination, report: *Report) err[fail.Fail] {
+    report.visited = report.visited + 1;
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(a);
+    fin { diagnostic.store_dnit(?diags); }
+    val res_formatted: res[str, fail.Fail] = report.transform(a, text, ?diags, report.context);
+    if (sel res_formatted.err) {
+        if (fail.is_reported(res_formatted.err)) {
+            report.malformed = report.malformed + 1;
+            ret report_diagnostics(a, report.diagnostics, name, text, ?diags);
+        }
+        ret err[fail.Fail].err{res_formatted.err};
+    }
+    val output: str = res_formatted.ok;
+    fin { str_free(a, output); }
+    if (diagnostic.len(?diags) != 0) {
+        report.flagged = report.flagged + 1;
+        val err_told: err[fail.Fail] = report_diagnostics(a, report.diagnostics, name, text, ?diags);
+        if (sel err_told.err) { ret err_told; }
+    }
+    val differs: bool = !str_equals(text, output);
+    if (differs) { report.differing = report.differing + 1; }
+    ret emit(a, cli_diagnostic.out(report.diagnostics), dest, name, text, output, differs, report.heading, report.verb);
+}
+
+# rewrite one open file; the replacement carries the original's permission bits
+fun rewrite_open_file(a: *A.Allocator, fd: usize, dirfd: usize, leaf: str, name: str, sink: Sink, report: *Report) err[fail.Fail] {
+    var info:    system_os.stat_t;
+    val checked: i64 = system_os.stat(fd, ?info);
+    if (checked < 0) { ret err[fail.Fail].err{os_failure(a, "inspect", name, checked)}; }
+    if ((native.stat_mode(?info) & system_os.S_IFMT) != system_os.S_IFREG) {
+        ret err[fail.Fail].err{refused_input(a, diagnostic_kind.SOURCE_NOT_REGULAR, name, "is not a regular file, and a source must be one")};
+    }
+    val res_read: res[str, fail.Fail] = read_text(a, report.sources, fd, name);
+    if (sel res_read.err) { ret err[fail.Fail].err{res_read.err}; }
+    val text: str = res_read.ok;
+    fin { str_free(a, text); }
+    var dest: Destination = Destination{sink: sink, dirfd: dirfd, leaf: leaf, mode: (native.stat_mode(?info) & 0o7777)::i32, stream: system_os.INVALID_HANDLE};
+    ret rewrite_text(a, name, text, ?dest, report);
+}
+
+fun open_and_rewrite(a: *A.Allocator, dirfd: usize, leaf: str, name: str, sink: Sink, report: *Report) err[fail.Fail] {
+    var fd:         usize          = system_os.INVALID_HANDLE;
+    val err_opened: err[fail.Fail] = open_file(a, dirfd, leaf, name, ?fd);
+    if (sel err_opened.err) { ret err_opened; }
+    var err_rewrite_open_file: err[fail.Fail] = rewrite_open_file(a, fd, dirfd, leaf, name, sink, report);
+    val closed:                i64            = system_os.close(fd);
+    # a source opened read-only loses nothing to a refused close, so the failure going out stands alone
+    if (closed < 0 && sel err_rewrite_open_file.ok) { err_rewrite_open_file = err[fail.Fail].err{os_failure(a, "close", name, closed)}; }
+    ret err_rewrite_open_file;
+}
+
+# the file's text and everything made from it live in an arena of its own; a
+# failure outlives that arena, so it is carried out owned through `backing`
+fun rewrite_file(backing: *A.Allocator, dirfd: usize, leaf: str, name: str, sink: Sink, report: *Report) err[fail.Fail] {
+    var ar:       arena.Arena;
+    val err_init: err[A.Error] = arena.init(?ar, backing, 0);
+    if (sel err_init.err) { ret err[fail.Fail].err{fail.refused(err_init.err)}; }
+    fin { arena.dnit(?ar); }
+    var a:        A.Allocator;
+    val err_make: err[A.Error] = arena.allocator(?a, ?ar);
+    if (sel err_make.err) { ret err[fail.Fail].err{fail.refused(err_make.err)}; }
+    val err_open_and_rewrite: err[fail.Fail] = open_and_rewrite(?a, dirfd, leaf, name, sink, report);
+    if (sel err_open_and_rewrite.ok) { ret err_open_and_rewrite; }
+    val res_kept: res[fail.Fail, A.Error] = fail.retain(backing, err_open_and_rewrite.err);
+    if (sel res_kept.err) { ret err[fail.Fail].err{fail.refused(res_kept.err)}; }
+    ret err[fail.Fail].err{res_kept.ok};
+}
+
+# one directory entry: a directory is walked, a `.mach` file rewritten, another regular file
+# skipped, and anything else refused
+fun visit(a: *A.Allocator, dirfd: usize, leaf: str, name: str, sink: Sink, depth: usize, report: *Report) err[fail.Fail] {
+    var info:   system_os.stat_t;
+    val probed: i64 = system_os.stat_path(dirfd, leaf, ?info, system_os.AT_SYMLINK_NOFOLLOW);
+    if (probed < 0) { ret err[fail.Fail].err{os_failure(a, "inspect", name, probed)}; }
+    val kind: u32 = native.stat_mode(?info) & system_os.S_IFMT;
+    if (kind == system_os.S_IFDIR) {
+        var child:  usize = system_os.INVALID_HANDLE;
+        val opened: i64   = remove.open_dir(dirfd, leaf, ?child);
+        if (opened < 0) { ret err[fail.Fail].err{os_failure(a, "open", name, opened)}; }
+        ret finish_dir(a, child, name, walk(a, child, name, sink, depth + 1, report));
+    }
+    if (kind != system_os.S_IFREG) {
+        ret err[fail.Fail].err{refused_input(a, diagnostic_kind.SOURCE_NOT_REGULAR, name, "is a symlink or another entry that is not a regular file, and a source entry must be one")};
+    }
+    if (!str_ends_with(leaf, ".mach")) { ret err[fail.Fail].ok{}; }
+    ret rewrite_file(a, dirfd, leaf, name, sink, report);
+}
+
+fun name_compare(a: *str, b: *str) i64 {
+    val left:  str   = @a;
+    val right: str   = @b;
+    var i:     usize = 0;
+    for (true) {
+        val l: u8 = left[i];
+        val r: u8 = right[i];
+        if (l != r) {
+            if (l < r) { ret -1; }
+            ret 1;
+        }
+        if (l == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# every entry of one directory in name order
+fun walk(a: *A.Allocator, dirfd: usize, name: str, sink: Sink, depth: usize, report: *Report) err[fail.Fail] {
+    if (depth >= MAX_DEPTH) { ret err[fail.Fail].err{refused_input(a, diagnostic_kind.SOURCE_NESTING_DEPTH, name, "nests source directories deeper than 256")}; }
+    var names: Vector[str] = collections_vector.init[str](a);
+    fin {
+        var i: usize = 0;
+        for (i < names.len) {
+            str_free(a, names.data[i]);
+            i = i + 1;
+        }
+        collections_vector.dnit[str](?names);
+    }
+    var cursor:      system_os.DirectoryCursor     = system_os.DirectoryCursor{};
+    val initialized: system_os.DirectoryInitResult = system_os.directory_init(?cursor, dirfd);
+    var err_visit:   err[fail.Fail]                = err[fail.Fail].ok{};
+    if (initialized.code < 0) { err_visit = err[fail.Fail].err{os_failure(a, "list", name, initialized.code)}; }
+    or {
+        for {
+            var entry: system_os.DirectoryEntry;
+            val next:  i64 = system_os.directory_next(?cursor, ?entry);
+            if (next < 0) {
+                err_visit = err[fail.Fail].err{os_failure(a, "list", name, next)};
+                brk;
+            }
+            if (next == 0)                                                   { brk; }
+            if (str_equals(entry.name, ".") || str_equals(entry.name, "..")) { cnt; }
+            val res_copied: res[str, StrError] = str_copy_slice(a, entry.name, 0, entry.length);
+            if (sel res_copied.err) {
+                err_visit = err[fail.Fail].err{fail.message(fail.str_text(res_copied.err))};
+                brk;
+            }
+            val leaf:       str                 = res_copied.ok;
+            val res_pushed: res[usize, A.Error] = collections_vector.push[str](?names, leaf);
+            if (sel res_pushed.err) {
+                str_free(a, leaf);
+                err_visit = err[fail.Fail].err{fail.refused(res_pushed.err)};
+                brk;
+            }
+        }
+        val closed: i64 = system_os.directory_dnit(?cursor);
+        # a directory read loses nothing to a refused close, so the failure going out stands alone
+        if (closed < 0 && sel err_visit.ok) { err_visit = err[fail.Fail].err{os_failure(a, "close", name, closed)}; }
+    }
+    val listed: bool = sel err_visit.ok;
+    if (listed) {
+        sort.sort_by[str](names.data, names.len, name_compare);
+        var i: usize = 0;
+        for (i < names.len) {
+            val res_joined: res[str, A.Error] = types_path.join(a, name, names.data[i]);
+            if (sel res_joined.err) {
+                err_visit = err[fail.Fail].err{fail.refused(res_joined.err)};
+                brk;
+            }
+            val display: str = res_joined.ok;
+            err_visit = visit(a, dirfd, names.data[i], display, sink, depth, report);
+            str_free(a, display);
+            if (sel err_visit.err) { brk; }
+            i = i + 1;
+        }
+    }
+    ret err_visit;
+}
+
+# descend the manifest's source path one component at a time through held
+# directory capabilities, so a symlinked component is refused rather than
+# followed; the first component is compared against the dependency tree's
+# identity so an alias of `dep` cannot be selected as the source
+fun source_walk(a: *A.Allocator, dirfd: usize, rel: str, start: usize, name: str, sink: Sink, depth: usize, exclude: *file_identity.Identity, report: *Report) err[fail.Fail] {
+    if (depth >= MAX_DEPTH) { ret err[fail.Fail].err{refused_input(a, diagnostic_kind.SOURCE_NESTING_DEPTH, name, "nests source directories deeper than 256")}; }
+    var end:    usize = start;
+    val length: usize = str_len(rel);
+    for (end < length && rel[end] != '/') { end = end + 1; }
+    val res_copied: res[str, StrError] = str_copy_slice(a, rel, start, end - start);
+    if (sel res_copied.err) { ret err[fail.Fail].err{fail.message(fail.str_text(res_copied.err))}; }
+    val leaf: str = res_copied.ok;
+    fin { str_free(a, leaf); }
+    var child:  usize = system_os.INVALID_HANDLE;
+    val opened: i64   = remove.open_dir(dirfd, leaf, ?child);
+    if (opened < 0) { ret err[fail.Fail].err{os_failure(a, "open", name, opened)}; }
+    if (exclude != nil) {
+        var identity:   file_identity.Identity;
+        val identified: i64 = system_os.file_identity(child, ?identity);
+        if (identified < 0) {
+            ret finish_dir(a, child, name, err[fail.Fail].err{os_failure(a, "identify", name, identified)});
+        }
+        if (file_identity.equal(@exclude, identity)) {
+            ret finish_dir(a, child, name, err[fail.Fail].err{fail.user(diagnostic_kind.SOURCE_DEPENDENCY_TREE, "project source cannot be the dependency tree")});
+        }
+    }
+    var err_walk: err[fail.Fail] = err[fail.Fail].ok{};
+    if (end == length) { err_walk = walk(a, child, name, sink, 0, report); }
+    or                 { err_walk = source_walk(a, child, rel, end + 1, name, sink, depth + 1, nil, report); }
+    ret finish_dir(a, child, name, err_walk);
+}
+
+# the manifest's `project.src`, cleaned, relative to the project root. only the
+# `[project]` table is read, so a rewrite never needs a build profile
+fun source_dir(a: *A.Allocator, sources: *base_source.SourceMap, manifest_path: str) res[str, fail.Fail] {
+    val res_doc: res[manifest_load.Doc, fail.Fail] = manifest_load.doc_read(a, sources, manifest_path);
+    if (sel res_doc.err) { ret res[str, fail.Fail].err{res_doc.err}; }
+    var doc: manifest_load.Doc = res_doc.ok;
+    fin { manifest_load.doc_dnit(a, ?doc); }
+    ret source_dir_of(a, ?doc);
+}
+
+# `source_dir` of a manifest already read
+pub fun source_dir_of(a: *A.Allocator, doc: *manifest_load.Doc) res[str, fail.Fail] {
+    var itn: intern.Interner = intern.init(a);
+    fin { intern.dnit(?itn); }
+    var m: manifest_model.Manifest = manifest_model.init();
+    fin { manifest_model.dnit(?m, a); }
+    val err_parsed: err[fail.Fail] = manifest_load.project_parse(a, ?itn, ?doc.table, ?m);
+    if (sel err_parsed.err) { ret res[str, fail.Fail].err{err_parsed.err}; }
+    val opt_found: opt[str] = intern.get(?itn, m.src);
+    if (sel opt_found.none) { ret res[str, fail.Fail].err{fail.message("the manifest's source directory is not interned")}; }
+    val res_cleaned: res[str, A.Error] = types_path.clean(a, opt_found.some);
+    if (sel res_cleaned.err) { ret res[str, fail.Fail].err{fail.refused(res_cleaned.err)}; }
+    ret res[str, fail.Fail].ok{res_cleaned.ok};
+}
+
+# the dependency tree is identified through the root so the walk can never
+# select it
+fun walk_project(a: *A.Allocator, backing: *A.Allocator, root: usize, rel: str, name: str, sink: Sink, report: *Report) err[fail.Fail] {
+    var dep_fd:     usize         = system_os.INVALID_HANDLE;
+    val dependency: i64           = remove.open_dir(root, "dep", ?dep_fd);
+    val missing:    io_error.Kind = system_os.error_kind(dependency);
+    if (missing == io_error.NOT_FOUND || missing == io_error.NOT_DIRECTORY) { ret source_walk(backing, root, rel, 0, name, sink, 0, nil, report); }
+    if (dependency < 0)                                                     { ret err[fail.Fail].err{os_failure(a, "open", "dep", dependency)}; }
+    var err_source_walk: err[fail.Fail] = err[fail.Fail].ok{};
+    var excluded:        file_identity.Identity;
+    val identified:      i64            = system_os.file_identity(dep_fd, ?excluded);
+    if (identified < 0) { err_source_walk = err[fail.Fail].err{os_failure(a, "identify", "dep", identified)}; }
+    or                  { err_source_walk = source_walk(backing, root, rel, 0, name, sink, 0, ?excluded, report); }
+    ret finish_dir(a, dep_fd, "dep", err_source_walk);
+}
+
+# rewrite or check one project's source: the manifest names the source
+# directory, the dependency tree is identified so it can never be selected, and
+# the walk visits only the source tree's `.mach` files
+pub fun project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, sink: Sink, report: *Report) err[fail.Fail] {
+    val res_rel: res[str, fail.Fail] = source_dir(a, report.sources, manifest_path);
+    if (sel res_rel.err) { ret err[fail.Fail].err{res_rel.err}; }
+    val rel: str = res_rel.ok;
+    fin { str_free(a, rel); }
+    ret tree(a, backing, project_root, rel, sink, report);
+}
+
+# `project` over the source directory `rel`, cleaned and relative to the root. each source is
+# named from the root as given, as the manifest is, so a diff applies from where the command ran
+pub fun tree(a: *A.Allocator, backing: *A.Allocator, project_root: str, rel: str, sink: Sink, report: *Report) err[fail.Fail] {
+    val res_named: res[str, A.Error] = types_path.join(a, project_root, rel);
+    if (sel res_named.err) { ret err[fail.Fail].err{fail.refused(res_named.err)}; }
+    val name: str = res_named.ok;
+    fin { str_free(a, name); }
+    var root:   usize = system_os.INVALID_HANDLE;
+    val opened: i64   = remove.open_path(project_root, ?root);
+    if (opened < 0) { ret err[fail.Fail].err{os_failure(a, "open", project_root, opened)}; }
+    ret finish_dir(a, root, project_root, walk_project(a, backing, root, rel, name, sink, report));
+}
+
+# rewrite one file named directly, with no manifest read: the file's own
+# directory is opened so the leaf is handled exactly as the project walk handles it
+pub fun file(a: *A.Allocator, backing: *A.Allocator, operand: str, sink: Sink, report: *Report) err[fail.Fail] {
+    val leaf: str = types_path.filename(operand);
+    if (leaf == nil || str_equals(leaf, "")) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.CLI_OPERAND, "the source operand names no file")};
+    }
+    val res_parent: res[str, A.Error] = types_path.parent(a, operand);
+    if (sel res_parent.err) { ret err[fail.Fail].err{fail.refused(res_parent.err)}; }
+    val parent: str = res_parent.ok;
+    fin { str_free(a, parent); }
+    var dirfd:  usize = system_os.INVALID_HANDLE;
+    val opened: i64   = remove.open_path(parent, ?dirfd);
+    if (opened < 0) { ret err[fail.Fail].err{os_failure(a, "open", parent, opened)}; }
+    ret finish_dir(a, dirfd, parent, rewrite_file(backing, dirfd, leaf, operand, sink, report));
+}
+
+# rewrite the source arriving on one descriptor onto another; nothing on disk
+# is read or written, so no manifest is involved at any point. the descriptors
+# are parameters rather than the process streams so the caller owns that binding
+pub fun stream(a: *A.Allocator, in_fd: usize, out_fd: usize, sink: Sink, report: *Report) err[fail.Fail] {
+    val res_read: res[str, fail.Fail] = read_text(a, report.sources, in_fd, STREAM_NAME);
+    if (sel res_read.err) { ret err[fail.Fail].err{res_read.err}; }
+    val text: str = res_read.ok;
+    fin { str_free(a, text); }
+    var dest: Destination = detached(sink, out_fd);
+    ret rewrite_text(a, STREAM_NAME, text, ?dest, report);
+}

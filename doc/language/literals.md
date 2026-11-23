@@ -19,22 +19,36 @@ integer literal that takes that default must fit `i64`: one that does not,
 such as `10000000000000000000::f64`, is refused, and a suffix
 (`10000000000000000000u64`) or a typed context gives it the type it needs.
 
+A cast is such a context. Under `::` to an integer type, an unsuffixed integer
+literal takes the first of `i64`, `u64`, `i128` and `u128` that holds its value,
+and the cast converts that value. Every other cast reinterprets an operand of
+the destination's size, `:~` always and `::` to a type that is not a number,
+such as a pointer, so the literal takes the first of the signed and the unsigned
+integer of that size that holds it: `0x10000000::*Uart` reads `0x10000000` as a
+`u32` on a 32-bit target and as an `i64` on a 64-bit one, and `0x3f800000:~f32`
+is `1.0`. A literal neither holds is refused, naming the range it missed and
+the destination's size. A destination of a size no integer has leaves the
+literal its default.
+
 ### Typed suffixes
 
-A suffix is the spelling of the primitive type the literal has: `u8`,
-`u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128` on an
-integer literal, and `f16`, `f32` or `f64` on a float literal. It works with every radix
+A suffix is the spelling of the primitive type the literal has: an integer
+primitive from `u8` to `i128` on an integer literal and a float primitive on a
+float literal. No suffix names `u256`, `i256`, `u512` or `i512`, since a
+literal's value is held in 128 bits (see
+[types.md](types.md#primitive-scalars), and the `int-suffix` and `float-suffix`
+productions of [grammar.md](grammar.md#integer-literals)). It works with every radix
 and with digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`, `0.25f16`).
 
 A suffixed literal *is* that type, in the same way a variable of that type
 is. It is not a hint, and it is never silently retyped:
 
-```mach error type mismatch: expected u64, found u32
+```mach error expected u64, found u32
 val a: u32 = 7u32; # fine
-val b: u64 = 7u32; # error: type mismatch, expected u64, found u32
-val c: f64 = 1.5f32; # error: type mismatch, expected f64, found f32
+val b: u64 = 7u32; # error: expected u64, found u32
+val c: f64 = 1.5f32; # error: expected f64, found f32
 val d: u32 = 7u32 + 1; # fine: the unsuffixed 1 takes u32 from the other operand
-val e: u32 = 7u32 + 8u64; # error: operands are different types
+val e: u32 = 7u32 + 8u64; # error: operands `u32` and `u64` have different types
 ```
 
 Because a suffixed literal is already typed, it is what types the elements
@@ -52,11 +66,11 @@ fun total() u32 {
 }
 ```
 
-A literal outside the range of the type its suffix declares is rejected,
-with the range named. A leading `-` is part of the range check, so the
+A literal outside the range of the type its suffix declares is rejected
+with `literal.out_of_range`, with the range named. A leading `-` is part of the range check, so the
 most negative value of a signed type is written the way it reads:
 
-```mach error literal 128 is out of range for i8
+```mach error literal 128 is out of range for i8 (-128..127)
 val a: i8  = -128i8; # fine
 val b: i8  = 128i8; # error: literal 128 is out of range for i8 (-128..127)
 val c: u8  = 256u8; # error: literal 256 is out of range for u8 (0..255)
@@ -64,8 +78,10 @@ val d: u32 = -1u32; # error: literal -1 is out of range for u32 (0..4294967295)
 ```
 
 An integer literal may be as large as `u128` holds, in any radix and with
-separators, and the range check reaches the same width; a literal that no
-integer type holds is an error:
+separators, and the range check reaches the same width. A larger literal is
+refused with `literal.out_of_range`, even where the context is `u256` or
+`u512`, and in such a context a literal reaches only what an `i128` holds (see
+[types.md](types.md#256-and-512-bit-integers)):
 
 ```mach fragment
 val a: u128 = 340282366920938463463374607431768211455;         # u128 max
@@ -107,8 +123,8 @@ rounds to zero, is an error:
 ```mach error float literal overflows `f32`
 val a: f32 = 3.4028235e38; # fine: the largest f32
 val b: f64 = 1.0e39; # fine: f64 holds it
-val c: f32 = 1.0e39; # error: float literal overflows `f32`: it rounds to infinity
-val d: f32 = 1.0e-46; # error: float literal underflows `f32`: its nonzero value rounds to zero
+val c: f32 = 1.0e39; # error: float literal overflows `f32` and rounds to infinity
+val d: f32 = 1.0e-46; # error: float literal underflows `f32` and rounds to zero
 ```
 
 `f16` holds much less, so its bounds come early:
@@ -116,8 +132,8 @@ val d: f32 = 1.0e-46; # error: float literal underflows `f32`: its nonzero value
 ```mach error float literal overflows `f16`
 val a: f16 = 65504.0; # fine: the largest f16
 val b: f16 = 0.00000006; # fine: rounds to the smallest subnormal, 2^-24
-val c: f16 = 70000.0; # error: float literal overflows `f16`: it rounds to infinity
-val d: f16 = 1.0e-8; # error: float literal underflows `f16`: its nonzero value rounds to zero
+val c: f16 = 70000.0; # error: float literal overflows `f16` and rounds to infinity
+val d: f16 = 1.0e-8; # error: float literal underflows `f16` and rounds to zero
 ```
 
 Every phase agrees on the type a suffix declares: compile-time evaluation,
@@ -134,28 +150,98 @@ val c: u8 = 'M';
 
 Char escapes: `\n` `\t` `\r` `\\` `\'` `\"` `\0` `\xHH`.
 
-This set is deliberately minimal — there is no `\a` `\b` `\f` `\v`. Any other
+This set is deliberately minimal, and `\a` `\b` `\f` `\v` are refused as
+unknown escapes with `literal.malformed`. Any other
 byte, control characters included, is written `\xHH` (e.g. `\x08` for
 backspace, `\x07` for bell).
 
 ## String
 
-A sequence of characters in double quotes, producing a `*u8` pointing at
-null-terminated bytes in the data segment:
+A sequence of characters in double quotes. A string literal is its bytes: each
+character written, with each escape standing for the one byte it names. What
+the bytes become depends on where the literal is used.
+
+Bound to a pointer, which is also what a literal is when nothing gives it a
+type, the literal is a `*u8` pointing at its bytes in the data segment with a
+terminating `0` byte stored after them:
 
 ```mach
 val msg: *u8 = "hello, mach\n";
 ```
 
+These bytes are read-only. Two literals with the same text in one module may be
+the same bytes at the same address, so the address of a literal says nothing
+about which literal it came from.
+
+Checked against an array of `u8`, the literal is that array and holds its bytes
+and nothing else. A terminator is stored only when it is written, as `\0`:
+
+```mach fragment
+val A: [3]u8 = "abc";      # 61 62 63
+val B: [4]u8 = "abc\0";    # 61 62 63 00
+val C: [4]u8 = "abc";      # error: the string literal holds 3 bytes and the array 4
+val D: [_]u8 = "abc";      # [3]u8
+```
+
+So `"abc"` stores 4 bytes when bound to `*u8` and 3 when bound to `[3]u8`. One
+rule covers both: a string literal is its bytes, and a pointer binding stores a
+terminator after them.
+
+- The length `N` of `[N]u8` is checked. A literal whose byte count is not `N` is
+  refused with `array.literal_length`, and when the literal is one byte short
+  the refusal suggests ending it with `\0`. `[N]` never adds a terminator for
+  the literal.
+- `[_]u8` takes its length from the literal's byte count (see
+  [types.md](types.md#inferred-length-_t)).
+- The count is of bytes after escapes: `"a\n"` is 2 bytes, `"\x41\x42"` is 2,
+  `"a\0b"` is 3 with a `0` byte in the middle, and `""` is none.
+- The element type is `u8`, or an alias of it as std's `char` is. There is no
+  transcoding, and an array of any other element type is refused with
+  `type.mismatch`.
+- The array is a value like any other array: it is the bytes of the binding
+  itself, so `#[section]`, `#[align]` and `#[at]` on a module binding place
+  those bytes, with no pointer and no relocation, and a local `var` gets its
+  own copy it may write.
+- The same holds wherever a value is checked against an array type: a `val` or
+  `var` at module scope or in a function, a record field (`R{name: "abc"}`
+  with `name: [3]u8`), an element of an array of arrays
+  (`[2][3]u8{"abc", "def"}`), a call argument for a `[N]u8` parameter, a `ret`
+  from a function returning `[N]u8`, and an assignment to an array. Only the
+  literal as a whole expression takes the array. A comparison gives it no
+  array type, so it stays a pointer beside a pointer, and an array is never
+  compared with `==`.
+- A module `val` holding the array is a constant like one an array literal
+  initializes: `$length_of` reads its length, and comptime reads its elements
+  (`A[0]`, `$each b in A`).
+
 String escapes: the same set.
 
-A string literal is a single line. There is no multi-line string syntax —
-long content uses `\n` escapes or lives in external files.
+A quoted string literal is a single line. Text of several lines is a
+**multiline string**: each line starts with `\\`, and the lines join with `\n`.
+
+```mach
+val usage: *u8 =
+    \\usage: tool [options] <file>
+    \\  -v  print each step
+;
+```
+
+- The text of a line is every byte after its `\\` up to the line's end, as
+  written. Nothing in it is an escape, and a `"` or a `#` in it is text.
+- The last line adds no newline. End with a bare `\\` line for one.
+- A line that starts with anything other than `\\` ends the string, so a blank
+  line or a comment does. The `;` or `,` after a multiline string goes on the
+  next line, since a line's text runs to its end.
+- A CRLF line break joins as `\n`.
+- A multiline string is a string literal like any other, so it initializes an
+  array of `u8` with its bytes as a quoted one does.
+- `mach fmt` indents each line, and keeps the bytes after each `\\` as written,
+  trailing whitespace included.
 
 ## `nil`
 
 The `nil` keyword is the null-address literal. With no context it types as
-`*u8`; it coerces to any pointer-like type — a raw `ptr`, a typed `*T`, or a
+`*u8`. It coerces to any pointer-like type: a raw `ptr`, a typed `*T`, or a
 function type `fun(...)` (a function value is a code address, so the null
 address is a valid null callback). The coercion is uniform across every
 position a value flows into: globals, locals, record fields, array elements,
@@ -167,7 +253,7 @@ var p:  *i64     = nil; # null pointer
 var cb: fun(u32) = nil; # null function pointer
 var k:  F        = nil::F; # the cast spelling works too
 
-fun absent() u8 {
+fun absent() u1 {
     ret p == nil; # nil compares against any pointer-like value
 }
 ```

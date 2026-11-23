@@ -1,23 +1,23 @@
 # Intrinsics
 
 Intrinsics are compiler-shipped comptime functions. They have the same
-syntactic shape as user-defined function calls (`$name(args)`), but their
+syntactic shape as user-defined function calls (`$<name>(args)`), but their
 names are reserved and their implementations are built into the compiler.
 
-The set is closed; adding a new intrinsic requires a compiler change.
+The set is closed. Adding a new intrinsic requires a compiler change.
 
 ## Value intrinsics
 
 Return comptime constant unsigned integers. The storage type is whatever
-the binding declares — Mach has no compiler-known `usize`.
+the binding declares. `usize` is a stdlib alias, not a compiler type.
 
 A layout measurement is an **untyped comptime integer**, exactly like an integer
 literal: it names a constant the compiler already knows, so putting it in a
 narrower binding is a choice of representation rather than a conversion. It
-adopts the binding's width and signedness, and is **refused** — never truncated —
+adopts the binding's width and signedness, and is **refused**, never truncated,
 when the measured value does not fit:
 
-```mach error value 300 is out of range for u8
+```mach error value 300 is out of range for u8 (0..255)
 use std.types.size.usize;
 
 rec Point { x: i64; y: i64; }
@@ -30,8 +30,8 @@ rec Huge { a: [300]u8; }
 val D: u8 = $size_of(Huge); # error: value 300 is out of range for u8 (0..255)
 ```
 
-Without a binding to read a width from — an array length, an `#[align(...)]`
-argument, a comparison against a typed value — the measurement behaves the way a
+Without a binding to read a width from (an array length, an `#[align(...)]`
+argument, a comparison against a typed value) the measurement behaves the way a
 literal does in the same position.
 
 ```mach fragment
@@ -46,7 +46,7 @@ pub val POINT_SIZE: i64 = $size_of(Point);
 pub val POINT_X:    i64 = $offset_of(Point, x);
 ```
 
-`T` is a **type**, written with the ordinary type grammar — not just a bare
+`T` is a **type**, written with the ordinary type grammar, not just a bare
 name. A generic instance, a pointer, an array, a `^` secret, and a qualified
 `module.Type` are all valid, including inside the generic that owns the
 parameter:
@@ -66,19 +66,19 @@ the same checked layout under the same complete-type rules as size and
 alignment (see [Where a layout intrinsic is constant](#where-a-layout-intrinsic-is-constant)).
 An unresolved or recursive layout is diagnosed, never guessed.
 
-### `$length_of` — elements, not bytes
+### `$length_of`: elements, not bytes
 
 `$size_of` counts bytes and `$length_of` counts elements. For `[N]u8` the two
-answers are equal; for everything else they are not, and the difference is
-deliberately in the surface rather than in the caller's head — making a caller
+answers are equal. For everything else they are not, and the difference is
+deliberately in the surface rather than in the caller's head: making a caller
 divide by an element size is exactly the silent-arithmetic error the `u8` case
 hides during development.
 
 ```mach fragment
 val PIXELS: [400]f32x4 = ...;
-$length_of(PIXELS)      # 400   — elements
-$size_of(PIXELS)        # 6400  — bytes
-$length_of(f32x4)       # 4     — a vector's lane count
+$length_of(PIXELS)      # 400, elements
+$size_of(PIXELS)        # 6400, bytes
+$length_of(f32x4)       # 4, a vector's lane count
 ```
 
 **Only a fixed array and a vector have an answer**, and everything else is
@@ -93,20 +93,50 @@ stores four of them.
 ### The operand may be a binding
 
 Every intrinsic taking a type operand also accepts a **value binding** there,
-denoting that binding's type. A binding's type has no spelling — `val LOGO: [_]u8`
-really is a concrete `[7194]u8` that cannot be written — so without this a program
+denoting that binding's type. A binding's type has no spelling (`val LOGO: [_]u8`
+really is a concrete `[7194]u8` that cannot be written), so without this a program
 can index an embed and pass it around and never learn its length:
 
 ```mach fragment
 #[embed("assets/logo.qoi")]
 val LOGO: [_]u8;
 
-$length_of(LOGO)        # 7194 — elements
-$size_of(LOGO)          # 7194 — bytes
+$length_of(LOGO)        # 7194, elements
+$size_of(LOGO)          # 7194, bytes
 
 var i: u64 = 0;
 for (i < $length_of(LOGO)) { ... }
 ```
+
+The binding is any `val` or `var` at file scope, a local, or a parameter, and
+the answer is its type's whatever gave it that type: a written length, an array
+literal, a string literal or an `#[embed]` behind `[_]`. It folds wherever the
+intrinsic does, so a binding's length is an array length, a `$if` condition and
+a loop bound:
+
+```mach fragment
+val NAME: [_]u8 = "mach";                 # [4]u8
+def Twice: [2 * $length_of(NAME) + 1]u8;  # [9]u8
+
+$if ($length_of(NAME) != 4) {
+    $error("NAME changed");
+}
+```
+
+What the operand may be:
+
+- A name that resolves to a binding of array type answers for that type, as
+  `$size_of` does for a binding of any type.
+- A name that resolves to a binding of another type is that type, so
+  `$length_of` refuses it with `comptime.length_of`, naming the type, as it
+  refuses the type written out.
+- A dotted path is read as a module-qualified type, so a field path such as
+  `r.t` is refused (`module.alias_expected`). Name the field's type, or bind
+  the field first.
+- An expression (`A[0, 2]`, a call) is refused as no type
+  (`syntax.expected_type`).
+- `$type_of(A)` is not a type constructor and is refused where a type is
+  written (`comptime.type_constructor`). The binding itself is the operand.
 
 This is the operand slot's rule, not a per-intrinsic one, and it is **only** that
 slot. A name written where a type is expected and resolving to a value is still a
@@ -116,7 +146,7 @@ a silently-typed binding.
 ### Where a layout intrinsic is constant
 
 `$size_of`, `$length_of`, `$align_of`, `$offset_of` and `$type_id` fold in every **type** position, including ones resolved
-before layout would otherwise be known — the measured type's layout is established
+before layout would otherwise be known. The measured type's layout is established
 on demand when the measurement asks for it, so where the type is *declared* relative
 to where it is measured makes no difference:
 
@@ -138,6 +168,23 @@ rec Over { x: u8; }
 rec Holder { buf: [$size_of(Pair)]u8; } # an array length, inside a field type
 ```
 
+A module `val` initialized from a measurement is a compile-time constant like any
+other: it serves as an array length and in a gate, in its own module and in every
+module that imports it, wherever it is declared relative to the place that reads it.
+
+```mach
+rec Pair { a: u64; b: u64; }
+
+val PAIR_BYTES: u64 = $size_of(Pair);
+
+fun pair_bytes() u64 {
+    var raw: [PAIR_BYTES]u8;
+    var n:   u64 = 0;
+    $if (PAIR_BYTES == 16) { n = $size_of([PAIR_BYTES]u8); }
+    ret n;
+}
+```
+
 `$offset_of` and a descriptor's `.offset` answer from the same checked layout that
 sizes the type, under the same complete-type rules as `$size_of`. A layout the
 walk cannot determine is reported, never guessed.
@@ -151,13 +198,13 @@ laid out, so a layout intrinsic there is rejected and reports why. See
 [comptime-control.md](comptime-control.md).
 
 **Inside a generic, a predicate is answered per instantiation.** `$is_record(T)`
-in a `fun f[T]()` body is not decided against the template's placeholder — the gate
+in a `fun f[T]()` body is not decided against the template's placeholder. The gate
 is deferred and re-folded once for each instantiation with `T` substituted, so
 `f[SomeRecord]` and `f[u64]` take different arms from one template. A template that
 is never instantiated has no instance to answer for and reports nothing.
 
 **Cycles are refused, not resolved.** A measurement whose answer is one of its own
-inputs — `#[align($size_of(Self))]`, or two types each aligned to the other's size —
+inputs, such as `#[align($size_of(Self))]` or two types each aligned to the other's size,
 is reported as a layout cycle naming the type that closes it. A pointer field does
 not create one: it stores an address of fixed width, so `rec Node { next: *Node; }`
 measures normally.
@@ -172,8 +219,8 @@ $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
 $is_tag(T)              # T is a tagged value (or an instance of one)
 $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
-$is_integer(T)          # T is an integer: i8..i64, u8..u64
-$is_float(T)            # T is a float: f32 or f64
+$is_integer(T)          # T is an integer primitive, signed or unsigned, of any width
+$is_float(T)            # T is a float primitive, f16, f32 or f64
 $is_secret(T)           # T is `^`-qualified at the outermost level
 $holds_secret(T)        # any byte of T is secret
 ```
@@ -193,7 +240,7 @@ A ten-way `f.type == i8 || f.type == i16 || ...` chain is the shape the language
 forced before these two, and every scalar type added later had to edit every one
 of those chains. Nothing has to edit a predicate.
 
-They are **comptime-only** — a gate condition selects an arm, and there is no
+They are **comptime-only**: a gate condition selects an arm, and there is no
 runtime boolean for one to become, so using a predicate as a value is an error.
 
 **`^` is a constructor, and a predicate answers about the outermost one.** `^Pair`
@@ -204,16 +251,16 @@ that called `^Pair` a record would send a walk into an operand the intrinsic the
 rejects.
 
 Outermost means outermost. `^*u8` is a secret pointer and `$is_pointer` answers
-false; `*^u8` is a **public** pointer to secret storage and is still a pointer,
+false. `*^u8` is a **public** pointer to secret storage and is still a pointer,
 since the address is public. A generic instance answers as the declaration it
-instantiates, so `Box[i64]` is a record — which is the type a reflection loop
-actually meets — and `Box[^u64]` is a record too, because the instance is not itself
-secret; its field is, and the field is where a walk meets the question.
+instantiates, so `Box[i64]` is a record (which is the type a reflection loop
+actually meets), and `Box[^u64]` is a record too, because the instance is not itself
+secret. Its field is, and the field is where a walk meets the question.
 
 `$is_secret` is the family's fourth member and its one **exception**, and the
 exception is coherent rather than special-cased: the other three ask about the shape
 *under* the wrapper, this one asks about the wrapper itself. It is what makes the
-other three's false readable — `$is_record(^Pair)` and `$is_record(u64)` are
+other three's false readable. `$is_record(^Pair)` and `$is_record(u64)` are
 otherwise the same answer, so before this a library could only ever meet a secret as
 a fallthrough it had to refuse.
 
@@ -235,7 +282,7 @@ do, so the four cannot disagree about what a type is:
 | `*^u8` | false | a **public** pointer to secret storage |
 | `[4]^u8` | false | a public array of secret elements |
 | `rec S { k: ^u64; }` | false | the record is public, its **field** is secret |
-| `Box[^u64]` | false | the instance is a record; its field is secret |
+| `Box[^u64]` | false | the instance is a record, its field is secret |
 | `u64`, `Pair`, `ptr` | false | no `^` anywhere |
 
 `$is_integer(^u64)` and `$is_float(^f64)` answer **false** for the same reason
@@ -251,7 +298,7 @@ one a walk actually has, and `$is_secret(f.type)` is exactly it.
 Through a reference, the per-field question **composes**:
 `$is_secret($pointee_of(f.type))` says whether a pointer field points at secret
 storage. Note that `$pointee_of(^*U)` is refused, so there is no route through a
-secret pointer — which is correct, since `$is_secret` has already answered true for
+secret pointer, which is correct, since `$is_secret` has already answered true for
 it and a walk should stop there.
 
 ### `$holds_secret`
@@ -302,7 +349,7 @@ $each f in $fields(Outer) {
 }
 ```
 
-## `$pointee_of(T)` — descend through a reference
+## `$pointee_of(T)`: descend through a reference
 
 `$is_pointer` tells a walk that a field is a reference. `$pointee_of` says what it
 refers to, which is what makes the reference traversable rather than merely
@@ -310,7 +357,7 @@ detectable:
 
 ```mach fragment
 $pointee_of(*U)         # U
-$pointee_of(**U)        # *U — one level, not all of them
+$pointee_of(**U)        # *U, one level, not all of them
 ```
 
 It is a type **constructor**, in the same family as `*`, `[N]` and `^`, not a call
@@ -331,7 +378,7 @@ $each f in $fields(Node) {
 ```
 
 Because `str` is `def str: *char`, a `str` field is a reference field, and
-`$pointee_of(str)` is `u8` — which is what a formatter that renders a `str` field
+`$pointee_of(str)` is `u8`, which is what a formatter that renders a `str` field
 needs.
 
 **Everything that is not a typed reference is refused, and the refusal names what
@@ -341,8 +388,8 @@ reports about the wrong record, so refusing is the only safe answer:
 | operand | result |
 |---|---|
 | `*U` | `U` |
-| `ptr` | refused — the raw pointer is untyped and carries no pointee |
-| `^*U` | refused — a `^` secret is not a reference |
+| `ptr` | refused: the raw pointer is untyped and carries no pointee |
+| `^*U` | refused: a `^` secret is not a reference |
 | anything else | refused, naming the type |
 
 `^` is **not** stripped, which puts `$pointee_of` with the predicates rather than
@@ -352,16 +399,16 @@ a walk secret storage the gate refused it.
 
 **Following references does not terminate structurally.** The by-value walk `$fields`
 supports does: a record cannot contain itself by value, so descending on `$is_record`
-reaches a finite set of types. A reference graph has no such property —
+reaches a finite set of types. A reference graph has no such property:
 `rec Grow[T] { p: *Grow[*T]; n: i64; }` is legal and has unboundedly many distinct
 instances, and a walk that follows `p` generates `Grow[i64]`, `Grow[*i64]`,
-`Grow[**i64]` without end. The compiler's generic-instantiation guard turns that into
-a diagnostic naming the derivation chain rather than a hang, but that is a backstop,
-not a termination story. A library that walks references owes its callers one of its
-own, which is why `std.derive` refuses reference fields by default and offers
-following as a separately named member.
+`Grow[**i64]` without end. Such a walk is a growing cycle of instances behind a comptime
+gate, and instantiation has no step limit (see [fun.md](fun.md#instantiation-ends-or-is-refused)),
+so it runs until memory is refused, shown under `-v` as it grows. A library that walks
+references owes its callers a termination story of its own, which is why `std.derive`
+refuses reference fields rather than following them.
 
-## `$type_name(T)` — a type's spelling
+## `$type_name(T)`: a type's spelling
 
 ```mach fragment
 $type_name(T)           # the type's spelling, as a NUL-terminated string
@@ -374,10 +421,10 @@ error reports cannot drift. Composites spell compositely (`$type_name(*Pair)` is
 be a drift on the one qualifier where a drift matters most, since a diagnostic about
 that type prints `^Pair`.
 
-## `$type_id(T)` — a type's identity
+## `$type_id(T)`: a type's identity
 
 ```mach fragment
-$type_id(T)             # a u64 unique to T
+$type_id(T)             # a u64 that identifies T
 ```
 
 A value, like `$type_name`, and a compile-time constant: it folds wherever the layout
@@ -386,15 +433,18 @@ so it can gate a `$if`, initialize a `val`, or be compared at run time against a
 stored one. Its type is `u64`. It never adopts a narrower binding by value, because
 an identity cut to 32 bits is not one: `val id: u32 = $type_id(T)` is a type mismatch.
 
-The contract:
+The id is the first 64 bits of a hash over the type's canonical recipe, which spells
+a nominal type by its module path and name and every other type by its parts. So:
 
-- **Distinct for distinct types.** Types are nominal, so two records named `Point`
-  in two modules have two identities. `^T` differs from `T`, and `*T`, `[N]T`,
-  a function type and each instance of a generic differ by their parts:
-  `$type_id(Box[u64])` is not `$type_id(Box[u32])`.
 - **Equal for the same type** wherever it is named: in any module, at any
   instantiation site of a generic, and in every compilation unit and library of one
   program. A `def` is a transparent alias, so `def Id: Point;` has `Point`'s identity.
+- **Changed by a rename or a move.** Renaming the type, renaming its module or moving
+  it to another module gives it a different id.
+- **Different types almost always differ, but are not guaranteed to.** `^T` and `T`,
+  two records named `Point` in two modules, and `Box[u64]` and `Box[u32]` have
+  different recipes, but two distinct types can in principle hash to the same id,
+  and the compiler does not detect it.
 - **Unaffected by optimization and linking.** It is a constant the compiler folds,
   not an address, so no folding of identical code or data can merge two identities.
 
@@ -406,7 +456,7 @@ use std.runtime;
 rec Point  { x: u64; }
 rec Box[T] { v: T; }
 
-fun same[T, U]() u8 {
+fun same[T, U]() u1 {
     ret $type_id(T) == $type_id(U);
 }
 
@@ -418,20 +468,6 @@ fun main() i32 {
     ret 0;
 }
 ```
-
-**Why a hash, and how often it collides.** A program's units are compiled
-separately, and a library may be compiled long before the program that links it, so
-no unit can see every type that will share the program. A numbering with no
-collisions needs that global view, and an address needs the linker and breaks at a
-shared library, whose internal symbols are hidden. So the identity is derived from
-the type alone: the first 64 bits of SHA-256 over the type's canonical recipe, which
-spells a nominal type by its owning module and name and every other type by its
-parts. Two distinct types of one program share an identity only by collision. For
-`n` distinct types that chance is at most `n(n-1)/2^65`: about `2^-26` for a million
-types, and far less for any real program. A check that pins a value to one type is
-defeated only when the two colliding types are the very pair it compares, and a
-source author aiming for that must find a SHA-256 match on 64 bits, about `2^64`
-work, while naming only types of their own program.
 
 The value is the same for every build of one program by one compiler. It is not
 promised across compiler versions, so a stored identity is a check inside a
@@ -456,7 +492,7 @@ about storage.**
 ## The type operand
 
 `$size_of` / `$length_of` / `$align_of` / `$offset_of` / `$fields` and the queries above all take a
-**type** in argument 0, written with the ordinary type grammar — plus one extra
+**type** in argument 0, written with the ordinary type grammar, plus one extra
 form: a field descriptor's `f.type` inside a `$each` body. `$pointee_of` is part of
 that grammar rather than one of its consumers, so it composes with every one of
 them (`$size_of($pointee_of(f.type))`, `$fields($pointee_of(f.type))`).
@@ -469,7 +505,7 @@ $each f in $fields(T) {
 ```
 
 The same form is valid in a **generic argument list**, which is what makes a walk
-recursive rather than merely descending (#2691):
+recursive rather than merely descending:
 
 ```mach fragment
 fun eq[T](a: *T, b: *T) bool {
@@ -489,21 +525,21 @@ written once and reaches any depth.
 
 **Termination is structural and needs no depth limit.** Each descent instantiates at
 a field's own type, a record's fields are finite, and a record cannot contain itself
-by value — a self-reference must go through a pointer, which is a different type and
+by value. A self-reference must go through a pointer, which is a different type and
 which `$is_record` does not select. Note that a walk which followed references would
 not have this property: `rec Grow[T] { p: *Grow[*T]; }` is legal and has unboundedly
 many distinct instances reachable through its pointer.
 
 Inside the loop a field's type has no spelling, only the descriptor. A path that is
 genuinely a qualified type name (`mod.Type`) still reads as one, and a wrong one
-still reports against the type grammar — in the generic argument list exactly as in
+still reports against the type grammar, in the generic argument list exactly as in
 an intrinsic operand. A name that is not a `$each` loop variable is reported where
 it is written.
 
 ## Type intrinsic
 
-`$type_of(expr)` produces a comptime type value — the resolved type of its
-argument `expr`. Type values have no runtime representation; they are only
+`$type_of(expr)` produces a comptime type value: the resolved type of its
+argument `expr`. Type values have no runtime representation. They are only
 meaningful as operands in comptime type comparisons.
 
 ```mach fragment
@@ -520,7 +556,7 @@ $or { $error("unsupported type"); }
 
 A bare type name (e.g. `i64`, `str`, `Point`) is the other valid operand.
 The comparison selects one branch at compile time per monomorphization
-instance — useful for per-element type dispatch inside `$each` bodies.
+instance, which is useful for per-element type dispatch inside `$each` bodies.
 
 The operand is read at the **instance's** concrete type, in a plain generic as
 much as in a pack-tailed one, and whether it is a parameter, a local, a field, or
@@ -548,7 +584,7 @@ three readable properties:
 | `f.offset` | integer  | byte offset of the field in `T`'s layout     |
 
 `$fields(T)` is consumed by `$each f in $fields(T)`. Inside the loop body,
-`v.[f]` projects the concrete field off an instance `v` — it is an lvalue
+`v.[f]` projects the concrete field off an instance `v`. It is an lvalue
 (readable and writable, including through a pointer receiver).
 
 ```mach fragment
@@ -641,7 +677,7 @@ fun main(argc: i64, argv: **u8) i64 {
 ```
 
 Note: if a record has a field literally named `type`, that ordinary field
-access (`v.type`) is unaffected — `v.[f]` projection uses the `$each` loop
+access (`v.type`) is unaffected. `v.[f]` projection uses the `$each` loop
 variable, which is always a field descriptor, never a regular member.
 
 ### Nested `$each`
@@ -684,7 +720,7 @@ five readable properties:
 | `case.code`        | `u64`     | declaration ordinal case code, the stored discriminator value |
 
 Accessing `case.type` or `case.offset` on a descriptor whose `has_payload` is false
-is a compile error; gate on `case.has_payload` first. `case.type` preserves all
+is a compile error. Gate on `case.has_payload` first. `case.type` preserves all
 declared payload qualifiers, and over a generic instantiation it names the
 specialized payload type. `$is_tag(^T)` is false, and `$cases(^T)` is rejected.
 `$fields` refuses a tag and `$cases` refuses a record.
@@ -732,12 +768,12 @@ types (`$discriminant_of(^T)`) because it reports storage metadata rather than
 the active case. Conversely, `$cases(^T)` is refused, matching current shape query
 conventions.
 
-`$offset_of(T, payload_case)` reuses the layout intrinsic to report the common
-payload offset; naming a payloadless case is an error. Like `$size_of` and
+`$offset_of(T, payload_case)` reuses the layout intrinsic to report the offset
+of the payload area that holds the case. Naming a payloadless case is an error. Like `$size_of` and
 `$align_of`, layout answers for tags come from the checked target layout and are
 available during type checking.
 
-## `$each` — compile-time unroll
+## `$each`: compile-time unroll
 
 `$each` is a statement form that splices its body once per element of a
 comptime sequence. There are four sequence forms:
@@ -750,7 +786,7 @@ $each x in ARR { ... }           # one iteration per element of a constant array
 ```
 
 `$each` is valid only in statement scope (inside a function body). It is not
-a loop — the body is duplicated at compile time, not iterated at runtime.
+a loop. The body is duplicated at compile time, not iterated at runtime.
 Enclosing runtime variables (e.g. an index or accumulator) are shared across
 all unrolled copies.
 
@@ -762,7 +798,7 @@ See [variadics.md](variadics.md) for the pack form (`$each a in va`).
 element's compile-time constant per iteration. Unlike the pack and `$fields`
 forms, every element shares one type (the array's element type), so the loop
 variable is an ordinary constant value: it reads as a value, casts, dispatches a
-per-element `$if`, and — for a record element — projects fields with `x.field`.
+per-element `$if`, and, for a record element, projects fields with `x.field`.
 
 ```mach
 use std.print;
@@ -805,27 +841,32 @@ fun run(n: i64) {
 }
 ```
 
-**Eligibility.** `ARR` must name an immutable `val` (never a `var`) declared in
-the current module, whose type is a fixed-size array `[N]E` fully initialized by
-an array literal of exactly `N` elements. `E` must be a scalar or record type;
+**Eligibility.** `ARR` must name an immutable `val` (never a `var`), declared in
+the current module, in a body, or in a module it imports, whose type is a
+fixed-size array `[N]E` fully initialized by an array literal of exactly `N`
+elements. `E` must be a scalar or record type, and
 nested-array element types are not supported. An empty array (`[0]E`) unrolls to
 nothing. Each violation is reported with a teaching diagnostic.
 
 `x.field` on a record element projects the element's constant: a scalar field
-folds to a constant, a function-pointer field yields a function reference, and a
-record field materializes the nested literal. Projection is one level deep
-(`x.field`); `x` itself is a constant and has no address (`?x` is rejected).
+folds to a constant, a field the literal leaves out reads as its zero, and a
+record field materializes the nested literal, at any depth (`x.a.b`). A part of
+the element with no compile-time value, such as a function-pointer field, is
+read from the array itself. `x` itself is a constant and has no address (`?x` is
+rejected).
 
 ## Diagnostic intrinsics
 
-`$error("msg")` fails compilation with `msg` when it is **reached** — on a live
+`$error("msg")` fails compilation with `msg` when it is **reached**, on a live
 path: an unconditional position, or a `$if` / `$or` arm the compiler selects. A
 `$error` in a discarded (dead) arm never fires, so it is the natural total-
-coverage fallback for a `$type_of` dispatch — the unhandled-type `$or {}` arm
+coverage fallback for a `$type_of` dispatch: the unhandled-type `$or {}` arm
 fails the build at compile time instead of falling through to a runtime error.
 
 `$error` is valid in both declaration and statement scope and takes one
-string-literal message.
+string-literal message. One that fires in declaration scope refuses its module,
+and the modules that import it report nothing: see
+[comptime-control.md](comptime-control.md#a-module-refused-by-its-own-error).
 
 ```mach fragment
 $error("msg")           # fails compilation when reached
@@ -839,10 +880,26 @@ $or ($type_of(arg) == str) { write_str(w, arg); }
 $or { $error("no writer for this argument type"); }    # compile error on an unhandled type
 ```
 
+## `$zeroize(p, count)`: a wipe no pass removes
+
+`$zeroize` writes zero to every byte of `count` values of the pointee of `p`. It is
+the one intrinsic that does its work at run time, because no function can state
+what it states: see [the zeroizing-write guarantee](secrecy.md#the-zeroizing-write-guarantee).
+
+```mach fragment
+var key: [32]^u8;
+# ...
+$zeroize(?key, 1);
+```
+
+`p` is a `*T` for any `T`: public, wholly secret or mixed, with no cast, since the
+wipe reads nothing and changes no qualifier. `count` is a public integer. It is an
+expression statement and gives no value.
+
 ## Not provided as intrinsics
 
-Code intrinsics — runtime-instruction emitters like `trap`, `fence`,
-`pause` — are not in the compiler-shipped set. They belong in stdlib as
+Other code intrinsics, runtime-instruction emitters like `trap`, `fence` and
+`pause`, are not in the compiler-shipped set. They belong in stdlib as
 functions with per-arch `asm` bodies. See [policy.md](policy.md).
 
 **`$assert` is not an intrinsic either**, and is not planned as one: `$if` and
@@ -861,11 +918,11 @@ conditions fold there as in any other gate, and the ones that do not (a type que
 over an unbound generic parameter, anything asked of a chain that also declares
 something) refuse with their own cause rather than through a second surface that
 could describe them differently. A chain written this way declares nothing, so it is
-decided during type checking and can measure a type; see
+decided during type checking and can measure a type. See
 [comptime-control.md](comptime-control.md).
 
 ## See also
 
-- [comptime.md](comptime.md) — channel overview
-- [comptime-control.md](comptime-control.md) — `$if` / `$or`
-- [variadics.md](variadics.md) — `$each a in va`, `va: ...`, `va.len`, `va...`
+- [comptime.md](comptime.md): channel overview
+- [comptime-control.md](comptime-control.md): `$if` / `$or`
+- [variadics.md](variadics.md): `$each a in va`, `va: ...`, `va.len`, `va...`

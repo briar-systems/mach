@@ -1,0 +1,590 @@
+# the `[link.<name>]` tables: their decoding, and their resolution for one target
+#
+# an entry applies to a target its `sys`, `arch` and `abi` filters all admit, and a
+# `LinkRequirement` owns its copy of the entry's symbols.
+
+use mach.base.fail;
+use mach.base.growth;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_is_empty;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
+
+use A: std.allocator;
+use std.process.env;
+use types_path:   std.types.path;
+use types_string: std.types.string;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.intern;
+use mach.target.input;
+use target_tags: mach.target.tags;
+
+use mach.manifest.model.LINK_FRAMEWORK;
+use mach.manifest.model.LINK_LOCAL;
+use mach.manifest.model.LINK_SYSTEM;
+use mach.manifest.model.LinkDef;
+use mach.manifest.model.LinkSource;
+use mach.manifest.model.LinkVersions;
+use mach.manifest.model.Manifest;
+use mach.manifest.model.TargetDef;
+use mach.manifest.model.free_strarr;
+use mach.manifest.model.id_of;
+use mach.manifest.model.link_def;
+use mach.manifest.refusal.point_at;
+use mach.manifest.refusal.refuse;
+use mach.manifest.refusal.sfmt;
+use mach.manifest.refusal.span_site;
+use mach.manifest.schema.StrArr;
+use mach.manifest.schema.check_path;
+use mach.manifest.schema.element_span;
+use mach.manifest.schema.flag;
+use mach.manifest.schema.ids_of;
+use mach.manifest.schema.key_text;
+use mach.manifest.schema.value_span;
+use mach.manifest.schema.written_value;
+use mach.manifest.template;
+
+# a `[link.<name>]` entry resolved for one target, as the linker consumes it.
+# the symbol array is owned; release it with `link_claims_dnit`
+# ---
+# source:             copied from the link
+# text:               for a local source, the `path` expanded, anchored as an absolute path and
+#                     interned; otherwise the link's `name`
+# key:                the link's table key, its identity
+# symbols:            an owned copy of the link's `symbols`, or nil when it has none
+# symbol_count:       length of `symbols`
+# include_referenced: copied from the link
+# kind:               copied from the link
+# versions:           copied from the link
+pub rec LinkRequirement {
+    source: LinkSource;
+    text:   intern.StrId;
+    key:    intern.StrId;
+
+    symbols:            *intern.StrId;
+    symbol_count:       u32;
+    include_referenced: bool;
+    kind:               input.Kind;
+    versions:           LinkVersions;
+}
+
+fun canonical_axis_value(key: str, value: str) bool {
+    if (str_equals(value, "*"))  { ret true; }
+    if (str_equals(key, "sys"))  { ret target_tags.sys_named(value) != target_tags.NONE; }
+    if (str_equals(key, "arch")) { ret target_tags.arch_named(value) != target_tags.NONE; }
+    if (str_equals(key, "abi"))  { ret target_tags.abi_named(value) != target_tags.NONE; }
+    ret false;
+}
+
+# a link's `sys`, `arch` or `abi` filter: an array of values, each a canonical
+# name or "*"
+fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, key: str, label: str) res[StrArr, fail.Fail] {
+    val opt_arr: opt[*toml_value.Array] = toml_lookup.get_array(sub, key);
+    if (sel opt_arr.none) { ret res[StrArr, fail.Fail].err{fail.message("a link passed its schema check without a filter axis")}; }
+    val res_arr: res[StrArr, fail.Fail] = ids_of(alloc, itn, opt_arr.some, label, key);
+    if (sel res_arr.err) { ret res_arr; }
+    var out: StrArr = res_arr.ok;
+    out.present = true;
+
+    var vi: u32 = 0;
+    for (vi < out.count) {
+        val vs: str = intern.text(itn, out.items[vi]);
+        if (!canonical_axis_value(key, vs)) {
+            free_strarr(alloc, out.items, out.count);
+            ret res[StrArr, fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.{} has the non-canonical value '{}'. use a canonical value or \"*\"", label, key, vs), element_span(opt_arr.some, vi::usize))};
+        }
+        vi = vi + 1;
+    }
+    ret res[StrArr, fail.Fail].ok{out};
+}
+
+# decode every `[link.<name>]` table of `t` into `m.links`, nothing when there is none
+# ---
+# alloc: owns the link array, its entries and a refusal's text
+# itn:   interns the names, paths and filter values
+# t:     the manifest's root table
+# m:     the manifest the links are set on
+# ret:   ok, or the refusal of the first link that does not decode
+pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail] {
+    val opt_tab: opt[*toml_value.Table] = toml_lookup.get_table(t, "link");
+    if (sel opt_tab.none) { ret err[fail.Fail].ok{}; }
+    val tab: *toml_value.Table = opt_tab.some;
+    val n:   usize             = toml_lookup.table_len(tab);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val res_links: res[*LinkDef, A.Error] = A.allocate[LinkDef](alloc, n);
+    if (sel res_links.err) { ret err[fail.Fail].err{fail.refused(res_links.err)}; }
+    m.links      = res_links.ok;
+    m.link_count = n::u32;
+
+    var initialized: usize = 0;
+    for (initialized < n) {
+        m.links[initialized] = link_def();
+        initialized          = initialized + 1;
+    }
+
+    var i: usize = 0;
+    for (i < n) {
+        val opt_name:        opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        if (sel opt_name.none)        { brk; }
+        if (sel opt_table_value.none) { brk; }
+        val res_label: res[str, fail.Fail] = sfmt(alloc, "[link.{}]", opt_name.some);
+        if (sel res_label.err) { ret err[fail.Fail].err{res_label.err}; }
+        val err_link_decode: err[fail.Fail] = link_decode(alloc, itn, opt_name.some, res_label.ok, opt_table_value.some, ?m.links[i]);
+        str_free(alloc, res_label.ok);
+        if (sel err_link_decode.err) { ret err_link_decode; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun link_decode(alloc: *A.Allocator, itn: *intern.Interner, name: str, label: str, v: *toml_value.Value, d: *LinkDef) err[fail.Fail] {
+    val sub:         *toml_value.Table            = ?v.data.table;
+    val res_name_id: res[intern.StrId, fail.Fail] = id_of(itn, name);
+    if (sel res_name_id.err) { ret err[fail.Fail].err{res_name_id.err}; }
+    d.name    = res_name_id.ok;
+    d.at      = span_site(v.key);
+    d.path_at = span_site(value_span(sub, "path"));
+
+    val source_s: str = key_text(sub, "source");
+    if (!str_equals(source_s, "system") && !str_equals(source_s, "framework") && !str_equals(source_s, "local")) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.source must be \"system\", \"framework\", or \"local\"", label), value_span(sub, "source"))};
+    }
+    d.source = LINK_LOCAL;
+    if (str_equals(source_s, "system"))    { d.source = LINK_SYSTEM; }
+    if (str_equals(source_s, "framework")) { d.source = LINK_FRAMEWORK; }
+
+    val symbols_v: *toml_value.Value = written_value(sub, "symbols");
+    if (symbols_v != nil) {
+        val res_syms: res[StrArr, fail.Fail] = ids_of(alloc, itn, ?symbols_v.data.array, label, "symbols");
+        if (sel res_syms.err) { ret err[fail.Fail].err{res_syms.err}; }
+        val syms: StrArr = res_syms.ok;
+        d.symbols      = syms.items;
+        d.symbol_count = syms.count;
+        var si: u32 = 0;
+        for (si < syms.count) {
+            if (str_is_empty(intern.text(itn, syms.items[si]))) {
+                ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.symbols has an empty symbol name", label), element_span(?symbols_v.data.array, si::usize))};
+            }
+            var sj: u32 = 0;
+            for (sj < si) {
+                if (intern.str_same(syms.items[sj], syms.items[si])) {
+                    ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_DUPLICATE_ENTRY, "mach.toml: {}.symbols lists '{}' twice",
+                        label, intern.text(itn, syms.items[si])), element_span(?symbols_v.data.array, si::usize))};
+                }
+                sj = sj + 1;
+            }
+            si = si + 1;
+        }
+    }
+
+    val name_val: str = key_text(sub, "name");
+    val path_val: str = key_text(sub, "path");
+    if (d.source == LINK_LOCAL) {
+        if (!str_is_empty(name_val)) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.name is not allowed for local sources", label), value_span(sub, "name"))};
+        }
+        if (str_is_empty(path_val)) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_MISSING_REQUIRED, "mach.toml: {} is missing required key 'path' for local source", label), v.span)};
+        }
+        val res_path_field: res[str, fail.Fail] = sfmt(alloc, "{}.path", label);
+        if (sel res_path_field.err) { ret err[fail.Fail].err{res_path_field.err}; }
+        val err_check_path: err[fail.Fail] = check_path(alloc, path_val, res_path_field.ok, value_span(sub, "path"));
+        str_free(alloc, res_path_field.ok);
+        if (sel err_check_path.err) { ret err_check_path; }
+        val res_path_id: res[intern.StrId, fail.Fail] = id_of(itn, path_val);
+        if (sel res_path_id.err) { ret err[fail.Fail].err{res_path_id.err}; }
+        d.path     = res_path_id.ok;
+        d.lib_name = intern.STR_NIL;
+    }
+    or (str_is_empty(name_val) && names_module(sub)) {
+        if (!str_is_empty(path_val)) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.path is not allowed for non-local sources", label), value_span(sub, "path"))};
+        }
+        d.lib_name = d.name;
+        d.path     = intern.STR_NIL;
+    }
+    or {
+        if (!str_is_empty(path_val)) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.path is not allowed for non-local sources", label), value_span(sub, "path"))};
+        }
+        if (str_is_empty(name_val)) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_MISSING_REQUIRED, "mach.toml: {} is missing required key 'name' for non-local source", label), v.span)};
+        }
+        val res_lib_id: res[intern.StrId, fail.Fail] = id_of(itn, name_val);
+        if (sel res_lib_id.err) { ret err[fail.Fail].err{res_lib_id.err}; }
+        d.lib_name = res_lib_id.ok;
+        d.path     = intern.STR_NIL;
+    }
+
+    val res_os: res[StrArr, fail.Fail] = parse_filter_axis(alloc, itn, sub, "sys", label);
+    if (sel res_os.err) { ret err[fail.Fail].err{res_os.err}; }
+    d.sys       = res_os.ok.items;
+    d.sys_count = res_os.ok.count;
+
+    val res_isa: res[StrArr, fail.Fail] = parse_filter_axis(alloc, itn, sub, "arch", label);
+    if (sel res_isa.err) { ret err[fail.Fail].err{res_isa.err}; }
+    d.arch       = res_isa.ok.items;
+    d.arch_count = res_isa.ok.count;
+
+    val res_abi: res[StrArr, fail.Fail] = parse_filter_axis(alloc, itn, sub, "abi", label);
+    if (sel res_abi.err) { ret err[fail.Fail].err{res_abi.err}; }
+    d.abi       = res_abi.ok.items;
+    d.abi_count = res_abi.ok.count;
+
+    d.export = flag(sub, "export");
+    val include_v: *toml_value.Value = written_value(sub, "include");
+    if (include_v != nil) {
+        val include_s: str = include_v.data.string;
+        if (str_equals(include_s, "referenced")) { d.include_referenced = true; }
+        or (!str_equals(include_s, "always")) {
+            ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.include must be \"always\" or \"referenced\"", label), include_v.span)};
+        }
+    }
+    val err_kinded: err[fail.Fail] = link_decode_kind(alloc, itn, label, sub, d);
+    if (sel err_kinded.err) { ret err_kinded; }
+    ret link_decode_versions(alloc, label, sub, d);
+}
+
+# the `current_version` and `compatibility_version` keys, which only a system source of the
+# shared kind takes, written together: what a shared library's load command names where its
+# image records them
+fun link_decode_versions(alloc: *A.Allocator, label: str, sub: *toml_value.Table, d: *LinkDef) err[fail.Fail] {
+    val current_v: *toml_value.Value = written_value(sub, "current_version");
+    val compat_v:  *toml_value.Value = written_value(sub, "compatibility_version");
+    if (current_v == nil && compat_v == nil) { ret err[fail.Fail].ok{}; }
+    var first: *toml_value.Value = current_v;
+    if (first == nil) { first = compat_v; }
+    if (d.source != LINK_SYSTEM || d.kind != input.SHARED) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} states versions, which only a system source of the shared kind takes", label), first.span)};
+    }
+    if (current_v == nil || compat_v == nil) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_MISSING_REQUIRED, "mach.toml: {} states only one of current_version and compatibility_version. write both", label), first.span)};
+    }
+    val res_current: res[u32, fail.Fail] = version_encoded(alloc, label, "current_version", current_v);
+    if (sel res_current.err) { ret err[fail.Fail].err{res_current.err}; }
+    val res_compat: res[u32, fail.Fail] = version_encoded(alloc, label, "compatibility_version", compat_v);
+    if (sel res_compat.err) { ret err[fail.Fail].err{res_compat.err}; }
+    d.versions = LinkVersions{stated: true, current: res_current.ok, compat: res_compat.ok};
+    ret err[fail.Fail].ok{};
+}
+
+# a version written `X[.Y[.Z]]` as a load command holds it: X below 65536 in the high 16
+# bits, Y and Z below 256 in 8 bits each, a component left out being zero
+fun version_encoded(alloc: *A.Allocator, label: str, key: str, v: *toml_value.Value) res[u32, fail.Fail] {
+    val text:   str    = v.data.string;
+    var parts:  [3]u64 = [3]u64{0, 0, 0};
+    var limit:  [3]u64 = [3]u64{0xffff, 0xff, 0xff};
+    var at:     usize  = 0;
+    var part:   usize  = 0;
+    var digits: usize  = 0;
+    var bad:    bool   = str_is_empty(text);
+    for (!bad && text[at] != 0) {
+        val ch: u8 = text[at];
+        at = at + 1;
+        if (ch == '.') {
+            if (digits == 0 || part == 2) { bad = true; }
+            part   = part + 1;
+            digits = 0;
+            cnt;
+        }
+        if (ch < '0' || ch > '9') {
+            bad = true;
+            cnt;
+        }
+        parts[part] = parts[part] * 10 + (ch - '0')::u64;
+        digits      = digits + 1;
+        if (parts[part] > limit[part]) { bad = true; }
+    }
+    if (digits == 0) { bad = true; }
+    if (bad) {
+        ret res[u32, fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.{} must be written X[.Y[.Z]], X below 65536 and Y and Z below 256", label, key), v.span)};
+    }
+    ret res[u32, fail.Fail].ok{((parts[0] << 16) | (parts[1] << 8) | parts[2])::u32};
+}
+
+# whether the entry `sub` states `kind = "module"`, an import module, whose
+# name is the entry's key unless it states one
+fun names_module(sub: *toml_value.Table) bool {
+    val kind_v: *toml_value.Value = written_value(sub, "kind");
+    ret kind_v != nil && str_equals(kind_v.data.string, "module");
+}
+
+# the `kind` key, which only a system source naming a library by a bare name
+# or an import module takes: a file states its own kind, and a framework is
+# its bundle
+fun link_decode_kind(alloc: *A.Allocator, itn: *intern.Interner, label: str, sub: *toml_value.Table, d: *LinkDef) err[fail.Fail] {
+    val kind_v: *toml_value.Value = written_value(sub, "kind");
+    if (kind_v == nil) { ret err[fail.Fail].ok{}; }
+    if (d.source != LINK_SYSTEM) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.kind is not allowed for non-system sources", label), kind_v.span)};
+    }
+    val kind_s: str = kind_v.data.string;
+    if (str_equals(kind_s, "module")) {
+        d.kind = input.MODULE;
+        ret err[fail.Fail].ok{};
+    }
+    if (str_equals(kind_s, "static")) { d.kind = input.STATIC; }
+    or (!str_equals(kind_s, "shared")) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.kind must be \"shared\", \"static\" or \"module\"", label), kind_v.span)};
+    }
+    val lib_name: str = intern.text(itn, d.lib_name);
+    if (input.names_file(lib_name::*u8)) {
+        ret err[fail.Fail].err{point_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.kind is not allowed with name '{}', because a named file states its own kind", label, lib_name), kind_v.span)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# free the symbol arrays of `count` requirements and nil them. the `items` array
+# itself is not freed
+# ---
+# alloc: the allocator the claims were made from
+# items: the requirements; nil is accepted
+# count: how many entries to release
+pub fun link_claims_dnit(alloc: *A.Allocator, items: *LinkRequirement, count: u32) {
+    if (items == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        free_strarr(alloc, items[i].symbols, items[i].symbol_count);
+        items[i].symbols      = nil;
+        items[i].symbol_count = 0;
+        i                     = i + 1;
+    }
+}
+
+# turn a partially filled requirement buffer into an exactly sized result, taking
+# ownership of the buffer
+# ---
+# alloc:     the buffer's allocator
+# items:     a buffer of `capacity` entries with the first `count` filled
+# capacity:  the buffer's allocated extent
+# count:     the filled prefix
+# out_items: receives the exact array, or nil when `count` is 0 or on error
+# out_count: receives `count`, or 0 when it is 0 or on error
+# ret:       ok; when `count` is 0 the buffer is freed. on a failed shrink the filled
+#            claims and the whole buffer are freed and the allocator's error is returned
+pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
+    capacity: u32, count: u32,
+    out_items: **LinkRequirement,
+    out_count: *u32) err[fail.Fail] {
+    @out_items = nil;
+    @out_count = 0;
+    var kept:       *LinkRequirement = items;
+    var cap:        u32              = capacity;
+    val err_fitted: err[A.Error]     = growth.resize[LinkRequirement](alloc, ?kept, ?cap, count::usize);
+    if (sel err_fitted.err) {
+        link_claims_dnit(alloc, items, count);
+        A.deallocate[LinkRequirement](alloc, items, capacity::usize);
+        ret err[fail.Fail].err{fail.refused(err_fitted.err)};
+    }
+    @out_items = kept;
+    @out_count = count;
+    ret err[fail.Fail].ok{};
+}
+
+# add every symbol of `src` that `dst` lacks to `dst`, keeping `dst` order first
+# and the new entries in `src` order. `src` is not modified
+# ---
+# alloc: the allocator of `dst.symbols`; the old array is freed and replaced
+# dst:   the requirement that grows
+# src:   the requirement whose symbols are added
+# ret:   ok, without allocating, when nothing is new; err on a symbol count
+#        overflow or allocation failure, leaving `dst` unchanged
+pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
+    src: *LinkRequirement) err[fail.Fail] {
+    var added: u32 = 0;
+    var i:     u32 = 0;
+    for (i < src.symbol_count) {
+        var present: bool = false;
+        var j:       u32  = 0;
+        for (j < dst.symbol_count) {
+            if (intern.str_same(dst.symbols[j], src.symbols[i])) {
+                present = true;
+                brk;
+            }
+            j = j + 1;
+        }
+        j = 0;
+        for (!present && j < i) {
+            if (intern.str_same(src.symbols[j], src.symbols[i])) {
+                present = true;
+                brk;
+            }
+            j = j + 1;
+        }
+        if (!present) { added = added + 1; }
+        i = i + 1;
+    }
+    if (added == 0) { ret err[fail.Fail].ok{}; }
+    if (dst.symbol_count > 0xFFFFFFFF - added) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.MANIFEST_TOO_MANY_ENTRIES, "too many merged link symbol claims")};
+    }
+
+    val total:        u32                         = dst.symbol_count + added;
+    val res_allocate: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](alloc, total::usize);
+    if (sel res_allocate.err) {
+        ret err[fail.Fail].err{fail.refused(res_allocate.err)};
+    }
+    val merged:  *intern.StrId = res_allocate.ok;
+    var written: u32           = 0;
+    for (written < dst.symbol_count) {
+        merged[written] = dst.symbols[written];
+        written         = written + 1;
+    }
+    i = 0;
+    for (i < src.symbol_count) {
+        var present: bool = false;
+        var j:       u32  = 0;
+        for (j < written) {
+            if (intern.str_same(merged[j], src.symbols[i])) {
+                present = true;
+                brk;
+            }
+            j = j + 1;
+        }
+        if (!present) {
+            merged[written] = src.symbols[i];
+            written         = written + 1;
+        }
+        i = i + 1;
+    }
+
+    if (dst.symbols != nil && dst.symbol_count > 0) {
+        A.deallocate[intern.StrId](alloc, dst.symbols, dst.symbol_count::usize);
+    }
+    dst.symbols      = merged;
+    dst.symbol_count = total;
+    ret err[fail.Fail].ok{};
+}
+
+fun filter_matches(itn: *intern.Interner, items: *intern.StrId, count: u32, target: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (intern.str_same(items[i], target) || str_equals(intern.text(itn, items[i]), "*")) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether a link's `sys`, `arch` and `abi` filters all admit a target. an empty
+# axis admits nothing, "*" everything
+# ---
+# itn: resolves the filter values
+# l:   the link
+# t:   the target
+# ret: true when all three axes admit `t`
+pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) bool {
+    if (!filter_matches(itn, l.sys, l.sys_count, t.sys))    { ret false; }
+    if (!filter_matches(itn, l.arch, l.arch_count, t.arch)) { ret false; }
+    if (!filter_matches(itn, l.abi, l.abi_count, t.abi))    { ret false; }
+    ret true;
+}
+
+# resolve a link entry for one target into a `LinkRequirement`. a local `path`
+# is expanded with `expand_local_path`, anchored and interned, and the symbols are
+# copied into an owned array. the path is anchored once, here: at the root
+# project's directory when its template names a variable whose value lies under
+# it, as `{project.work}` does, and otherwise at the directory of the project
+# whose manifest states the entry
+# ---
+# alloc:    owns the symbol copy
+# itn:      interns the anchored path
+# l:        the link
+# proj_out: the expanded `[project].work`
+# v:        the template values
+# declared: the directory of the project whose manifest states `l`
+# home:     the root project's directory
+# ret:      the requirement; on error nothing is left allocated
+pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
+    proj_out: str, v: *template.Values, declared: str, home: str) res[LinkRequirement, fail.Fail] {
+    var req: LinkRequirement;
+    req.source             = l.source;
+    req.key                = l.name;
+    req.include_referenced = l.include_referenced;
+    req.kind               = l.kind;
+    req.versions           = l.versions;
+    req.symbols            = nil;
+    req.symbol_count       = 0;
+    var handed: bool = false;
+    fin {
+        if (!handed) { free_strarr(alloc, req.symbols, req.symbol_count); }
+    }
+    if (l.symbol_count > 0) {
+        val res_allocate: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](alloc, l.symbol_count::usize);
+        if (sel res_allocate.err) { ret res[LinkRequirement, fail.Fail].err{fail.refused(res_allocate.err)}; }
+        req.symbols = res_allocate.ok;
+        var si: u32 = 0;
+        for (si < l.symbol_count) {
+            req.symbols[si] = l.symbols[si];
+            si              = si + 1;
+        }
+        req.symbol_count = l.symbol_count;
+    }
+    if (l.source == LINK_LOCAL) {
+        val res_expanded: res[str, fail.Fail] = expand_local_path(alloc, itn, l, proj_out, v);
+        if (sel res_expanded.err) { ret res[LinkRequirement, fail.Fail].err{res_expanded.err}; }
+        var base: str = declared;
+        if (template.homed(intern.text(itn, l.path))) { base = home; }
+        val res_anchored: res[str, fail.Fail] = anchored(alloc, base, res_expanded.ok);
+        str_free(alloc, res_expanded.ok);
+        if (sel res_anchored.err) { ret res[LinkRequirement, fail.Fail].err{res_anchored.err}; }
+        val res_int: res[intern.StrId, fail.Fail] = id_of(itn, res_anchored.ok);
+        str_free(alloc, res_anchored.ok);
+        if (sel res_int.err) { ret res[LinkRequirement, fail.Fail].err{res_int.err}; }
+        req.text = res_int.ok;
+        handed   = true;
+        ret res[LinkRequirement, fail.Fail].ok{req};
+    }
+    req.text = l.lib_name;
+    handed   = true;
+    ret res[LinkRequirement, fail.Fail].ok{req};
+}
+
+val CWD_OP: fail.Op = fail.Op{verb: "read", role: "the working directory"};
+
+# the project path `path` under the directory `base`, as an absolute, lexically
+# clean path, `base` lying under the working directory when relative
+fun anchored(alloc: *A.Allocator, base: str, path: str) res[str, fail.Fail] {
+    val res_cwd: res[types_string.OwnedString, env.EnvError] = env.current_dir(alloc);
+    if (sel res_cwd.err) { ret res[str, fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_CURRENT_DIR, CWD_OP, fail.Cause.env{res_cwd.err})}; }
+    var cwd:       types_string.OwnedString = res_cwd.ok;
+    val res_based: res[str, A.Error]        = types_path.resolve(alloc, cwd.data, base);
+    types_string.owned_dnit(?cwd);
+    if (sel res_based.err) { ret res[str, fail.Fail].err{fail.refused(res_based.err)}; }
+    val res_joined: res[str, A.Error] = types_path.resolve(alloc, res_based.ok, path);
+    str_free(alloc, res_based.ok);
+    if (sel res_joined.err) { ret res[str, fail.Fail].err{fail.refused(res_joined.err)}; }
+    val res_clean: res[str, A.Error] = types_path.clean(alloc, res_joined.ok);
+    str_free(alloc, res_joined.ok);
+    if (sel res_clean.err) { ret res[str, fail.Fail].err{fail.refused(res_clean.err)}; }
+    ret res[str, fail.Fail].ok{res_clean.ok};
+}
+
+# expand a local link's `path` with `v`; a refusal points at the `path` value
+pub fun expand_local_path(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
+    proj_out: str, v: *template.Values) res[str, fail.Fail] {
+    val res_path_expand: res[str, fail.Fail] = template.path_expand(alloc, intern.text(itn, l.path), template.CONTEXT_PATH, proj_out, v, "a local link path");
+    if (sel res_path_expand.err) { ret res[str, fail.Fail].err{fail.at(res_path_expand.err, l.path_at)}; }
+    ret res_path_expand;
+}
+
+# the link `m` declares under the interned `name`, nil when none is
+pub fun find_link_by_name(m: *Manifest, name: intern.StrId) *LinkDef {
+    var i: u32 = 0;
+    for (i < m.link_count) {
+        if (intern.str_same(m.links[i].name, name)) { ret ?m.links[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}

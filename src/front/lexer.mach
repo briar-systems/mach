@@ -1,0 +1,625 @@
+# the lexer: a file's source as a token stream, with its lexical errors and the runs of
+# line comments that documentation is read from
+#
+# line-adjacent `#` comments that each start their own line fold into one run, and the
+# parser asks for the run directly above a declaration (`doc_run_above`) and the run
+# opening the file (`leading_run`)
+#
+# `asm` where a statement begins, followed on its line by a word, opens an inline-asm block:
+# its head runs to the `{` on that line, and its body, the instruction set's text, is one
+# token whose end the dialect of the set the head names finds (`mach.front.asm`)
+use mach.base.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+
+use A: std.allocator;
+
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.growth;
+use base_source: mach.base.source;
+use front_asm:   mach.front.asm;
+use mach.front.lexis;
+use mach.front.token;
+
+use masc_source: masc.core.source;
+use masc_isa:    masc.isa;
+
+def LexErrorCode: u8;
+
+val LEX_ERR_UNEXPECTED_CHAR:   LexErrorCode = 1;
+val LEX_ERR_UNTERMINATED_STR:  LexErrorCode = 2;
+val LEX_ERR_UNTERMINATED_CHAR: LexErrorCode = 3;
+val LEX_ERR_CONTROL_CHAR:      LexErrorCode = 4;
+val LEX_ERR_NON_ASCII:         LexErrorCode = 5;
+val LEX_ERR_ASM_UNREAD:        LexErrorCode = 6;
+val LEX_ERR_ASM_AMBIGUOUS:     LexErrorCode = 7;
+val LEX_ERR_ASM_UNTERMINATED:  LexErrorCode = 8;
+
+rec LexError {
+    span: base_source.Span;
+    code: LexErrorCode;
+}
+
+rec CommentRun {
+    span:       base_source.Span;
+    start_line: usize;
+    end_line:   usize;
+}
+
+# a lexed file: its tokens ending in one end of file token, its lex errors and its comment runs
+# ---
+# tokens:      the tokens in source order, owned by the stream
+# len:         how many tokens are held
+# cap:         how many tokens `tokens` has room for
+# source:      the text lexed, borrowed
+# file_id:     the file the text belongs to, where errors are reported
+# errors:      the lex errors met, owned by the stream
+# error_len:   how many errors are held
+# error_cap:   how many errors `errors` has room for
+# comments:    the comment runs, each a lone trailing comment or line adjacent own-line comments, in source order, owned by the stream
+# comment_len: how many runs are held
+# comment_cap: how many runs `comments` has room for
+pub rec TokenStream {
+    tokens: *token.Token;
+    len:    usize;
+    cap:    usize;
+
+    source:  str;
+    file_id: base_source.FileId;
+
+    errors:    *LexError;
+    error_len: usize;
+    error_cap: usize;
+
+    comments:    *CommentRun;
+    comment_len: usize;
+    comment_cap: usize;
+}
+
+# splits `source`, a NUL-terminated text, into tokens, the lex errors met, and the comment
+# runs a later doc lookup reads; the stream borrows `source` and owns the rest
+pub fun tokenize(source: str, alloc: *A.Allocator, file_id: base_source.FileId) res[TokenStream, fail.Fail] {
+    var stream: TokenStream;
+    stream.tokens      = nil;
+    stream.len         = 0;
+    stream.cap         = 0;
+    stream.source      = source;
+    stream.file_id     = file_id;
+    stream.errors      = nil;
+    stream.error_len   = 0;
+    stream.error_cap   = 0;
+    stream.comments    = nil;
+    stream.comment_len = 0;
+    stream.comment_cap = 0;
+
+    val err_scanned: err[fail.Fail] = scan(?stream, alloc);
+    if (sel err_scanned.err) {
+        dnit(?stream, alloc);
+        ret res[TokenStream, fail.Fail].err{err_scanned.err};
+    }
+    ret res[TokenStream, fail.Fail].ok{stream};
+}
+
+fun scan(stream: *TokenStream, alloc: *A.Allocator) err[fail.Fail] {
+    val source: str   = stream.source;
+    val length: usize = str_len(source);
+    var pos:    usize = 0;
+    var line:   usize = 1;
+    for (source[pos] != 0) {
+        val c:  u8    = source[pos];
+        val nl: usize = newline_len(source, pos);
+        if (nl > 0) {
+            line = line + 1;
+            pos  = pos + nl;
+            cnt;
+        }
+        if (c == ' ' || c == '\t') {
+            pos = pos + 1;
+            cnt;
+        }
+        if (c == '#' && source[pos + 1] != '[') {
+            val end:       usize          = line_end(source, pos);
+            val err_added: err[fail.Fail] = comment_add(stream, alloc, pos, end, line);
+            if (sel err_added.err) { ret err_added; }
+            pos = end;
+            cnt;
+        }
+
+        # a fixed spelling begins with punctuation no other token begins with, so it is looked
+        # for last, only where the text is none of the others
+        var tok: token.Token;
+        if (c == '\\' && source[pos + 1] == '\\') {
+            var joined: usize = 0;
+            tok  = scan_multiline(source, pos, ?joined);
+            line = line + joined;
+        }
+        or (c == '"') {
+            val res_quoted: res[token.Token, fail.Fail] = scan_quoted(stream, alloc, pos, token.KIND_LIT_STR, LEX_ERR_UNTERMINATED_STR);
+            if (sel res_quoted.err) { ret err[fail.Fail].err{res_quoted.err}; }
+            tok = res_quoted.ok;
+        }
+        or (c == '\'') {
+            val res_quoted: res[token.Token, fail.Fail] = scan_quoted(stream, alloc, pos, token.KIND_LIT_CHAR, LEX_ERR_UNTERMINATED_CHAR);
+            if (sel res_quoted.err) { ret err[fail.Fail].err{res_quoted.err}; }
+            tok = res_quoted.ok;
+        }
+        or (c >= '0' && c <= '9') { tok = scan_number(source, pos); }
+        or (lexis.is_ident_start(c)) {
+            tok = scan_ident(source, pos);
+            if (asm_opens(stream, tok)) {
+                val res_past: res[usize, fail.Fail] = scan_asm(stream, alloc, tok, length);
+                if (sel res_past.err) { ret err[fail.Fail].err{res_past.err}; }
+                line = line + newlines(source, pos, res_past.ok);
+                pos  = res_past.ok;
+                cnt;
+            }
+        }
+        or {
+            val opt_spelled: opt[token.Token] = token.spelling_at(source, pos);
+            if (sel opt_spelled.some) { tok = opt_spelled.some; }
+            or {
+                tok = token.make(token.KIND_ERROR, pos, 1);
+                var code: LexErrorCode = LEX_ERR_UNEXPECTED_CHAR;
+                if (c < 0x20 || c == 0x7f) { code = LEX_ERR_CONTROL_CHAR; }
+                or (c >= 0x80)             { code = LEX_ERR_NON_ASCII; }
+                val err_refused: err[fail.Fail] = error_add(stream, alloc, pos, 1, code);
+                if (sel err_refused.err) { ret err_refused; }
+            }
+        }
+        pos = tok.span.offset + tok.span.len;
+
+        val err_pushed: err[fail.Fail] = token_add(stream, alloc, tok);
+        if (sel err_pushed.err) { ret err_pushed; }
+    }
+    ret token_add(stream, alloc, token.make(token.KIND_EOF, pos, 0));
+}
+
+# whether `tok` is an `asm` that opens a block: where a statement begins, after nothing, a `;`,
+# `{` or `}`, or the `]` that closes a decorator, and with a word after it on its line
+fun asm_opens(stream: *TokenStream, tok: token.Token) bool {
+    val source: str = stream.source;
+    if (!str_region_equals(source, tok.span.offset, tok.span.len, lexis.KW_ASM)) { ret false; }
+    if (stream.len > 0) {
+        val before: token.Kind = stream.tokens[stream.len - 1].kind;
+        if (before != token.KIND_SEMI && before != token.KIND_LBRACE && before != token.KIND_RBRACE && !decorated(stream)) { ret false; }
+    }
+    var at: usize = tok.span.offset + tok.span.len;
+    if (source[at] != ' ' && source[at] != '\t') { ret false; }
+    for (source[at] == ' ' || source[at] == '\t') { at = at + 1; }
+    ret lexis.is_ident_char(source[at]);
+}
+
+# whether the last token is the `]` that closes a decorator's `#[`
+fun decorated(stream: *TokenStream) bool {
+    var depth: u32   = 0;
+    var i:     usize = stream.len;
+    for (i > 0) {
+        i = i - 1;
+        val k: token.Kind = stream.tokens[i].kind;
+        if (k == token.KIND_RBRACKET) { depth = depth + 1; }
+        or (k == token.KIND_LBRACKET || k == token.KIND_DECORATOR_OPEN) {
+            if (depth == 0) { ret false; }
+            depth = depth - 1;
+            if (depth == 0) { ret k == token.KIND_DECORATOR_OPEN; }
+        }
+        or (depth == 0)                                                               { ret false; }
+        or (k == token.KIND_SEMI || k == token.KIND_LBRACE || k == token.KIND_RBRACE) { ret false; }
+    }
+    ret false;
+}
+
+# the tokens of the asm block `word` opens, and the offset past them: `asm`, its head, and
+# when a `{` ends the head on its line, that brace, the body and the `}` that closes it. a
+# body its dialect never closes runs to the end of the text
+fun scan_asm(stream: *TokenStream, alloc: *A.Allocator, word: token.Token, length: usize) res[usize, fail.Fail] {
+    val source:   str            = stream.source;
+    val err_word: err[fail.Fail] = token_add(stream, alloc, word);
+    if (sel err_word.err) { ret res[usize, fail.Fail].err{err_word.err}; }
+    var start: usize = word.span.offset + word.span.len;
+    for (source[start] == ' ' || source[start] == '\t') { start = start + 1; }
+    var stop: usize = start;
+    for (source[stop] != 0 && source[stop] != '{' && source[stop] != ';' && newline_len(source, stop) == 0) { stop = stop + 1; }
+    var end: usize = stop;
+    for (end > start && (source[end - 1] == ' ' || source[end - 1] == '\t')) { end = end - 1; }
+    val head:     base_source.Span = base_source.span(start, end - start);
+    val err_head: err[fail.Fail]   = token_add(stream, alloc, token.make(token.KIND_ASM_HEAD, start, end - start));
+    if (sel err_head.err)    { ret res[usize, fail.Fail].err{err_head.err}; }
+    if (source[stop] != '{') { ret res[usize, fail.Fail].ok{end}; }
+    val err_brace: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_LBRACE, stop, 1));
+    if (sel err_brace.err) { ret res[usize, fail.Fail].err{err_brace.err}; }
+
+    val body:        usize                         = stop + 1;
+    val res_dialect: res[masc_isa.Reader, A.Error] = front_asm.dialect(alloc, source, head);
+    if (sel res_dialect.err) { ret res[usize, fail.Fail].err{fail.refused(res_dialect.err)}; }
+    val reader: masc_isa.Reader = res_dialect.ok;
+    if (sel reader.many) { ret asm_unread(stream, alloc, head, body, length, LEX_ERR_ASM_AMBIGUOUS); }
+    if (!sel reader.one) { ret asm_unread(stream, alloc, head, body, length, LEX_ERR_ASM_UNREAD); }
+    val opt_close: opt[usize] = masc_source.closing(?reader.one.source, ?source[body], length - body);
+    if (sel opt_close.none) {
+        val err_open: err[fail.Fail] = error_add(stream, alloc, word.span.offset, word.span.len, LEX_ERR_ASM_UNTERMINATED);
+        if (sel err_open.err) { ret res[usize, fail.Fail].err{err_open.err}; }
+        val err_rest: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_ASM_BODY, body, length - body));
+        if (sel err_rest.err) { ret res[usize, fail.Fail].err{err_rest.err}; }
+        ret res[usize, fail.Fail].ok{length};
+    }
+    ret asm_closed(stream, alloc, body, body + opt_close.some);
+}
+
+# the body from `body` to its `}` at `close`, and the offset past that brace
+fun asm_closed(stream: *TokenStream, alloc: *A.Allocator, body: usize, close: usize) res[usize, fail.Fail] {
+    val err_body: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_ASM_BODY, body, close - body));
+    if (sel err_body.err) { ret res[usize, fail.Fail].err{err_body.err}; }
+    val err_close: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_RBRACE, close, 1));
+    if (sel err_close.err) { ret res[usize, fail.Fail].err{err_close.err}; }
+    ret res[usize, fail.Fail].ok{close + 1};
+}
+
+# a body no dialect reads, refused with `code` at the head. the file is refused, so the body
+# is taken to its first brace-balanced `}` only for the diagnostics of the text after it
+fun asm_unread(stream: *TokenStream, alloc: *A.Allocator, head: base_source.Span, body: usize, length: usize, code: LexErrorCode) res[usize, fail.Fail] {
+    val err_refused: err[fail.Fail] = error_add(stream, alloc, head.offset, head.len, code);
+    if (sel err_refused.err) { ret res[usize, fail.Fail].err{err_refused.err}; }
+    var depth: usize = 1;
+    var at:    usize = body;
+    for (at < length) {
+        if (stream.source[at] == '{') { depth = depth + 1; }
+        or (stream.source[at] == '}') {
+            depth = depth - 1;
+            if (depth == 0) { ret asm_closed(stream, alloc, body, at); }
+        }
+        at = at + 1;
+    }
+    val err_body: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_ASM_BODY, body, length - body));
+    if (sel err_body.err) { ret res[usize, fail.Fail].err{err_body.err}; }
+    ret res[usize, fail.Fail].ok{length};
+}
+
+# the offset of the newline that ends the line holding `pos`, or of the text's end
+fun line_end(source: str, pos: usize) usize {
+    var end: usize = pos;
+    for (source[end] != 0 && newline_len(source, end) == 0) {
+        end = end + 1;
+    }
+    ret end;
+}
+
+# a string or character literal from its opening `delim` at `start`; one the line ends
+# before it closes is recorded as `unterminated`, and spans to the line's end
+fun scan_quoted(stream: *TokenStream, alloc: *A.Allocator, start: usize, kind: token.Kind,
+    unterminated: LexErrorCode) res[token.Token, fail.Fail] {
+    val source: str   = stream.source;
+    val delim:  u8    = source[start];
+    var pos:    usize = start + 1;
+    for (source[pos] != 0 && source[pos] != delim && newline_len(source, pos) == 0) {
+        if (source[pos] == '\\' && source[pos + 1] != 0 && newline_len(source, pos + 1) == 0) {
+            pos = pos + 2;
+            cnt;
+        }
+        pos = pos + 1;
+    }
+    if (source[pos] == delim) { pos = pos + 1; }
+    or {
+        val err_refused: err[fail.Fail] = error_add(stream, alloc, start, pos - start, unterminated);
+        if (sel err_refused.err) { ret res[token.Token, fail.Fail].err{err_refused.err}; }
+    }
+    ret res[token.Token, fail.Fail].ok{token.make(kind, start, pos - start)};
+}
+
+# a multiline string from its first `\\` at `start`: that line and each following line whose
+# first text is `\\`, through the last one's end, with the line breaks it spans counted into
+# `lines`. a line that starts otherwise, a blank one or a comment, ends it
+fun scan_multiline(source: str, start: usize, lines: *usize) token.Token {
+    var end: usize = line_end(source, start);
+    for {
+        val nl: usize = newline_len(source, end);
+        if (nl == 0) { brk; }
+        var next: usize = end + nl;
+        for (source[next] == ' ' || source[next] == '\t') { next = next + 1; }
+        if (source[next] != '\\' || source[next + 1] != '\\') { brk; }
+        end    = line_end(source, next);
+        @lines = @lines + 1;
+    }
+    ret token.make(token.KIND_LIT_STR, start, end - start);
+}
+
+fun digits_skip(source: str, pos: usize, radix: u8) usize {
+    var at: usize = pos;
+    for (digit_in(source[at], radix) || source[at] == '_') {
+        at = at + 1;
+    }
+    ret at;
+}
+
+fun digit_in(c: u8, radix: u8) bool {
+    if (radix == 16) { ret is_hex_char(c); }
+    if (radix == 2)  { ret c == '0' || c == '1'; }
+    if (radix == 8)  { ret c >= '0' && c <= '7'; }
+    ret c >= '0' && c <= '9';
+}
+
+# a number literal from its first digit: a prefixed integer, or a decimal one with an
+# optional fraction and exponent, through every identifier character after it, so its suffix
+# and any digit outside its base are part of the literal the scan of its value refuses
+fun scan_number(source: str, start: usize) token.Token {
+    var pos:      usize = start;
+    var is_float: bool  = false;
+    val lead:     u8    = source[pos + 1];
+    if (source[pos] == '0' && lead == 'x') { pos = digits_skip(source, pos + 2, 16); }
+    or (source[pos] == '0' && lead == 'b') { pos = digits_skip(source, pos + 2, 2); }
+    or (source[pos] == '0' && lead == 'o') { pos = digits_skip(source, pos + 2, 8); }
+    or {
+        pos = digits_skip(source, pos, 10);
+        if (source[pos] == '.' && source[pos + 1] >= '0' && source[pos + 1] <= '9') {
+            is_float = true;
+            pos      = digits_skip(source, pos + 1, 10);
+        }
+        if (is_exponent_start(source, pos)) {
+            is_float = true;
+            pos      = pos + 1;
+            if (source[pos] == '+' || source[pos] == '-') { pos = pos + 1; }
+            pos = digits_skip(source, pos, 10);
+        }
+    }
+
+    var kind: token.Kind = token.KIND_LIT_INT;
+    if (is_float) { kind = token.KIND_LIT_FLOAT; }
+    for (lexis.is_ident_char(source[pos])) {
+        pos = pos + 1;
+    }
+    ret token.make(kind, start, pos - start);
+}
+
+fun scan_ident(source: str, start: usize) token.Token {
+    var pos: usize = start;
+    for (lexis.is_ident_char(source[pos])) {
+        pos = pos + 1;
+    }
+    ret token.make(token.KIND_IDENT, start, pos - start);
+}
+
+# release a token stream; a nil stream holds nothing
+pub fun dnit(stream: *TokenStream, alloc: *A.Allocator) {
+    if (stream == nil) { ret; }
+    if (stream.tokens != nil && stream.cap > 0) {
+        A.deallocate[token.Token](alloc, stream.tokens, stream.cap);
+    }
+    if (stream.errors != nil && stream.error_cap > 0) {
+        A.deallocate[LexError](alloc, stream.errors, stream.error_cap);
+    }
+    if (stream.comments != nil && stream.comment_cap > 0) {
+        A.deallocate[CommentRun](alloc, stream.comments, stream.comment_cap);
+    }
+    stream.tokens      = nil;
+    stream.len         = 0;
+    stream.cap         = 0;
+    stream.errors      = nil;
+    stream.error_len   = 0;
+    stream.error_cap   = 0;
+    stream.comments    = nil;
+    stream.comment_len = 0;
+    stream.comment_cap = 0;
+}
+
+# the doc comment of a declaration: the last comment run ending before it, when that run
+# starts its own line and sits on the line directly above with only layout between
+# ---
+# stream:      the lexed file
+# decl_offset: where the declaration begins
+# ret:         the run's span, or an empty span at offset 0 when the declaration has none
+pub fun doc_run_above(stream: *TokenStream, decl_offset: usize) base_source.Span {
+    var empty: base_source.Span;
+    empty.offset = 0;
+    empty.len    = 0;
+
+    var i: usize = stream.comment_len;
+    for (i > 0) {
+        i = i - 1;
+        val run:     *CommentRun = ?stream.comments[i];
+        val run_end: usize       = run.span.offset + run.span.len;
+        if (run_end > decl_offset) { cnt; }
+        if (comment_starts_line(stream.source, run.span.offset)
+            && layout_only(stream.source, run_end, decl_offset)
+            && newlines_capped(stream.source, run_end, decl_offset) == 1) { ret run.span; }
+        ret empty;
+    }
+    ret empty;
+}
+
+# the comment run that opens the file, when nothing but layout comes before it
+pub fun leading_run(stream: *TokenStream) base_source.Span {
+    var empty: base_source.Span;
+    empty.offset = 0;
+    empty.len    = 0;
+    if (stream.comment_len == 0) { ret empty; }
+    val run: *CommentRun = ?stream.comments[0];
+    if (!layout_only(stream.source, 0, run.span.offset)) { ret empty; }
+    ret run.span;
+}
+
+# report every lex error the stream holds, in the order met
+# ---
+# stream: the lexed file
+# diags:  store the errors are reported to
+# ret:    ok once all are reported, or the failure to report one or a code outside the catalog
+pub fun emit_diagnostics(stream: *TokenStream, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < stream.error_len) {
+        val e:        *LexError = ?stream.errors[i];
+        val opt_text: opt[str]  = error_message(e.code);
+        if (sel opt_text.none) { ret err[fail.Fail].err{fail.message("unknown LexErrorCode tag in the lexer's diagnostics")}; }
+        val err_report: err[fail.Fail] = diagnostic.report(diags, error_kind(e.code), stream.file_id, e.span, opt_text.some);
+        if (sel err_report.err) { ret err_report; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun token_add(stream: *TokenStream, alloc: *A.Allocator, tok: token.Token) err[fail.Fail] {
+    if (stream.len == stream.cap) {
+        val err_grow: err[A.Error] = growth.reserve_usize[token.Token](alloc, ?stream.tokens, ?stream.cap, stream.len + 1);
+        if (sel err_grow.err) {
+            ret err[fail.Fail].err{fail.refused(err_grow.err)};
+        }
+    }
+    stream.tokens[stream.len] = tok;
+    stream.len                = stream.len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun error_add(stream: *TokenStream, alloc: *A.Allocator, offset: usize, len: usize, code: LexErrorCode) err[fail.Fail] {
+    if (stream.error_len == stream.error_cap) {
+        val err_grow: err[A.Error] = growth.reserve_usize[LexError](alloc, ?stream.errors, ?stream.error_cap, stream.error_len + 1);
+        if (sel err_grow.err) {
+            ret err[fail.Fail].err{fail.refused(err_grow.err)};
+        }
+    }
+
+    var e: LexError;
+    e.span.offset                   = offset;
+    e.span.len                      = len;
+    e.code                          = code;
+    stream.errors[stream.error_len] = e;
+    stream.error_len                = stream.error_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# a comment is on its own line when only layout precedes it on that line
+fun comment_starts_line(source: str, offset: usize) bool {
+    var i: usize = offset;
+    for (i > 0) {
+        i = i - 1;
+        if (source[i] == '\n' || source[i] == '\r') { ret true; }
+        if (source[i] != ' ' && source[i] != '\t')  { ret false; }
+    }
+    ret true;
+}
+
+fun layout_only(source: str, start: usize, end: usize) bool {
+    var i: usize = start;
+    for (i < end) {
+        val c: u8 = source[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a run is consecutive own-line comments; a trailing comment neither starts
+# nor extends one, so code between two comments never joins them
+fun comment_add(stream: *TokenStream, alloc: *A.Allocator, start: usize, end: usize, line: usize) err[fail.Fail] {
+    if (stream.comment_len > 0) {
+        val last: *CommentRun = ?stream.comments[stream.comment_len - 1];
+        if (line == last.end_line + 1
+            && comment_starts_line(stream.source, last.span.offset)
+            && comment_starts_line(stream.source, start)
+            && layout_only(stream.source, last.span.offset + last.span.len, start)) {
+            last.span.len = end - last.span.offset;
+            last.end_line = line;
+            ret err[fail.Fail].ok{};
+        }
+    }
+
+    if (stream.comment_len == stream.comment_cap) {
+        val err_grow: err[A.Error] = growth.reserve_usize[CommentRun](alloc, ?stream.comments, ?stream.comment_cap, stream.comment_len + 1);
+        if (sel err_grow.err) {
+            ret err[fail.Fail].err{fail.refused(err_grow.err)};
+        }
+    }
+
+    var run: CommentRun;
+    run.span.offset                     = start;
+    run.span.len                        = end - start;
+    run.start_line                      = line;
+    run.end_line                        = line;
+    stream.comments[stream.comment_len] = run;
+    stream.comment_len                  = stream.comment_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# the diagnostic text of a lex error; absent for a code outside the catalog
+fun error_message(code: LexErrorCode) opt[str] {
+    if (code == LEX_ERR_UNTERMINATED_STR)  { ret opt[str].some{"unterminated string literal"}; }
+    if (code == LEX_ERR_UNTERMINATED_CHAR) { ret opt[str].some{"unterminated character literal"}; }
+    if (code == LEX_ERR_CONTROL_CHAR)      { ret opt[str].some{"control characters are not allowed in source. only printable ASCII and whitespace are allowed"}; }
+    if (code == LEX_ERR_NON_ASCII)         { ret opt[str].some{"this character is not allowed. source text must be ASCII"}; }
+    if (code == LEX_ERR_UNEXPECTED_CHAR)   { ret opt[str].some{"this character begins no token"}; }
+    if (code == LEX_ERR_ASM_UNREAD)        { ret opt[str].some{"no instruction set of masc's reads this head as a selection, so the body's text cannot be read"}; }
+    if (code == LEX_ERR_ASM_AMBIGUOUS)     { ret opt[str].some{"more than one instruction set of masc's reads this head as a selection, so the body's text cannot be read"}; }
+    if (code == LEX_ERR_ASM_UNTERMINATED)  { ret opt[str].some{"unterminated asm body"}; }
+    ret opt[str].none{};
+}
+
+# the diagnostic kind of a lex error; NONE for a code outside the catalog
+fun error_kind(code: LexErrorCode) diagnostic_kind.Kind {
+    if (code == LEX_ERR_UNTERMINATED_STR)  { ret diagnostic_kind.LITERAL_UNTERMINATED_STRING; }
+    if (code == LEX_ERR_UNTERMINATED_CHAR) { ret diagnostic_kind.LITERAL_UNTERMINATED_CHAR; }
+    if (code == LEX_ERR_CONTROL_CHAR)      { ret diagnostic_kind.SOURCE_CONTROL_CHAR; }
+    if (code == LEX_ERR_NON_ASCII)         { ret diagnostic_kind.SOURCE_UNEXPECTED_CHAR; }
+    if (code == LEX_ERR_UNEXPECTED_CHAR)   { ret diagnostic_kind.SOURCE_UNEXPECTED_CHAR; }
+    if (code == LEX_ERR_ASM_UNREAD)        { ret diagnostic_kind.ASM_HEAD; }
+    if (code == LEX_ERR_ASM_AMBIGUOUS)     { ret diagnostic_kind.ASM_HEAD; }
+    if (code == LEX_ERR_ASM_UNTERMINATED)  { ret diagnostic_kind.ASM_UNTERMINATED; }
+    ret diagnostic_kind.NONE;
+}
+
+fun newline_len(source: str, pos: usize) usize {
+    if (source[pos] == 0) { ret 0; }
+    ret base_source.line_break_len(source[pos], source[pos + 1]);
+}
+
+# the line breaks from `start` to `end`
+fun newlines(source: str, start: usize, end: usize) usize {
+    var n: usize = 0;
+    var i: usize = start;
+    for (i < end) {
+        val nl: usize = newline_len(source, i);
+        if (nl > 0) {
+            n = n + 1;
+            i = i + nl;
+            cnt;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the line breaks between `start` and `end`, counted no further than 2
+fun newlines_capped(source: str, start: usize, end: usize) usize {
+    var n: usize = 0;
+    var i: usize = start;
+    for (i < end && source[i] != 0) {
+        val nl: usize = newline_len(source, i);
+        if (nl > 0) {
+            n = n + 1;
+            if (n == 2) { ret 2; }
+            i = i + nl;
+            cnt;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun is_exponent_start(source: str, pos: usize) bool {
+    if (source[pos] != 'e' && source[pos] != 'E') {
+        ret false;
+    }
+    var next: usize = pos + 1;
+    if (source[next] == '+' || source[next] == '-') {
+        next = next + 1;
+    }
+    ret source[next] >= '0' && source[next] <= '9';
+}
+
+fun is_hex_char(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}

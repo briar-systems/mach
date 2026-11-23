@@ -1,0 +1,906 @@
+# the comptime value model: its kinds, constructors, integer and float arithmetic and
+# casts between scalars
+use base_alloc: mach.base.alloc;
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.float;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.wide;
+use mach.front.ast;
+use ast_expr:         mach.front.ast.expr;
+use ast_id:           mach.front.ast.id;
+use ast_type:         mach.front.ast.type;
+use comptime_failure: mach.front.comptime.failure;
+use comptime_fold:    mach.front.comptime.fold;
+use target_facts:     mach.target.facts;
+use target_tags:      mach.target.tags;
+use mach.type;
+use mirl_capability: mirl.target.capability;
+use A:               std.allocator;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+
+use type_kind:   mach.type.kind;
+use type_prim:   mach.type.prim;
+use opcodes_row: mirl.ir.opcode.row;
+use opcodes:     mirl.ir.opcode.table;
+
+pub def CTKind: u8;
+
+pub val CT_KIND_INT:   CTKind = 0;
+pub val CT_KIND_FLOAT: CTKind = 1;
+pub val CT_KIND_STR:   CTKind = 2;
+
+pub val CT_KIND_TYPE: CTKind = 3;
+
+pub val CT_KIND_FIELD: CTKind = 4;
+
+rec FieldRef {
+    owner: u32;
+    index: u32;
+}
+
+pub val CT_KIND_PACK_ELEM: CTKind = 5;
+
+rec PackElemRef {
+    index: u32;
+    ty:    u32;
+}
+
+pub val CT_KIND_CONST_ELEM: CTKind = 6;
+
+# a tag case descriptor from `$cases(T)`: the same owner/index shape as a field descriptor
+pub val CT_KIND_CASE: CTKind = 7;
+
+# an integer constant whose declared type is a def chain ending outside the integers;
+# data.s is the interned refusal naming the chain, and reading it fails with that refusal
+pub val CT_KIND_NON_INTEGER: CTKind = 8;
+
+rec ConstElemRef {
+    elem: u32;
+    ty:   u32;
+}
+
+# a node of a module's published constant values (see comptime.deep), read at type `ty`;
+# `module` is the stable id of the module whose store holds it
+pub val CT_KIND_NODE: CTKind = 9;
+
+rec NodeRef {
+    module: u32;
+    shape:  u32;
+    at:     u32;
+    ty:     u32;
+}
+
+# an integer value is 128 bits in data.w; data.i is its low limb, and a signed
+# value sign-fills the high limb so every reader of a value that fits 64 bits
+# sees the same i64 it always did
+pub rec CTValue {
+    kind:         CTKind;
+    int_unsigned: bool;
+    int_width:    u8;
+    float_width:  float.FloatWidth;
+    # the constant's declared type holds a secret: it has no compile-time value but under `:>`
+    secret: bool;
+    data:   uni {
+        i: i64;
+        w: wide.Wide;
+        f: f64;
+        s: intern.StrId;
+        t: u32;
+        fld: FieldRef;
+        pelem: PackElemRef;
+        celem: ConstElemRef;
+        node: NodeRef;
+    };
+}
+
+val FLOAT_WIDTH_MISMATCH_MSG: str =
+    "float operands must have the same declared width. cast one operand with `::`";
+
+# an internal failure of the evaluator as an evaluation result
+# ---
+# message: the failure's text, borrowed
+# ret:     the failure
+pub fun internal_failure(message: str) res[CTValue, comptime_failure.EvalFail] {
+    ret res[CTValue, comptime_failure.EvalFail].err{comptime_failure.eval_internal(message)};
+}
+
+# a refusal of the input as an evaluation result
+# ---
+# diag:    the diagnostic kind it is reported as
+# message: the refusal's text, borrowed
+# ret:     the failure, of kind EVAL_FAIL_REJECTED
+pub fun reject(diag: diagnostic_kind.Kind, message: str) res[CTValue, comptime_failure.EvalFail] {
+    ret awaiting(comptime_failure.EVAL_FAIL_REJECTED, diag, message);
+}
+
+# the refusal `diag` with a message formatted on the allocator of `itn`, interned so it
+# outlives the evaluation while the formatted copy is freed
+pub fun reject_formatted(itn: *intern.Interner, diag: diagnostic_kind.Kind, res_text: res[str, fail.Fail]) res[CTValue, comptime_failure.EvalFail] {
+    if (sel res_text.err) { ret internal_failure(fail.describe(res_text.err)); }
+    fin { str_free(itn.a, res_text.ok); }
+    val res_itn_added: res[intern.StrId, A.Error] = intern.add(itn, res_text.ok);
+    if (sel res_itn_added.err) { ret internal_failure(base_alloc.text(res_itn_added.err)); }
+    ret reject(diag, intern.text(itn, res_itn_added.ok));
+}
+
+# an evaluation failure of any kind as an evaluation result
+# ---
+# kind:    why there is no value, such as a phase it waits on
+# diag:    the diagnostic kind it is reported as
+# message: the text, borrowed
+# ret:     the failure
+pub fun awaiting(kind: comptime_failure.EvalFailKind, diag: diagnostic_kind.Kind, message: str) res[CTValue, comptime_failure.EvalFail] {
+    var f: comptime_failure.EvalFail;
+    f.kind    = kind;
+    f.diag    = diag;
+    f.message = message;
+    ret res[CTValue, comptime_failure.EvalFail].err{f};
+}
+
+# an integer value of a given type: the bits cut to `width` and extended back by its sign
+# ---
+# bits:   the value's bits
+# width:  the type's width in bits, more than zero
+# signed: whether the type is signed
+# ret:    the typed value, held untyped past 128 bits, or an internal failure for a zero width
+pub fun cast_int(bits: wide.Wide, width: u32, signed: bool) res[CTValue, comptime_failure.EvalFail] {
+    if (width == 0) { ret internal_failure("comptime scalar cast has an invalid integer width"); }
+    val value: wide.Wide = comptime_fold.at_width(bits, width, signed);
+    var out:   CTValue;
+    out.kind         = CT_KIND_INT;
+    out.int_unsigned = !signed;
+    out.int_width    = width_held(width);
+    out.data.w       = value;
+    ret res[CTValue, comptime_failure.EvalFail].ok{out};
+}
+
+fun cast_desc(types: *type.TypeInterner, tid: type_kind.TypeId, pointer_width: u32) res[type_prim.PrimDesc, comptime_failure.EvalFail] {
+    val opt_found: opt[*type.Type] = type.get(types, type.strip_secret(types, tid));
+    if (!sel opt_found.some) {
+        ret res[type_prim.PrimDesc, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_TOO_EARLY, "comptime cast type is not resolved")};
+    }
+    val kind: type_kind.TypeKind = opt_found.some.kind;
+    var desc: type_prim.PrimDesc = type_prim.prim_desc(kind);
+    if (kind == type_kind.TYPE_PTR || kind == type_kind.TYPE_POINTER || kind == type_kind.TYPE_FUN) {
+        desc.class  = type_prim.PRIM_CLASS_PTR;
+        desc.bits   = pointer_width * 8;
+        desc.width  = desc.bits;
+        desc.signed = false;
+    }
+    if (desc.class == type_prim.PRIM_CLASS_NONE) {
+        ret res[type_prim.PrimDesc, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_CAST, "comptime casts require scalar types")};
+    }
+    ret res[type_prim.PrimDesc, comptime_failure.EvalFail].ok{desc};
+}
+
+# the value mirl's conversion row `op` gives `x`, read as `from`, at `to`
+fun converted(op: opcodes_row.Opcode, from: comptime_fold.Kind, x: wide.Wide, to: comptime_fold.Kind) res[wide.Wide, comptime_failure.EvalFail] {
+    val got: comptime_fold.Answer = comptime_fold.convert(op, from, x, to, target_facts.nans_none());
+    if (sel got.folded) { ret res[wide.Wide, comptime_failure.EvalFail].ok{got.folded[0]}; }
+    ret res[wide.Wide, comptime_failure.EvalFail].err{comptime_failure.eval_internal("the constant folder refused a comptime conversion")};
+}
+
+# 2^k as an f64, exact for every k an integer width needs
+fun pow2(k: u32) f64 {
+    ret float.bits_f64((1023 + k::u64) << 52);
+}
+
+# whether `v` truncated toward zero lies in the range of a `bits`-wide integer; a NaN never does.
+# below 2^53 the bound one past the minimum is exact, and above it no f64 lies between the two
+fun float_fits_int(v: f64, bits: u32, signed: bool) bool {
+    if (v != v)  { ret false; }
+    if (!signed) { ret v > float.f64_neg(1.0) && v < pow2(bits); }
+    val top: f64 = pow2(bits - 1);
+    if (!(v < top))     { ret false; }
+    if (bits - 1 <= 52) { ret v > float.f64_neg(top) - 1.0; }
+    ret v >= float.f64_neg(top);
+}
+
+# the refusal of a float-to-int cast whose value has no integer of type `to_ty`, naming both
+fun float_to_int_refused(types: *type.TypeInterner, itn: *intern.Interner, v: f64, w: float.FloatWidth, to_ty: type_kind.TypeId) res[CTValue, comptime_failure.EvalFail] {
+    var name:      str             = "the destination type";
+    val opt_found: opt[*type.Type] = type.get(types, type.strip_secret(types, to_ty));
+    if (sel opt_found.some) {
+        val spelled: str = type_prim.prim_name(opt_found.some.kind);
+        if (spelled != nil) { name = spelled; }
+    }
+    var buf:      [48]u8;
+    var res_text: res[str, fail.Fail];
+    val bits:     u64 = float.f64_bits(v) & 0x7FFFFFFFFFFFFFFF;
+    if (v != v) { res_text = diagnostic.format(itn.a, "a comptime cast of NaN to `{}` has no value, because a NaN is no integer", name); }
+    or {
+        var sign: str = "";
+        if (float.f64_signbit(v)) { sign = "-"; }
+        var digits: str = "inf";
+        if ((bits >> 52) != 0x7FF) {
+            var sh: float.Shortest = float.shortest(float.bits_f64(bits), w);
+            digits = float.shortest_text(?sh, ?buf[0]);
+        }
+        res_text = diagnostic.format(itn.a, "a comptime cast of `{}{}` to `{}` has no value, because it falls outside the range of `{}`", sign, digits, name, name);
+    }
+    if (sel res_text.err) { ret internal_failure(fail.describe(res_text.err)); }
+    fin { str_free(itn.a, res_text.ok); }
+    val res_itn_added: res[intern.StrId, A.Error] = intern.add(itn, res_text.ok);
+    if (sel res_itn_added.err) { ret internal_failure(base_alloc.text(res_itn_added.err)); }
+    ret reject(diagnostic_kind.COMPTIME_CAST_RANGE, intern.text(itn, res_itn_added.ok));
+}
+
+# the refusal of a float operation whose result is a NaN at width `w` on the instruction
+# set `arch_id`, whose rule `nans` gives no defined NaN for it: no constant has that value.
+# a rule stated unspecified is the target model's, and one not stated is a gap of mirl's
+pub fun nan_unspecified(itn: *intern.Interner, arch_id: u32, nans: target_facts.Nans, w: float.FloatWidth) res[CTValue, comptime_failure.EvalFail] {
+    val target: str              = target_tags.arch_name(arch_id);
+    var at:     float.FloatWidth = w;
+    if (at == float.FLOAT_W_NONE) { at = float.FLOAT_W_64; }
+    var rules:    target_facts.Nans    = nans;
+    val rule:     mirl_capability.Nans = target_facts.nans_at(?rules, at);
+    var res_text: res[str, fail.Fail];
+    if (sel rule.unspecified) {
+        res_text = diagnostic.format(itn.a, "a comptime NaN has no value on `{}`, where mirl's target model leaves the NaN result unspecified", target);
+    }
+    or {
+        val format: str = float.width_name(at);
+        res_text = diagnostic.format(itn.a, "a comptime NaN has no value on `{}` at `{}`, because mirl states no NaN rule for `{}` on `{}` yet",
+            target, format, format, target);
+    }
+    ret reject_formatted(itn, diagnostic_kind.COMPTIME_NAN_UNSPECIFIED, res_text);
+}
+
+# a numeric conversion folds through mirl's conversion rows. a float to int cast
+# whose value is NaN or truncates outside the integer's range is refused, so the
+# saturation mirl's row gives such a value is never folded. a NaN converted to
+# another float width is made by the target's rule `nans` for the format it is
+# converted to, and where the rule leaves it unknown it is refused, naming the
+# target's instruction set `arch_id`
+pub fun cast_scalar(types: *type.TypeInterner, itn: *intern.Interner, pointer_width: u32, nans: target_facts.Nans, arch_id: u32,
+    value: CTValue, from_ty: type_kind.TypeId, to_ty: type_kind.TypeId, reinterpret: bool) res[CTValue, comptime_failure.EvalFail] {
+    val res_from: res[type_prim.PrimDesc, comptime_failure.EvalFail] = cast_desc(types, from_ty, pointer_width);
+    if (sel res_from.err) { ret res[CTValue, comptime_failure.EvalFail].err{res_from.err}; }
+    val res_cast_desc: res[type_prim.PrimDesc, comptime_failure.EvalFail] = cast_desc(types, to_ty, pointer_width);
+    if (sel res_cast_desc.err) { ret res[CTValue, comptime_failure.EvalFail].err{res_cast_desc.err}; }
+    val from:           type_prim.PrimDesc = res_from.ok;
+    val to:             type_prim.PrimDesc = res_cast_desc.ok;
+    val representation: bool               = reinterpret || from.class == type_prim.PRIM_CLASS_PTR || to.class == type_prim.PRIM_CLASS_PTR;
+    if (representation && from.bits != to.bits) { ret reject(diagnostic_kind.COMPTIME_CAST, "comptime bit reinterpret requires equal source and destination sizes"); }
+    if (value.kind == CT_KIND_STR && from.class == type_prim.PRIM_CLASS_PTR && to.class == type_prim.PRIM_CLASS_PTR) {
+        ret res[CTValue, comptime_failure.EvalFail].ok{value};
+    }
+    val from_float: bool = from.class == type_prim.PRIM_CLASS_FLOAT;
+    val to_float:   bool = to.class == type_prim.PRIM_CLASS_FLOAT;
+    if ((from_float && value.kind != CT_KIND_FLOAT) || (!from_float && value.kind != CT_KIND_INT)) {
+        ret reject(diagnostic_kind.COMPTIME_CAST, "the cast operand is not a scalar value of its source type");
+    }
+    if (to.width != to.bits && !from_float && !reinterpret) {
+        var truth: wide.Wide = wide.zero();
+        if (!wide.is_zero(value.data.w)) { truth = wide.from_u64(1); }
+        ret cast_int(truth, to.width, false);
+    }
+    val fw: float.FloatWidth = float.width_of_bits(to.bits);
+    if (from_float) {
+        val source_fw:  float.FloatWidth                        = float.width_of_bits(from.bits);
+        val res_source: res[CTValue, comptime_failure.EvalFail] = float_value(value.data.f, source_fw);
+        if (sel res_source.err) { ret res_source; }
+        val source_value: f64       = res_source.ok.data.f;
+        val source_bits:  wide.Wide = wide.from_u64(float.bits_at(source_value, source_fw));
+        if (to_float) {
+            if (fw == source_fw) { ret float_value(source_value, fw); }
+            var op: opcodes_row.Opcode = opcodes.FDEMOTE;
+            if (to.bits > from.bits) { op = opcodes.FPROMOTE; }
+            val got: comptime_fold.Answer = comptime_fold.convert(op, comptime_fold.Kind.float{source_fw}, source_bits, comptime_fold.Kind.float{fw}, nans);
+            if (sel got.nan) {
+                if (!target_facts.nans_held(?nans)) {
+                    ret reject(diagnostic_kind.COMPTIME_CAST, "a NaN converted to another float width folds only for a selected target");
+                }
+                ret nan_unspecified(itn, arch_id, nans, fw);
+            }
+            if (!(sel got.folded)) { ret res[CTValue, comptime_failure.EvalFail].err{comptime_failure.eval_internal("the constant folder refused a comptime conversion")}; }
+            ret float_value(float.value_of_bits(got.folded[0].lo, fw), fw);
+        }
+        if (representation)                                    { ret cast_int(source_bits, to.bits, to.signed); }
+        if (!float_fits_int(source_value, to.bits, to.signed)) { ret float_to_int_refused(types, itn, source_value, source_fw, to_ty); }
+        var op: opcodes_row.Opcode = opcodes.FTOI_U;
+        if (to.signed) { op = opcodes.FTOI_S; }
+        val res_whole: res[wide.Wide, comptime_failure.EvalFail] = converted(op, comptime_fold.Kind.float{source_fw}, source_bits, comptime_fold.Kind.integer{to.bits});
+        if (sel res_whole.err) { ret res[CTValue, comptime_failure.EvalFail].err{res_whole.err}; }
+        ret cast_int(res_whole.ok, to.bits, to.signed);
+    }
+    val res_source: res[CTValue, comptime_failure.EvalFail] = cast_int(value.data.w, from.bits, from.signed);
+    if (sel res_source.err) { ret res_source; }
+    val source_value: wide.Wide = res_source.ok.data.w;
+    if (!to_float)      { ret cast_int(source_value, to.width, to.signed); }
+    if (representation) { ret float_value(float.value_of_bits(source_value.lo, fw), fw); }
+    var op: opcodes_row.Opcode = opcodes.ITOF_U;
+    if (from.signed) { op = opcodes.ITOF_S; }
+    val narrow:   wide.Wide                                 = comptime_fold.at_width(source_value, from.bits, false);
+    val res_real: res[wide.Wide, comptime_failure.EvalFail] = converted(op, comptime_fold.Kind.integer{from.bits}, narrow, comptime_fold.Kind.float{fw});
+    if (sel res_real.err) { ret res[CTValue, comptime_failure.EvalFail].err{res_real.err}; }
+    ret float_value(float.value_of_bits(res_real.ok.lo, fw), fw);
+}
+
+# whether a value is a field or case descriptor
+# ---
+# v:   the value
+# ret: true for CT_KIND_FIELD and CT_KIND_CASE
+pub fun is_descriptor(v: CTValue) bool {
+    ret v.kind == CT_KIND_FIELD || v.kind == CT_KIND_CASE;
+}
+
+# an integer value typed by the integer type its declaration spells
+# a named primitive integer types it at that width and sign, and any other name leaves it untyped.
+# a secret type is read through, and a non-integer value, a nil type, a generic name or a type that
+# is no name keep the value as it is
+# ---
+# a:      the tree
+# source: the tree's source text
+# t:      the declared type syntax
+# value:  the value
+# ret:    the value with its integer type applied
+pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: ast_id.TypeId, value: CTValue) CTValue {
+    var out: CTValue = value;
+    if (out.kind != CT_KIND_INT || ast_id.type_is_nil(t)) { ret out; }
+    val opt_found: opt[*ast_type.Type] = ast.get_type(a, t);
+    if (!sel opt_found.some) { ret out; }
+    val ty: *ast_type.Type = opt_found.some;
+    if (ty.kind == ast_type.TYPE_KIND_SECRET)                               { ret apply_declared_int_type(a, source, ty.data.secret.inner, out); }
+    if (ty.kind != ast_type.TYPE_KIND_NAMED || ty.data.named.args_len != 0) { ret out; }
+    # the catalog decides the width and signedness a spelling declares; any
+    # other name leaves the value untyped
+    out.int_width = 0;
+    val opt_kind: opt[type_kind.TypeKind] = type_prim.prim_from_view(base_source.span_view(source, ty.data.named.name));
+    if (sel opt_kind.some) {
+        val d: type_prim.PrimDesc = type_prim.prim_desc(opt_kind.some);
+        if (d.class == type_prim.PRIM_CLASS_INT) { ret typed_int(out, !d.signed, width_held(d.width)); }
+    }
+    ret out;
+}
+
+# an integer cast as a scalar cast computes it: a typed operand is read at its own width and sign,
+# an untyped one as it stands, then the result is cut or extended to the destination
+pub fun cast_to_int(value: CTValue, width: u32, signed: bool) res[CTValue, comptime_failure.EvalFail] {
+    if (value.kind != CT_KIND_INT) { ret reject(diagnostic_kind.COMPTIME_CAST, "the cast operand is not a scalar value of its source type"); }
+    var source: wide.Wide = value.data.w;
+    if (value.int_width != 0) {
+        val res_read: res[CTValue, comptime_failure.EvalFail] = cast_int(value.data.w, value.int_width::u32, !value.int_unsigned);
+        if (sel res_read.err) { ret res_read; }
+        source = res_read.ok.data.w;
+    }
+    ret cast_int(source, width, signed);
+}
+
+# the width a comptime integer of a `bits`-bit type is held at: its own up to the 128-bit
+# carrier, and untyped past it, exact to 128 bits with every overflow refused
+pub fun width_held(bits: u32) u8 {
+    if (bits > 128) { ret 0; }
+    ret bits::u8;
+}
+
+# a value with its integer sign and width replaced
+# ---
+# value:    the value
+# unsigned: whether it reads as unsigned
+# width:    its width in bits, 0 for untyped
+# ret:      the retyped value, its bits untouched
+pub fun typed_int(value: CTValue, unsigned: bool, width: u8) CTValue {
+    var out: CTValue = value;
+    out.int_unsigned = unsigned;
+    out.int_width    = width;
+    ret out;
+}
+
+# whether a float value's width is not read yet
+# ---
+# v:   the value
+# ret: true for a float of FLOAT_W_NONE
+pub fun float_width_unread(v: CTValue) bool {
+    ret v.kind == CT_KIND_FLOAT && v.float_width == float.FLOAT_W_NONE;
+}
+
+# whether a value is a negative integer
+# ---
+# v:   the value
+# ret: true for a signed integer below zero, false for an unsigned one or any other kind
+pub fun ct_is_negative(v: CTValue) bool {
+    if (v.kind != CT_KIND_INT) { ret false; }
+    if (v.int_unsigned)        { ret false; }
+    ret wide.is_negative(v.data.w);
+}
+
+# an integer value that is neither negative nor above u64, read as a u64
+pub fun ct_int_u64(v: CTValue) opt[u64] {
+    if (v.kind != CT_KIND_INT || ct_is_negative(v)) { ret opt[u64].none{}; }
+    if (v.data.w.hi != 0)                           { ret opt[u64].none{}; }
+    ret opt[u64].some{v.data.w.lo};
+}
+
+# the decimal text of an integer value in a wide.FORMAT_CAP buffer
+pub fun ct_int_text(v: CTValue, buf: *u8) str {
+    if (v.int_unsigned) { ret wide.text_u(v.data.w, buf); }
+    ret wide.text_s(v.data.w, buf);
+}
+
+# a negative value is below every other, and operands of one sign order as their two's
+# complement bit patterns
+fun ct_int_lt(a: CTValue, b: CTValue) bool {
+    val an: bool = ct_is_negative(a);
+    val bn: bool = ct_is_negative(b);
+    if (an != bn) { ret an; }
+    ret comptime_fold.holds(comptime_fold.int(opcodes.LT_U, a.data.w, b.data.w, 2), 0);
+}
+
+fun ct_int_eq(a: CTValue, b: CTValue) bool {
+    if (ct_is_negative(a) != ct_is_negative(b)) { ret false; }
+    ret comptime_fold.holds(comptime_fold.int(opcodes.EQ, a.data.w, b.data.w, 2), 0);
+}
+
+# the u1 answer of `==` or `!=` over two values of one kind
+# ---
+# op:  BIN_EQ or BIN_NEQ, any other read as `!=`
+# lhs: the left operand
+# rhs: the right operand
+# ret: the answer, or a refusal for operands of different kinds, floats of different widths or a
+#      kind with no equality
+pub fun apply_equality(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, comptime_failure.EvalFail] {
+    if (lhs.kind != rhs.kind) {
+        ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "equality requires operands of the same kind");
+    }
+    if (lhs.kind == CT_KIND_FLOAT && !float.widths_agree(lhs.float_width, rhs.float_width)) {
+        ret reject(diagnostic_kind.COMPTIME_FLOAT_WIDTH_MISMATCH, FLOAT_WIDTH_MISMATCH_MSG);
+    }
+    var eq: bool = false;
+    if (lhs.kind == CT_KIND_INT) { eq = ct_int_eq(lhs, rhs); }
+    or (lhs.kind == CT_KIND_FLOAT) {
+        val w: float.FloatWidth = float.unify_width(lhs.float_width, rhs.float_width);
+        eq = comptime_fold.holds(comptime_fold.flt(opcodes.FEQ_O, w, float.round_at(lhs.data.f, w), float.round_at(rhs.data.f, w), 2, target_facts.nans_none()), 0);
+    }
+    or (lhs.kind == CT_KIND_STR)  { eq = intern.str_same(lhs.data.s, rhs.data.s); }
+    or (lhs.kind == CT_KIND_TYPE) { eq = lhs.data.t == rhs.data.t; }
+    or                            { ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "equality requires integer, float, string or type operands"); }
+
+    if (op == ast_expr.BIN_EQ) { ret u1_value(eq); }
+    ret u1_value(!eq);
+}
+
+# the u1 answer of `<`, `<=`, `>` or `>=` over two numbers of one kind
+# ---
+# op:  the comparison, any other read as `>=`
+# lhs: the left operand
+# rhs: the right operand
+# ret: the answer, or a refusal for operands of different kinds, floats of different widths or
+#      non-numeric operands
+pub fun apply_compare(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, comptime_failure.EvalFail] {
+    if (lhs.kind != rhs.kind) {
+        ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "comparison requires operands of the same kind");
+    }
+    if (lhs.kind == CT_KIND_INT) {
+        if (op == ast_expr.BIN_LT)  { ret u1_value(ct_int_lt(lhs, rhs)); }
+        if (op == ast_expr.BIN_LEQ) { ret u1_value(!ct_int_lt(rhs, lhs)); }
+        if (op == ast_expr.BIN_GT)  { ret u1_value(ct_int_lt(rhs, lhs)); }
+        ret u1_value(!ct_int_lt(lhs, rhs));
+    }
+    if (lhs.kind == CT_KIND_FLOAT) {
+        if (!float.widths_agree(lhs.float_width, rhs.float_width)) {
+            ret reject(diagnostic_kind.COMPTIME_FLOAT_WIDTH_MISMATCH, FLOAT_WIDTH_MISMATCH_MSG);
+        }
+        val w:   float.FloatWidth   = float.unify_width(lhs.float_width, rhs.float_width);
+        val l:   f64                = float.round_at(lhs.data.f, w);
+        val r:   f64                = float.round_at(rhs.data.f, w);
+        var row: opcodes_row.Opcode = opcodes.FGE_O;
+        if (op == ast_expr.BIN_LT)  { row = opcodes.FLT_O; }
+        or (op == ast_expr.BIN_LEQ) { row = opcodes.FLE_O; }
+        or (op == ast_expr.BIN_GT)  { row = opcodes.FGT_O; }
+        ret u1_value(comptime_fold.holds(comptime_fold.flt(row, w, l, r, 2, target_facts.nans_none()), 0));
+    }
+    ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "ordered comparison requires numeric operands");
+}
+
+# `nans` is the target's rule for the nan a float operation returns, and a nan result it
+# leaves unknown is refused as comptime.nan_unspecified
+pub fun apply_arith(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue, nans: target_facts.Nans) res[CTValue, comptime_failure.EvalFail] {
+    if (lhs.kind != rhs.kind) {
+        ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "arithmetic requires operands of the same kind");
+    }
+    if (lhs.kind == CT_KIND_INT)   { ret apply_int_arith(op, lhs, rhs); }
+    if (lhs.kind == CT_KIND_FLOAT) { ret apply_float_arith(op, lhs, rhs, nans); }
+    ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "arithmetic requires numeric operands");
+}
+
+fun apply_float_arith(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue, nans: target_facts.Nans) res[CTValue, comptime_failure.EvalFail] {
+    if (!float.widths_agree(lhs.float_width, rhs.float_width)) {
+        ret reject(diagnostic_kind.COMPTIME_FLOAT_WIDTH_MISMATCH, FLOAT_WIDTH_MISMATCH_MSG);
+    }
+    val w: float.FloatWidth = float.unify_width(lhs.float_width, rhs.float_width);
+    val l: f64              = float.round_at(lhs.data.f, w);
+    val r: f64              = float.round_at(rhs.data.f, w);
+
+    var row: opcodes_row.Opcode = opcodes.FADD;
+    if (op == ast_expr.BIN_SUB) { row = opcodes.FSUB; }
+    or (op == ast_expr.BIN_MUL) { row = opcodes.FMUL; }
+    or (op == ast_expr.BIN_DIV) {
+        if (r == 0.0) { ret reject(diagnostic_kind.COMPTIME_DIVISION_BY_ZERO, "float division by zero"); }
+        row = opcodes.FDIV;
+    }
+    or (op == ast_expr.BIN_MOD) {
+        if (r == 0.0) { ret reject(diagnostic_kind.COMPTIME_DIVISION_BY_ZERO, "float modulo by zero"); }
+        row = opcodes.FREM;
+    }
+    or (op != ast_expr.BIN_ADD) { ret reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "this float operator cannot be evaluated at compile time"); }
+    val got: comptime_fold.Answer = comptime_fold.flt(row, w, l, r, 2, nans);
+    if (sel got.nan) { ret reject(diagnostic_kind.COMPTIME_NAN_UNSPECIFIED, "comptime NaN has no value on this target"); }
+    ret float_value(comptime_fold.float_of(got, w), w);
+}
+
+fun bitwise_value(bits: wide.Wide, lhs: CTValue, rhs: CTValue) res[CTValue, comptime_failure.EvalFail] {
+    val unsigned: bool = lhs.int_unsigned || rhs.int_unsigned;
+    if (lhs.int_width != 0 && lhs.int_width == rhs.int_width) {
+        ret cast_int(bits, lhs.int_width::u32, !unsigned);
+    }
+    ret int_wide_make(bits, unsigned);
+}
+
+fun apply_int_arith(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, comptime_failure.EvalFail] {
+    val res_uns: bool = lhs.int_unsigned || rhs.int_unsigned;
+
+    if (op == ast_expr.BIN_BIT_AND)                       { ret bitwise_value(comptime_fold.first(comptime_fold.int(opcodes.AND, lhs.data.w, rhs.data.w, 2)), lhs, rhs); }
+    if (op == ast_expr.BIN_BIT_OR)                        { ret bitwise_value(comptime_fold.first(comptime_fold.int(opcodes.OR, lhs.data.w, rhs.data.w, 2)), lhs, rhs); }
+    if (op == ast_expr.BIN_BIT_XOR)                       { ret bitwise_value(comptime_fold.first(comptime_fold.int(opcodes.XOR, lhs.data.w, rhs.data.w, 2)), lhs, rhs); }
+    if (op == ast_expr.BIN_SHL || op == ast_expr.BIN_SHR) { ret apply_int_shift(op, lhs, rhs); }
+
+    if (!res_uns) { ret apply_folded_arith(op, lhs.data.w, rhs.data.w, false); }
+    if (ct_is_negative(lhs) || ct_is_negative(rhs)) {
+        ret reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "comptime arithmetic mixes a negative value with an unsigned operand");
+    }
+    ret apply_folded_arith(op, lhs.data.w, rhs.data.w, true);
+}
+
+# the rows an operator folds by over signed and over unsigned operands: the checked rows
+# for `+ - *`, whose second result says the exact result is out of range
+rec Rows {
+    signed:   opcodes_row.Opcode;
+    unsigned: opcodes_row.Opcode;
+    text:     str;
+}
+
+fun rows_of(op: ast_expr.BinOp) opt[Rows] {
+    if (op == ast_expr.BIN_ADD) { ret opt[Rows].some{Rows{signed: opcodes.ADD_OV_S, unsigned: opcodes.ADD_OV_U, text: "comptime integer overflow in '+'"}}; }
+    if (op == ast_expr.BIN_SUB) { ret opt[Rows].some{Rows{signed: opcodes.SUB_OV_S, unsigned: opcodes.SUB_OV_U, text: "comptime integer overflow in '-'"}}; }
+    if (op == ast_expr.BIN_MUL) { ret opt[Rows].some{Rows{signed: opcodes.MUL_OV_S, unsigned: opcodes.MUL_OV_U, text: "comptime integer overflow in '*'"}}; }
+    if (op == ast_expr.BIN_DIV) { ret opt[Rows].some{Rows{signed: opcodes.DIV_S, unsigned: opcodes.DIV_U, text: "integer division"}}; }
+    if (op == ast_expr.BIN_MOD) { ret opt[Rows].some{Rows{signed: opcodes.REM_S, unsigned: opcodes.REM_U, text: "integer modulo"}}; }
+    ret opt[Rows].none{};
+}
+
+# `+ - * / %` over two integers at comptime's width, folded by the folder: an out of range
+# result, a division by zero and a quotient that does not fit are refused
+fun apply_folded_arith(op: ast_expr.BinOp, a: wide.Wide, b: wide.Wide, unsigned: bool) res[CTValue, comptime_failure.EvalFail] {
+    val opt_rows: opt[Rows] = rows_of(op);
+    if (sel opt_rows.none) { ret reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "this integer operator cannot be evaluated at compile time"); }
+    var row: opcodes_row.Opcode = opt_rows.some.signed;
+    if (unsigned) { row = opt_rows.some.unsigned; }
+    val got: comptime_fold.Answer = comptime_fold.int(row, a, b, 2);
+    if (sel got.zero) {
+        if (op == ast_expr.BIN_DIV) { ret reject(diagnostic_kind.COMPTIME_DIVISION_BY_ZERO, "integer division by zero"); }
+        ret reject(diagnostic_kind.COMPTIME_DIVISION_BY_ZERO, "integer modulo by zero");
+    }
+    if (sel got.overflow) {
+        if (op == ast_expr.BIN_DIV) { ret reject(diagnostic_kind.COMPTIME_OVERFLOW, "integer division overflow (INT128_MIN / -1)"); }
+        ret reject(diagnostic_kind.COMPTIME_OVERFLOW, "integer modulo overflow (INT128_MIN % -1)");
+    }
+    if (sel got.refused) { ret internal_failure("the constant folder refused a comptime integer operation"); }
+    val checked: bool = op == ast_expr.BIN_ADD || op == ast_expr.BIN_SUB || op == ast_expr.BIN_MUL;
+    if (checked && comptime_fold.holds(got, 1)) { ret reject(diagnostic_kind.COMPTIME_OVERFLOW, opt_rows.some.text); }
+    ret int_wide_make(comptime_fold.first(got), unsigned);
+}
+
+fun apply_int_shift(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, comptime_failure.EvalFail] {
+    if (ct_is_negative(rhs))                        { ret reject(diagnostic_kind.COMPTIME_SHIFT_COUNT, "comptime shift amount is negative"); }
+    if (rhs.data.w.hi != 0 || rhs.data.w.lo >= 128) { ret reject(diagnostic_kind.COMPTIME_SHIFT_COUNT, "comptime shift amount must be less than 128"); }
+    # a typed operand is shifted at its own width, and the runtime rule at or
+    # above that width is saturation, which a constant program never means
+    if (lhs.int_width != 0 && rhs.data.w.lo >= lhs.int_width::u64) {
+        ret reject(diagnostic_kind.COMPTIME_SHIFT_COUNT, "comptime shift amount is at least the width of the shifted operand");
+    }
+    val amt: u32 = rhs.data.w.lo::u32;
+    if (op == ast_expr.BIN_SHL) {
+        if (amt > 0) {
+            val back:      wide.Wide = wide.from_u64((comptime_fold.WIDTH - amt)::u64);
+            val discarded: wide.Wide = comptime_fold.first(comptime_fold.int(opcodes.SHR_U, lhs.data.w, back, 2));
+            if (!wide.is_zero(discarded)) { ret reject(diagnostic_kind.COMPTIME_OVERFLOW, "comptime left shift discards significant bits"); }
+        }
+        val shifted: wide.Wide = comptime_fold.first(comptime_fold.int(opcodes.SHL, lhs.data.w, rhs.data.w, 2));
+        ret int_wide_make(shifted, wide.is_negative(shifted));
+    }
+    if (lhs.int_unsigned) { ret int_wide_make(comptime_fold.first(comptime_fold.int(opcodes.SHR_U, lhs.data.w, rhs.data.w, 2)), true); }
+    ret int_wide_make(comptime_fold.first(comptime_fold.int(opcodes.SHR_S, lhs.data.w, rhs.data.w, 2)), false);
+}
+
+# an integer constant whose declared type is no integer, which fails when read
+# ---
+# message: the interned refusal naming the def chain
+# ret:     the value, of kind CT_KIND_NON_INTEGER
+pub fun non_integer(message: intern.StrId) CTValue {
+    var v: CTValue;
+    v.kind         = CT_KIND_NON_INTEGER;
+    v.int_unsigned = false;
+    v.int_width    = 0;
+    v.float_width  = float.FLOAT_W_NONE;
+    v.data.w       = wide.make(0, 0);
+    v.data.s       = message;
+    ret v;
+}
+
+# a named constant's value as a reader sees it: a non-integer constant fails with its refusal
+pub fun readable(v: CTValue, interner: *intern.Interner) res[CTValue, comptime_failure.EvalFail] {
+    if (v.kind != CT_KIND_NON_INTEGER) { ret res[CTValue, comptime_failure.EvalFail].ok{v}; }
+    val opt_message: opt[str] = intern.get(interner, v.data.s);
+    if (sel opt_message.none) { ret internal_failure("non-integer constant refusal is not interned"); }
+    ret awaiting(comptime_failure.EVAL_FAIL_NOT_INTEGER, diagnostic_kind.COMPTIME_NOT_INTEGER, opt_message.some);
+}
+
+# an untyped integer value of 128 bits
+# ---
+# bits:     the value's bits
+# unsigned: whether it reads as unsigned
+# ret:      the value, never a failure
+pub fun int_wide_make(bits: wide.Wide, unsigned: bool) res[CTValue, comptime_failure.EvalFail] {
+    var v: CTValue;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = unsigned;
+    v.int_width    = 0;
+    v.data.w       = bits;
+    ret res[CTValue, comptime_failure.EvalFail].ok{v};
+}
+
+# a 64-bit producer: the bits are a u64 when unsigned and an i64 otherwise
+fun int_value_make(bits: i64, unsigned: bool) res[CTValue, comptime_failure.EvalFail] {
+    if (unsigned) { ret int_wide_make(wide.from_u64(bits:~u64), unsigned); }
+    ret int_wide_make(wide.from_i64(bits), unsigned);
+}
+
+# an untyped signed integer value
+# ---
+# i:   the value
+# ret: the value, never a failure
+pub fun int_value(i: i64) res[CTValue, comptime_failure.EvalFail] {
+    ret int_value_make(i, false);
+}
+
+# -x over the untyped 128-bit range: the signed minimum negates to its own
+# magnitude, which only reads as unsigned; an unsigned magnitude past it has no
+# negation
+pub fun ct_negate(v: CTValue) res[CTValue, comptime_failure.EvalFail] {
+    if (!v.int_unsigned) {
+        if (wide.eq(v.data.w, wide.min_s())) { ret int_wide_make(v.data.w, true); }
+        ret int_wide_make(negated(v.data.w), false);
+    }
+    if (wide.is_zero(v.data.w)) { ret int_wide_make(wide.zero(), false); }
+    if (comptime_fold.holds(comptime_fold.int(opcodes.LT_U, wide.min_s(), v.data.w, 2), 0)) {
+        ret reject(diagnostic_kind.COMPTIME_OVERFLOW, "comptime negation of an unsigned value is out of range");
+    }
+    ret int_wide_make(negated(v.data.w), false);
+}
+
+fun negated(x: wide.Wide) wide.Wide {
+    ret comptime_fold.first(comptime_fold.int(opcodes.NEG, x, wide.zero(), 1));
+}
+
+# the negation of a float at width `w`, folded
+pub fun float_negated(x: f64, w: float.FloatWidth) f64 {
+    ret comptime_fold.float_of(comptime_fold.flt(opcodes.FNEG, w, x, 0.0, 1, target_facts.nans_none()), w);
+}
+
+# the bitwise complement of an integer, folded at comptime's width
+pub fun complement(x: wide.Wide) wide.Wide {
+    ret comptime_fold.first(comptime_fold.int(opcodes.NOT, x, wide.zero(), 1));
+}
+
+# a float value as an evaluation result, rounded to its width
+# ---
+# f:   the value
+# w:   its width, FLOAT_W_NONE when not yet read
+# ret: the value, never a failure
+pub fun float_value(f: f64, w: float.FloatWidth) res[CTValue, comptime_failure.EvalFail] {
+    ret res[CTValue, comptime_failure.EvalFail].ok{ct_float(f, w)};
+}
+
+# a float value rounded to its width
+# ---
+# f:   the value
+# w:   its width, FLOAT_W_NONE when not yet read
+# ret: the value
+pub fun ct_float(f: f64, w: float.FloatWidth) CTValue {
+    var v: CTValue;
+    v.kind        = CT_KIND_FLOAT;
+    v.float_width = w;
+    v.data.f      = float.round_at(f, w);
+    ret v;
+}
+
+# a u1 truth value as an evaluation result
+# ---
+# held: the truth
+# ret:  the value, never a failure
+pub fun u1_value(held: bool) res[CTValue, comptime_failure.EvalFail] {
+    ret res[CTValue, comptime_failure.EvalFail].ok{ct_u1(held)};
+}
+
+# a string value as an evaluation result
+# ---
+# s:   the interned string
+# ret: the value, never a failure
+pub fun str_value(s: intern.StrId) res[CTValue, comptime_failure.EvalFail] {
+    var v: CTValue;
+    v.kind   = CT_KIND_STR;
+    v.data.s = s;
+    ret res[CTValue, comptime_failure.EvalFail].ok{v};
+}
+
+# a type value as an evaluation result
+# ---
+# t:   the type id
+# ret: the value, never a failure
+pub fun type_value(t: u32) res[CTValue, comptime_failure.EvalFail] {
+    var v: CTValue;
+    v.kind   = CT_KIND_TYPE;
+    v.data.t = t;
+    ret res[CTValue, comptime_failure.EvalFail].ok{v};
+}
+
+# a field descriptor of `$fields(T)`
+# ---
+# owner: the type id that declares the field
+# index: the field's position in it
+# ret:   the descriptor
+pub fun field_value(owner: u32, index: u32) CTValue {
+    var v: CTValue;
+    v.kind           = CT_KIND_FIELD;
+    v.data.fld.owner = owner;
+    v.data.fld.index = index;
+    ret v;
+}
+
+# a case descriptor of `$cases(T)`
+# ---
+# owner: the tag's type id
+# index: the case's position in it
+# ret:   the descriptor
+pub fun case_value(owner: u32, index: u32) CTValue {
+    var v: CTValue;
+    v.kind           = CT_KIND_CASE;
+    v.data.fld.owner = owner;
+    v.data.fld.index = index;
+    ret v;
+}
+
+# an element of a variadic pack
+# ---
+# index: the element's position in the pack
+# ty:    its type id
+# ret:   the value
+pub fun pack_elem_value(index: u32, ty: u32) CTValue {
+    var v: CTValue;
+    v.kind             = CT_KIND_PACK_ELEM;
+    v.data.pelem.index = index;
+    v.data.pelem.ty    = ty;
+    ret v;
+}
+
+# a constant element whose checked type is not yet known: name resolution and loading bind case
+# literals this way, and type checking rebinds them with the declared type
+pub fun const_elem_untyped(elem: u32) CTValue {
+    ret const_elem_value(elem, type_kind.index(type_kind.TYPE_NIL));
+}
+
+# a constant element read at type `ty`
+# ---
+# elem: the index of the element's expression id
+# ty:   its type id, TYPE_NIL's index while it is not yet known
+# ret:  the value
+pub fun const_elem_value(elem: u32, ty: u32) CTValue {
+    var v: CTValue;
+    v.kind            = CT_KIND_CONST_ELEM;
+    v.data.celem.elem = elem;
+    v.data.celem.ty   = ty;
+    ret v;
+}
+
+# a node of a module's published constant values
+# ---
+# module: the stable id of the module whose store holds it
+# shape:  the node's shape in that store
+# at:     the offset of its payload
+# ty:     the type id it is read at
+# ret:    the value
+pub fun node_ref(module: u32, shape: u32, at: u32, ty: u32) CTValue {
+    var v: CTValue;
+    v.kind             = CT_KIND_NODE;
+    v.data.node.module = module;
+    v.data.node.shape  = shape;
+    v.data.node.at     = at;
+    v.data.node.ty     = ty;
+    ret v;
+}
+
+# a string value
+# ---
+# s:   the interned string
+# ret: the value
+pub fun ct_str(s: intern.StrId) CTValue {
+    var v: CTValue;
+    v.kind   = CT_KIND_STR;
+    v.data.s = s;
+    ret v;
+}
+
+# the truth value `held`, a u1: a comparison's answer, and the type a condition requires
+pub fun ct_u1(held: bool) CTValue {
+    var v: CTValue;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = true;
+    v.int_width    = 1;
+    v.data.w       = wide.zero();
+    if (held) { v.data.w = wide.from_u64(1); }
+    ret v;
+}
+
+# whether a value is a u1
+# ---
+# v:   the value
+# ret: true for an unsigned integer one bit wide
+pub fun is_u1(v: CTValue) bool {
+    ret v.kind == CT_KIND_INT && v.int_unsigned && v.int_width == 1;
+}
+
+# whether a value holds the truth
+# ---
+# v:   the value
+# ret: true for an integer equal to 1 of any width, false for anything else
+pub fun truth(v: CTValue) bool {
+    ret v.kind == CT_KIND_INT && wide.eq(v.data.w, wide.from_u64(1));
+}
+
+# a type value
+# ---
+# t:   the type id
+# ret: the value
+pub fun ct_type(t: u32) CTValue {
+    var v: CTValue;
+    v.kind   = CT_KIND_TYPE;
+    v.data.t = t;
+    ret v;
+}
+
+# a u64 value
+# ---
+# n:   the value
+# ret: an unsigned 64-bit integer value
+pub fun ct_uint(n: u64) CTValue {
+    var v: CTValue;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = true;
+    v.int_width    = 64;
+    v.data.w       = wide.from_u64(n);
+    ret v;
+}
+
+# an integer zero of a given type
+# ---
+# unsigned: whether the type is unsigned
+# width:    its width in bits, 0 for untyped
+# ret:      the value
+pub fun ct_zero_int(unsigned: bool, width: u8) CTValue {
+    var v: CTValue;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = unsigned;
+    v.int_width    = width;
+    v.data.w       = wide.zero();
+    ret v;
+}

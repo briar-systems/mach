@@ -1,16 +1,12 @@
-# `^` — the secret qualifier
+# `^`, the secret qualifier
 
 `^T` marks a type as carrying secret data for Mach's constant-time guarantee.
 Sema tracks secrecy as an information-flow discipline: secret data may move and
 be stored, but it may never reach a position a classical leakage model observes
 (a branch, a memory address, a variable-latency instruction). This page covers
-the flow-typing rules and the `#[oblivious]` codegen contract. The grammar lives
+the flow-typing rules and the `#[constant_time]` codegen contract. The grammar lives
 in [grammar.md](grammar.md); the decorator reference is in
 [decorators.md](decorators.md).
-
-> **Experimental preview.** The constant-time support is incomplete and
-> unaudited. Read [Assurance](#assurance) before relying on any of this.
-> **Do not build production cryptography on it at this version.**
 
 ## Secrecy lattice
 
@@ -31,8 +27,8 @@ fun up(p: u32) ^u32 {
 A **literal is public by construction** and stays public through that coercion:
 its value sits in the instruction stream, so classifying it as secret would
 protect nothing. `var s: ^u32 = 5;` types `5` as `u32` and relies on the
-up-coerce. The join below is unaffected — a value *computed* with a secret is
-secret however its other operand is spelled — so `v << 3` on a secret `v` still
+up-coerce. The join below is unaffected (a value *computed* with a secret is
+secret however its other operand is spelled), so `v << 3` on a secret `v` still
 yields a secret, while the constant `3` is not mistaken for a secret shift
 count.
 
@@ -46,7 +42,7 @@ arithmetic, bitwise, shift, and comparison operators, and through a value read
 out of a secret container:
 
 ```mach
-#[oblivious]
+#[constant_time("hard")]
 fun mix(a: ^u32, b: u32) ^u32 {
     ret a + b; # ^u32 + u32 -> ^u32
 }
@@ -55,6 +51,31 @@ rec Key { d: ^[32]u8; }
 
 fun first(k: Key) ^u8 {
     ret k.d[0]; # element of a secret array is ^u8
+}
+```
+
+A window keeps the secret of what it reads. `x[start, n]` over a secret array
+`^[N]T` is the secret array `^[n]T`, as a window over a secret vector is a
+secret vector, so `$is_secret` gives a window the same answer it gives the
+whole value. The checker and constant evaluation type a window with the same
+rule.
+
+A secret array `^[N]T` coerces to the array of secrets `[N]^T` with no syntax,
+and does so at every array level (`^[N][M]T` to `[N]^[M]T` or `[N][M]^T`).
+Each element stays secret, so nothing is declassified. The coercion only moves
+the secret inward: `[N]^T` lifts to `^[N]T` only by the usual public-to-secret
+lift, which needs it to fit `[N]T` and so never applies, and no coercion
+reaches the public `[N]T`:
+
+```mach
+val K: ^[_]u8 = [2]u8{1, 2};
+
+fun main() i32 {
+    val q:    ^[2]u8 = K[0, 2]; # the window's own type
+    val s:    [2]^u8 = K[0, 2]; # fine: every element stays secret
+    val last: u8     = q[1]:>u8;
+    val head: u8     = s[0]:>u8;
+    ret last::i32 + head::i32 - 3;
 }
 ```
 
@@ -71,7 +92,7 @@ error decided by operand type:
 - a secret left operand of a short-circuiting `&&` / `||` (it is the branch the
   operator keys on; a secret right operand only taints the result)
 - a secret memory index (`table[i]` with `i` secret)
-- a secret memory address — an access through a secret *pointer*, whether by
+- a secret memory address: an access through a secret *pointer*, whether by
   `@p`, `p[i]`, or the auto-deref in `p.x`. The index and the address are the
   two halves of one effective address, so both are gated. Only a secret
   *pointer* is an address: a `^[N]T` or `^Rec` is a secret value living at a
@@ -86,37 +107,53 @@ fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
 }
 ```
 
-Three more gates decide against the target's constant-time capabilities rather
-than the source alone, so they are reported at lowering:
+A secret operand of a **floating-point** operation is refused as well: its
+latency is variable on every target.
 
-- a secret operand of a **floating-point** operation (always variable-latency,
-  gated on every target)
-- a secret operand of an **integer multiply**, unless the target declares the
-  exact multiply it emits (the low half, a high half or the widening product,
-  at that operand width) as data-independent-timing under a condition the
-  build meets. The declared cells are the table in [Constant-time multiply by
-  instruction set](#constant-time-multiply-by-instruction-set): x86-64 admits
-  every scalar cell unconditionally, aarch64 admits its cells only while
-  PSTATE.DIT is on and only on an operating system that guarantees the mode,
-  riscv64 admits its cells only when the selection holds `m` and `zkt`, and
-  riscv32, SPIR-V and every lane multiply are refused. The refusal names the
-  target and the condition it lacks. `$mach.build.ct_mul(op, width)` reads the
-  same decision at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
-  `%` is refused like every secret division: the helper it would call is a
-  loop over the dividend's bits
-- a secret **variable shift count** on a target without a barrel shifter. Where
-  it is admitted, the saturation of a count at or above the operand width
-  ([operators.md](operators.md#bitwise)) is a compare to an all-ones-or-zero
-  mask and a mask on the count and the value, with no branch, so it reveals
-  nothing the shift itself would not
+Moving a secret float, and its `:>`, are not operations, but inside a
+`#[constant_time]` function each instruction that moves it must be one the
+target's vendor lists as data-independent:
+
+| target | moving and declassifying a secret `f32` or `f64` |
+|---|---|
+| x86-64 | admitted: loads and stores go through `movss` and `movq`, register moves through `movaps`, and `:>` zeroes the register above the value (`movq` for `f64`, `pslldq` and `psrldq` for `f32`), each on Intel's list (article 768547, Table 1). SSE `movsd` is not on it, so a `f64` never moves through it |
+| aarch64 | admitted under DIT: loads, stores and `:>` go through rows on Arm's DIT list |
+| riscv64 | refused: Zkt excludes floating point from its listings, every float load, store and move among them, so a secret float cannot be moved in a constant-time function |
+
+Whether an integer **multiply** or a **variable shift** runs in time
+independent of a secret operand is the target's question, and it is asked
+inside a `#[constant_time]` function, where mirl reads the class masc gives
+each instruction it selects under the timing modes the function's mode admits
+(see [Constant-time multiply by instruction set](#constant-time-multiply-by-instruction-set)
+and [Soft and hard](#soft-and-hard)). A secret operand of an instruction whose
+latency depends on it there is refused, naming the function and the
+instruction set's reason. `$mach.build.ct_mul(op, width)` reads mirl's answer
+for a multiply at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
+`%` is refused like every secret division: the helper it would call is a loop
+over the dividend's bits. Where a variable shift is admitted, the saturation
+of a count at or above the operand width ([operators.md](operators.md#bitwise))
+is a compare to an all-ones-or-zero mask and a mask on the count and the
+value, with no branch, so it reveals nothing the shift itself would not.
 
 A secret value passed to a variadic pack is also rejected, including a secret
-wrapped inside an aggregate.
+wrapped inside an aggregate. A pointer to secret storage (`*^u8`) is accepted:
+the pack's instance keeps its type, so its body reads `^u8` through it and every
+gate below holds there. A pack function that wipes several buffers is written so.
+A C variadic accepts neither, as its callee is untyped foreign code. Printing a
+pointer to secret storage through `std.format` is refused at the call, since its
+type has no rendering there: the weld keeps it from becoming a `ptr`.
+
+The gates hold in **every** function, whether or not it carries
+`#[constant_time]`. Branching, indexing, addressing or dividing on a `^` value
+needs a `:>T` downgrade first everywhere. Everything else is free everywhere: a
+secret moves through storage, arithmetic and calls in any function, and only a
+`#[constant_time]` function adds a guarantee about the code the compiler emits
+for it.
 
 The gates are checked against the types of the **instance**, not of the template.
 A generic's body is re-checked per instantiation under its concrete type
-arguments, and a pack-tailed function's body — the statements around its `$each`
-as well as the unrolled body itself — is re-typed per monomorphized instance, so
+arguments, and a pack-tailed function's body (the statements around its `$each`
+as well as the unrolled body itself) is re-typed per monomorphized instance, so
 a `T` that instantiates to a secret is gated exactly as the secret spelled out
 in full would be.
 
@@ -142,7 +179,7 @@ and false otherwise.
 
 It exists because secrecy was otherwise invisible to a library. Every other
 predicate asks about the shape *under* the `^` and so answers false for every
-secret, which makes `$is_record(^u64)` and `$is_record(u64)` the same answer — a
+secret, which makes `$is_record(^u64)` and `$is_record(u64)` the same answer: a
 reflection walk could only ever meet a secret field as a fallthrough it had to
 refuse. `$is_secret` is the positive question, and it is what lets `std.derive`
 decide rather than refuse: a formatter redacts a secret field, a hash refuses one
@@ -161,12 +198,12 @@ $each f in $fields(Session) {
 
 **Outermost only**, the same line the rest of the family draws:
 
-- `^*u8` is secret — the pointer *is* the secret, which is the shape the
+- `^*u8` is secret: the pointer *is* the secret, which is the shape the
   welded-storage rules exist for
-- `*^u8` is **not** — a public address to secret storage. Ask
+- `*^u8` is **not**: a public address to secret storage. Ask
   `$is_secret($pointee_of(f.type))` for the pointee
-- `[N]^u8` is not — a public array whose elements are secret
-- a record with a secret field is not — the **field** is, and that is where a
+- `[N]^u8` is not: a public array whose elements are secret
+- a record with a secret field is not: the **field** is, and that is where a
   walk meets the question
 
 ### `$holds_secret`: the question a memory primitive asks
@@ -204,7 +241,7 @@ The deep question belongs to code that treats a type as bytes, where one secret
 byte decides how every byte is moved.
 
 Note that a walk which skips a secret field is pinned by the flow rules rather
-than by convention — reading one into a public accumulator does not compile, so a
+than by convention: reading one into a public accumulator does not compile, so a
 walk that gates wrongly is a compile error, not a silent disclosure.
 
 ## Downgrade with `:>T`
@@ -229,9 +266,13 @@ fun publish(a: ^u32) u32 { ret a:^u32; }
 ```
 
 `:>T` peels exactly the outer qualifier, so it can never launder a welded pointee
-(`*^T` stays `*^T`). `::` and `:~` may neither add nor drop `^`. Promotion needs
-no operator of its own: a public value coerces up to secret implicitly, and a
-cast to a secret type (`x::^u16`) is an ordinary cast.
+(`*^T` stays `*^T`). `::` and `:~` may add `^` at a value position but never drop it. Promotion
+needs no operator of its own: a public value coerces up to secret implicitly,
+and a cast to a secret type (`x::^u16`) is an ordinary cast. The same holds for
+a scalar, for a scalar field of a by-value aggregate, and for a pointer value,
+whose address becomes secret. What a pointer reaches stays exact at every depth,
+so `*u8` does not cast to `*^u8`: the target is shared storage, and a secret
+written through the new alias would be read back through the old public one.
 
 `:>T` is the only declassification and there is no untyped form: `:^` is not
 an operator, so `x:^` and `x:^T` are parse errors at the colon. Inside a
@@ -240,6 +281,47 @@ parameter (`fun show[U](s: U) u32 { ret s:>u32; }`): the template cannot decide
 whether `u32` is `U` stripped, so it checks only that the target is public and
 each instance settles the equality under its concrete arguments, the way every
 other secrecy gate is checked against the instance.
+
+## Secrets have no compile-time value
+
+A module constant whose type holds a secret (`val K: ^u64 = 7;`, a `^[N]u8`
+array, a record or tag with a secret field) is a run-time value like any other
+secret. It has no compile-time value: wherever the compiler asks for one, a
+read of it is refused as `secret.comptime`. That covers every comptime
+argument (`take(K)` for `fun take($c: u64)`), an array, window or field length
+(`[K]u8`, `a[0, K]`), `$size_of`, `$align_of` and `$length_of` of a type that
+spells one, a `$if` gate in a function or at module scope, a `$each` over a
+secret constant array, a decorator argument (`#[align(K)]`), and a public field
+or element read of a secret constant (`K[0]`). A literal is public, and a public
+field of a constant that holds a secret elsewhere keeps its compile-time value
+(`C.count` of `R{count: 4, key: 9}`).
+
+`:>` of a constant is itself compile-time evaluable, so an author who means the
+value writes the declassification where it is used, as anywhere else:
+
+```mach
+val K: ^u64 = 7;
+
+fun take($c: u64) u64 {
+    ret c;
+}
+
+fun main_value() u64 {
+    ret take(K:>u64); # a compile-time 7, declassified here
+}
+```
+
+Inside a `#[constant_time]` function that cast is listed by
+`mach check --declassified` like any other. A constant's own initializer may
+read secret constants when its declared type holds a secret
+(`val K2: ^u64 = K + 1;`), and the value it binds is secret in turn. A comptime
+parameter declared with a type that holds a secret (`$c: ^u64`) is a
+contradiction, and its declaration is refused. Mach has no explicit tag
+discriminator values and no field defaults, so neither can name a secret.
+`#[embed]` cannot produce a secret array: the embedded bytes are public by
+type (`[_]u8` or `[N]u8`, and `^[_]u8` is refused as `embed.type`), so a key
+compiled into an image is embedded public and copied into secret storage, `val`
+to `var` of a `^` type, where it is used.
 
 ## Welded-storage pointers
 
@@ -250,10 +332,14 @@ public/secret aliasing leak unconstructable with no alias analysis:
   downgrade)
 - a secret-welded pointer cannot be erased to the untyped `ptr`
 - a `uni`'s overlapping variants must agree on secrecy
+- a `tag`'s cases share a byte only where they agree on its class, by the same
+  comparison, so a tag whose payloads disagree lays them out in separate areas
+  (it may be larger than one area would be; see
+  [tag.md](tag.md#layout-and-representation))
 
-```mach error union variants must agree on secrecy
+```mach error overlapping fields are part secret
 fun erase(p: *^u8) ptr {
-    ret p; # error: type mismatch: expected ptr, found *^u8
+    ret p; # error: expected ptr, found *^u8
 }
 
 uni Bad { a: ^u32; b: u32; } # error: variants disagree on secrecy
@@ -270,20 +356,23 @@ uni U[T]   { a: T; b: u32; }
 rec Box[T] { u: U[T]; }
 
 var s: U[^u32]; # error: this instantiation makes the variants disagree
-var b: Box[^u32]; # same error: the instance need not be spelled
+var b: Box[^u64]; # same error: the instance need not be spelled
 var p: U[u32]; # fine, and so is an all-secret instantiation
 ```
 
+Each mixed instance is reported once, where it is first formed, so a
+`Box[^u32]` written after `U[^u32]` adds no second error.
+
 A *partially* concrete template (`U[T, ^u32]` written inside another generic) is
 a legal annotation with both legal and illegal instantiations, so it is never
-rejected where it is written — only at the arguments that actually make a pair
+rejected where it is written, only at the arguments that actually make a pair
 mixed.
 
 The check is **deep** and **fails closed**: a secret nested anywhere inside an
 aggregate (including a generic instance's lazily-materialized fields) counts as
 secret at these boundaries, and a placement the checker cannot prove severs no
-weld — a secrecy difference reachable through a function type, or a shape whose
-layout it cannot determine — is rejected rather than allowed.
+weld (a secrecy difference reachable through a function type, or a shape whose
+layout it cannot determine) is rejected rather than allowed.
 
 Types are compared **by byte extent**, not by field ordinal. Each type lays out
 as a run of bytes, each byte secret or public, with padding counted as public
@@ -295,9 +384,48 @@ the rule is directional:
 2. a narrowing (`T` no larger than `S`) is accepted
 3. a widening is accepted only when the extra bytes cannot change class: every
    byte of `S` has one class and every byte of `T` has that same class
-4. beneath a pointer (a pointer field, a pointer to a pointer, a union variant
-   of pointer type) the target is shared storage, so the relation holds both
-   ways: equal extent and the same class at every byte
+4. beneath a pointer field (a pointer to a pointer, a union variant of pointer
+   type) the target is shared storage, so the relation holds both ways: equal
+   extent and the same class at every byte
+
+A by-value cast between aggregates is the one place a byte may turn from public
+to secret, and a pointer field keeps its target exact even there.
+
+A generic whose argument grows through a pointer, such as `rec S[T] { v: ^u32;
+next: *S[*T]; }`, has a fresh instance below every pointer, so the comparison
+cannot walk it there. Below a pointer, two instances of one such generic are
+compared by their arguments instead. The declarations place each parameter:
+**laid** when its argument's bytes sit inside the storage beside other fields,
+the whole **target** of a pointer, or **nowhere** when it only flows into
+parameters that are themselves placed nowhere. A laid pair of arguments must have
+one size, one alignment and the same class at every byte, a target pair must match
+both ways, and an argument placed nowhere is not compared at all. A
+disagreement names the field it lies in.
+
+```mach
+rec S[T] { v: ^u32; next: *S[*T]; }
+
+# fine: `T` reaches no byte, so the two agree at every depth
+fun view(p: *S[u32]) *S[u64] {
+    ret p::*S[u64];
+}
+```
+
+Two laid arguments that differ in size or alignment are refused as unprovable,
+under `secret.variant_unprovable`, because padding can line the two layouts up at
+one depth and not the next. So is a pointer from such an instance into storage of
+another shape, since the two sides never meet at an instance they could compare.
+
+```mach error cannot prove that the two types agree on secrecy
+rec W[T] { pad: u32; x: T; }
+rec S[T] { s: ^u64; v: T; next: *S[W[T]]; }
+rec R    { a: u32; b: u32; }
+
+# refused: below the first pointer `v` holds `W[u64]` on one side and `W[R]` on the other
+fun view(p: *S[u64]) *S[R] {
+    ret p::*S[R];
+}
+```
 
 The rule is the same for scalars and aggregates, and the variants of a union
 overlay its own storage from offset 0, so every pair of variants agrees on each
@@ -327,8 +455,10 @@ fun widen(p: *Key) *Wide {
 
 A type that stores no value (an empty `rec`, a `[0]T`, or an aggregate of only
 those) has zero extent and so no class: anything narrows to it, and it widens
-to nothing that stores a value. Reading past an object by indexing
-(`(?q.a)[1]`) is a bounds question no cast rule closes.
+to nothing that stores a value. The rule speaks only for the bytes a cast's
+types cover. Indexing past them, as `(?q.a)[1]` does or as indexing a narrowed
+`*^u8` past its first byte does, is an out-of-bounds access, and no cast rule
+closes it (see [Assurance](#assurance)).
 
 The comparison reads the same layout the backend emits. Where it cannot
 determine a layout it declines, which rejects.
@@ -337,8 +467,8 @@ determine a layout it declines, which rejects.
 
 `==`, `!=`, `<`, `<=`, `>` and `>=` all accept two pointer-like operands
 whatever their pointees' secrecy, including `*^T` against `*^T` and `*^T`
-against a public `*U`. The result is a public `bool` — `u8`, per
-[operators.md](operators.md) — so it branches, feeds `&&`, and returns like any
+against a public `*U`. The result is a public `bool` (`u1`, per
+[operators.md](operators.md)), so it branches, feeds `&&`, and returns like any
 other public value:
 
 ```mach
@@ -352,8 +482,8 @@ fun overlap(first: *^u8, first_len: usize, second: *^u8, second_len: usize) bool
 
 **This launders nothing**, and the reason is the line the whole model draws: a
 `*^T` is a *public address to secret storage*. The address was never secret, so
-reading it is not a downgrade. What the welding rules protect is the *pointee* —
-that the bytes at that address can only ever be reached as `^T` — and ordering
+reading it is not a downgrade. What the welding rules protect is the *pointee*:
+that the bytes at that address can only ever be reached as `^T`. Ordering
 reaches no bytes at all. It consumes two addresses and produces one `bool`; no
 integer and no pointer comes out of it, so there is no value to turn back into a
 `*T` and dereference. Ordering is exactly as revealing as the `==` the language
@@ -364,7 +494,8 @@ and each has a test pinning it:
 
 | refused | why |
 | --- | --- |
-| `p::usize`, `p:~usize` | `::` and `:~` may neither add nor drop `^` |
+| `p::usize`, `p:~usize` | `::` and `:~` may not drop `^` |
+| `p::*^u8` from `p: *u8` | adding `^` to a pointer's target lets a secret be written through the alias and read back public |
 | `p:>*u8` | a `:>T` target must name the operand's *stripped* type, and `*^u8` stripped is `*^u8` |
 | `@((?p):~*usize)` | the same, reached through a pointer to the slot |
 | `val e: ptr = p;` | a secret-welded pointer does not erase to `ptr` |
@@ -378,14 +509,14 @@ Three deliberate decisions:
   byte cursor to a typed buffer.
 - **`nil` orders.** `p > nil` compiles and compares against the null address as
   zero. It falls out of `nil` being a pointer-like operand, the same way
-  `p == nil` does. It is rarely what you mean — `p != nil` is — but it is not a
+  `p == nil` does. It is rarely what you mean (`p != nil` is), but it is not a
   leak, and special-casing it would be surface with nothing behind it.
 - **The comparison is not itself constant-time-gated, and does not need to be.**
   Both operands are public addresses, so ordering is `CT_OP_NONE`: it lowers to
   one unsigned integer compare of pointer width, data-independent on every
   supported target. There is no secret operand for the leakage model to track.
 
-Inside a `#[oblivious]` function this needs no exception. The result of ordering
+Inside a `#[constant_time]` function this needs no exception. The result of ordering
 two public addresses is public, so it may steer a branch there like any other
 public condition. The gates are unchanged where the *pointer itself* is the
 secret: a `^*T` is a secret value, the order of two of them is secret, and that
@@ -394,7 +525,7 @@ secret: a `^*T` is a secret value, the order of two of them is secret, and that
 ```mach error secret value used as a branch condition
 use std.types.bool.bool;
 
-#[oblivious]
+#[constant_time("hard")]
 fun before(a: *^u8, b: *^u8) bool {
     ret a < b; # public addresses, public bool
 }
@@ -405,153 +536,435 @@ fun leak(a: ^*u8, b: ^*u8) u8 {
 }
 ```
 
-## `#[oblivious]` — the codegen contract
+## `#[constant_time]`: the codegen contract
 
-The flow typing constrains the *source*; `#[oblivious]` carries the obligation
-through *codegen*. Inside a function carrying it, the backend must not introduce
-a secret-dependent branch or select a variable-latency instruction on a secret
-operand.
+The flow typing constrains the *source*. `#[constant_time(mode)]` carries the
+obligation through *codegen*, and its mode, `"soft"` or `"hard"`, is required:
+a bare `#[constant_time]` is refused. Inside a function carrying it, in either
+mode:
+
+- the code-level rules apply to the emitted code: no secret branch or loop
+  condition, short-circuit operand, index, address or division;
+- a callee that receives a secret must itself be declared constant time, as
+  [Calls](#calls) states;
+- masc's walk proves all of this on the encoded code, so a secret the
+  compiler's own passes route to a branch, an address or a variable-latency
+  instruction is refused, never emitted.
+
+The two modes differ only in how the processor's data-independent-timing mode is
+held, which [Soft and hard](#soft-and-hard) describes.
 
 Inline `asm` inside such a function is **validated**, not rejected. The block is
-parsed into instructions and walked for the same three leaks the compiler checks
-everywhere else — a secret reaching a branch condition, a memory address, or a
-variable-latency operation the target cannot do in constant time. Taint enters
-through the block's `{name}` bindings, whose secrecy is stamped from the local's
-declared type. A pointer to a secret (`*^u32`) is a public address and a secret
-load: the register it is staged into may address memory, and what a load through
-it produces is secret, while a secret pointer (`^*u32`) is a secret address. What
-the walk cannot model, it refuses:
+encoded with the rest of the function and masc's walk reads its bytes as it reads
+every other instruction, in one pass over the function's code, so nothing about a
+block is taken on trust from its text: a data directive is walked as the
+instructions its bytes decode to. The walk holds the same state through a block
+as anywhere else.
 
-| construct | why |
-|---|---|
-| a body that does not parse | nothing to analyze |
-| a data directive (`.byte`, `.word`, `.long`, `.quad`) | its payload can encode any instruction |
-| a mnemonic the target has not classified | its timing behaviour is unknown |
-| **a flags-conditioned branch on a secret** (x86-64 `jcc`, aarch64 `b.<cond>`) | the flags it reads were filled from a secret |
+- **Registers.** Every register is seeded at the function's entry: an argument
+  register as the declaration says, a register the convention holds public at
+  every entry (the stack pointer, the timing mode's register, a reserved one no
+  instruction adds to, as the thread pointer) public, and every other one, the
+  frame pointer and the flags a caller's arithmetic accrued included, as possibly
+  holding the caller's secret. A block that leaves a secret in a register held
+  public at entry is refused there. The walk holds a general register's secrecy
+  byte by byte, so a register or argument slot that carries a secret member of
+  a record or tag passed by value together with a public one is secret only in
+  the secret member's bytes, and a branch on the public member is admitted.
+  The bytes past a piece the convention leaves undefined are secret where any
+  byte of the piece is. Past a public piece they are public, as the declaration
+  states the piece: mach's own callers zero them, and a function whose `asm`
+  reads the whole register of a narrower argument reads bits its caller left.
+  Moves, loads and stores of each width, zero and sign extension, writes of a
+  narrower view by these forms (x86's 32-bit writes zero the rest of the
+  register, its 8 and 16-bit writes keep it, aarch64's `w` writes zero it),
+  shifts and rotates by a constant, byte swaps of a 32-bit or 64-bit register,
+  bit-field extracts, and `and`, `or` and `xor` with a constant or with another
+  register carry each byte to where the instruction puts it. An `xor` or an
+  and-not of a register with itself writes zero whatever the register held, so
+  every byte it writes is public. Every other
+  instruction, an add, a multiply, an exchange, a shift by a register or a
+  conditional move among them, makes every byte it writes secret if any byte it
+  reads is. A compare of a narrow view reads only
+  that view's bytes. A refusal of a store, a result or an argument names the
+  bytes of it that hold the secret. A floating-point or vector register is held
+  whole, so a piece carrying a secret and a public member in one is secret
+  whole and a branch on the public member is refused, naming the parameter and
+  the bytes that share the register: take such a record through a pointer, or
+  order its members so secret and public ones fall in different pieces. A
+  record or tag holding a secret that the convention itself passes by
+  reference, as aarch64 and riscv64 pass one larger than 16 bytes and windows
+  one of any size but 1, 2, 4 or 8 bytes, is copied into the callee in steps of
+  up to a word, each step public where no secret member covers any of its
+  bytes, so a public member or a discriminator moved in a step of its own
+  decides a branch, and one moved in the same step as a secret member is
+  refused.
+- **Flags.** Each instruction reads and writes each flag bit as masc's tables
+  state it, so a branch on flags a secret compare filled is refused, and an
+  instruction that writes only some of them, as `inc` leaves carry, leaves the
+  rest as they were.
+- **Timing.** An instruction whose timing depends on an input under the target's
+  timing mode is refused when that input may hold a secret, by the target's own
+  list: Intel's data operand independent timing instructions on x86-64, the
+  instructions Arm marks data-independent-time on aarch64, Zkt's on riscv64.
+  Every grammar parses divides, multiplies and float instructions, and the list
+  decides each.
+- **Memory.** The walk places each access as an extent off a register's value or
+  a symbol, follows the frame exactly where the producer states a slot's address
+  never leaves the code, and keeps what each extent may hold. A secret spilled and
+  reloaded comes back secret. A store of a secret is admitted only into memory
+  something states may hold one: a frame slot the walk places, a global whose type
+  holds a secret, or memory reached through a pointer the block loaded from a
+  `{name}` binding whose pointee is secret in every byte. A binding whose pointee
+  holds no secret states its memory public, and every other destination is memory
+  nothing states the secrecy of. A secret stored to either is refused
+  ([asm.md](asm.md) has the binding rules and an example).
+  A frame that realigns the stack pointer for a local aligned past the stack's
+  alignment is followed off two origins: the stack pointer's value on entry, off
+  which the saves, the frame pointer and the incoming arguments lie, and the value
+  the prologue realigns it to, off which the locals and spills lie. The walk names
+  the second only where it sees an instruction compute it, the bitwise and of the
+  stack pointer's known value with minus the alignment, and holds it anywhere in
+  the alignment's interval below that value, so a slot off one origin is taken
+  apart from a slot off the other only where every place the realign can leave
+  them shows it. A realigned frame whose stack pointer moves holds the aligned
+  origin in its base register, which the walk follows from the copy of the masked
+  stack pointer and, after a block that writes it, from the frame pointer and the
+  same mask, so its slots stay placed wherever the stack pointer goes.
+  A copy of a secret between two frame slots is emitted in runs cut where either
+  slot's statement of which bytes are public changes, so a public member copied
+  beside a secret one stays public in the destination, as a copy too large to be
+  moved step by step is otherwise a loop whose every store may hold what any of
+  its loads read.
+- **Writes.** The compiler states a written secret only at a call: the
+  registers a call carrying a secret clobbers besides its result are taken as
+  possibly secret after it. Every other instruction writes what the walk
+  computes from what it reads, so a value the compiler moves or splits keeps
+  each byte's secrecy as the walk follows it.
+- **The timing mode.** A block may not turn the timing mode off: aarch64's
+  `msr dit` from a register and `msr pstate.dit, #0` are refused whatever encodes
+  them. Only the read, set and restore the frame code places are admitted.
+- **The processor state the walk reads under.** An instruction may read a
+  register only under a processor state, and the walk reads it under the state
+  the target establishes where a thread of the program starts. On aarch64 a
+  scalar float instruction of one source (`fabs`, `fneg`, `fsqrt`, the `frint`
+  forms, `fcvt`, `bfcvt`, `frecpe`, `frecpx`, `frsqrte`, `fcvtxn`, the
+  conversions to and from integers and fixed point) keeps the upper bits of its
+  destination only where FPCR.NEP is set under FEAT_AFP, and so reads the
+  destination only then. Where the target establishes FPCR.NEP clear, the walk
+  checks with it clear and such an instruction writes its destination without
+  reading it. Where the target does not, a constant-time function whose
+  compiled code may select such an instruction clears FPCR.NEP itself: its
+  entry reads `fpcr`, clears bit 2 in a copy and writes it back where the bit
+  is set, each return restores `fpcr` from the saved copy where the entry
+  wrote it, and each call of a callee it does not trust is followed by the
+  clear again. A function entered with the bit clear, as a constant-time
+  caller leaves it, writes nothing. The function's code is then checked with
+  FPCR.NEP clear, and a function with no such instruction carries none of
+  this. Without FEAT_AFP the bit is RES0, so the copy holds 0 there and the
+  clear changes nothing. An instruction the function's code does not switch
+  for, as one of a block, is still checked with FPCR.NEP possibly set, and a
+  refusal for it names the state, `fpcr`, and that neither the system nor the
+  function clears it there. A block may not write `fpcr`: `msr fpcr` is
+  refused whatever value it writes, and only the function's own save, clear
+  and restore are admitted. The refusal says so and points to the way out:
+  write the operation in Mach, where the function clears FPCR.NEP around it.
 
-That last row is a per-target asymmetry worth stating precisely, because getting it
-wrong was a real hole (#2477). A branch whose condition is a **register operand** is
-visible to the walk and is checked: aarch64's `cbz`/`cbnz`, and every riscv64 branch,
-which compares two registers — RISC-V has no flags register at all. A branch whose
-condition rides the **flags register** is checked against a separate flags-taint
-state (#2460): a `cmp` of a secret marks the flags secret-derived, and a later `jcc`
-reading them is refused, while a compare-and-branch over public data is accepted.
-x86-64's `jcc` family is flags-conditioned, and so is **aarch64's `b.<cond>`** —
-which is easy to miss, because `b.<cond>` does not appear in aarch64's mnemonic table
-at all. It is admitted by the grammar's *decode hook*, carrying the unconditional
-branch's own opcode with the condition in its flags.
+What the walk cannot read, it refuses: bytes that decode to no instruction, an
+instruction whose effects masc's tables leave undecided, and control that leaves
+the block where the walk cannot follow it.
 
-The flags model is deliberately more than a single "writes flags" bit, because one
-bit has no correct value for two families. `inc` and `dec` write every status flag
-**except** carry, and the shifts write nothing at all when the count is zero — so
-neither can be taken to have refreshed the flags. A secret `cmp`, a public `inc`, and
-a `jc` is therefore still refused: the carry the branch reads is the secret one. Only
-an instruction that unconditionally overwrites every flag this grammar can read
-(`add`, `sub`, `cmp`, `test`, `and`, `or`, `xor`, `neg`, `cmpxchg`, `xadd`) clears
-the taint. `popfq`, `iretq` and `syscall` load or mask flags from somewhere the model
-does not represent, so they taint unconditionally and never clear.
+A `#[thread]` variable is reached in such a function as a global is, and holds
+what its type states: a secret one stays secret, and a public one cannot be given
+a secret. Its address is public, formed from the thread pointer, which no
+function may change, and from what the system alone writes: the link's offset,
+the offset the loader puts in its global offset table slot, the thread control
+block's own address at `fs:0` on x86-64, and on Windows the module's index and
+its entry in the thread's table of blocks. Where the target reaches a
+thread-local through a call of the runtime's resolver, as every darwin target
+does, the check cannot see into that call, and a constant-time function naming
+the variable is refused, naming it.
 
-A `setcc` **consumes** a flag into a register, so with secret-derived flags its
-destination is secret too — otherwise a secret could be laundered out of the flags
-and used as a memory index, which the address check would then miss.
+Debug information describes a secret scalar under a name carrying its `^`
+(`^u64`), which is all a debugger can be told: neither DWARF nor CodeView has a
+qualifier for secrecy. A secret aggregate is described as its base type.
 
-On a target whose grammar has no flag reader at all, every one of these facts is
-vacuous, and that vacuity is asserted per target rather than assumed: adding an
-aarch64 `cset` later has to state its facts deliberately.
+`{name}` bindings carry the local's declared type into the walk. A pointer to a
+secret (`*^u32`) is a public address and a secret load: the register it is
+staged into may address memory, and what a load through it produces is secret,
+while a secret pointer (`^*u32`) is a secret address.
 
-The rows whose facts could wrongly *permit* a leak were measured against the CPU
-rather than asserted from a manual: each instruction was run twice with the flags
-preset all-set and all-clear, and what it actually defines, preserves and reads was
-read off the hardware and written into the table. Three rows are exempt and stay a
-reasoned classification: `popfq`, `iretq` and `syscall` take their flags from the
-stack, the interrupt frame, or a masked prior RFLAGS, and no experiment of that
-shape can tell you where a value came *from*.
+On a typed stream (wasm) the producer states each load and store as on a
+machine target, and places in the frame each access whose address is a frame
+slot's moved only by constants and lying within the slot. wasm keeps a secret
+local whose address is taken, or one spilled past the operand stack, in linear
+memory off a frame base local the frame code sets once from the stack-pointer
+global, and nothing else writes it, so such an access reaches exactly the bytes
+the producer states. The walk holds a secret stored there in those bytes, and a
+slot no other access reaches is private to the function, so a constant-time
+function may hold a secret in its own frame across a call to a callee it does
+not trust. A slot whose address is passed on, or reached at an offset known
+only when the code runs, is not private, and a secret in it refuses such a call.
+The walk holds one bit of secrecy for each
+value on the operand stack and in each local. A `:>T` cast states a declassify
+point at the instruction that leaves the declassified value on top of the stack,
+which the walk takes as public there and nothing else. A call to a trusted
+callee pushes its results as the callee's declaration states them, a result
+public where the declaration makes it public, and a call to a callee nothing
+states takes every value it pushes as secret where any it pops or any memory it
+reaches may hold one. A function's own results are held to its declaration at
+each return, and it may leave no secret in a global. An `asm` block's accesses
+are placed nowhere, as the address it forms is its own, so a block in such a
+function reads every byte it loads as secret and may store no secret: nothing
+states the secrecy of the memory a block reaches, and a block's store of a
+secret into a public local's storage would otherwise come back as a public
+result.
 
-**Nothing re-measures the table today.** It is a recorded classification, and a CPU
-whose behaviour stops matching it is a silent divergence. Re-establishing it is a
-job for a unit test that runs the probe on the host it is running on, not for a
-cross-compilation suite: the experiment only means anything on the ISA it executes.
+### Calls
 
-**Memory is the third taint domain**, beside the register set and the flags bit
-(#2706). A secret spilled to the stack and reloaded comes back **secret**:
+`#[constant_time]` is a **per-function** contract, and a call is where it meets
+another function. A call trusts the callee's declaration and never reads its
+body: the callee's mode and which bytes of each of its parameters and of its
+result are secret, all read from its declaration, are all the caller's check
+knows of it. The
+callee's own build holds its body to that declaration, wherever the callee is
+compiled, so a definition that breaks it fails its own module and the program
+never links with it. This works the same within a module and across modules, a
+generic instance included.
 
-```
-mov rax, {r}
-mov [rsp], rax
-mov rbx, [rsp]
-mov rcx, [rbx]     # error: addresses memory with a secret value
-```
+A constant-time function may pass a secret only to a callee that
 
-Before this domain existed the reload came back in a register the walk believed
-public, and all three checks downstream of it were defeated at once — a branch
-condition, a memory address, and a variable-latency operand alike. The direct form
-(`mov rax, {r}` then `mov rbx, [rax]`) was always refused, which made the gate look
-sound while an ordinary spill walked straight through it.
+- it names directly, or reaches through a value of a function type marked
+  constant time ([Function types marked
+  constant time](#function-types-marked-constant-time)). A plain function type
+  states no mode, so a secret passed through a value of one is refused,
+  whatever the value points at. A call through a function value that passes no
+  secret and reaches none takes its result as the function type declares it,
+  as a direct call takes its callee's declaration;
+- is declared `#[constant_time("soft")]` or `#[constant_time("hard")]`, a generic
+  included, whose instances take its mode. An unmarked function is refused
+  whether it is generic or not, in the same module or another: mark it;
+- is not `#[weak]`, since a definition elsewhere may replace its body at link
+  time with code nothing here checked. An `ext` function never qualifies, as
+  `#[constant_time]` on an `ext` declaration is refused;
+- is in a mode the caller may rely on: a soft caller may call either mode,
+  and a hard caller a hard callee, or a soft one where the build guarantees
+  every timing mode a soft function's code may be held under (see
+  [Soft and hard](#soft-and-hard)), which is every x86-64 build, an aarch64
+  build with `dit` and a riscv64 build with `zkt`.
 
-The domain is **one bit covering all of memory**: either a secret has been stored in
-this body or it has not. That is coarser than it could be, and deliberately so. The
-obvious refinement — taint individual `[base + literal]` slots — is not sound here,
-because `[rsp + k]` and `[rbp + j]` can name the same byte with nothing in the walk
-relating two base registers, and because a slot key is an address rather than an
-extent, so an 8-byte store and an overlapping 4-byte load compare as different slots.
-Both would be laundering paths again.
+"Passing a secret" reaches through pointers: an argument whose type holds a
+secret anywhere it reaches, as `*^u8` or a record with a `^` field, as
+`$holds_secret` answers, counts, and the refusal is `secret.call_untrusted`,
+naming the type. masc's walk checks the same at the machine level from the
+callee's declaration, or the one a marked function type states, and the calling
+convention: a secret in a register or
+stack slot the callee's declaration says is public is refused, and so is any
+secret a call to a callee it does not trust could reach, in a register, an
+argument on the stack or memory the callee could reach through a pointer,
+naming the callee. So a call to a callee that is not constant time, even one
+passing only public values, is refused while a secret sits in memory the callee
+could reach.
 
-The bit is **monotone**: a later store of a public value does not clear it, since
-"the same slot" is precisely the question the domain cannot answer. So a body loses
-by this only if it stores a secret, later reloads some *other* public value, and then
-branches on, addresses with, or variable-latency operates on what it reloaded. The
-failure direction is refusal, never acceptance.
+A trusted callee may read any memory a pointer it is given reaches. What makes
+that safe is the rule its own walk holds it to: every read outside its own
+frame and its module's globals takes what it reads as the type it reads through
+says, secret through a pointer to a secret and public through a pointer to
+public storage, which welded storage keeps free of secrets, and as secret where
+the compiler states nothing, as inside an `asm` block. So a callee never takes
+a secret its caller holds as public, and the caller takes everything the callee
+may have written as possibly secret after the call.
 
-A store through an address the walk cannot resolve needs no special case: there is no
-slot to fail to identify.
+A trusted callee's result is what its declaration says it is. The bytes of the
+result its type declares public are public in the caller, so a constant-time
+caller may branch on a public status a trusted callee returns even when it
+passed that callee a secret, and the bytes it declares secret are secret. The
+callee's own build holds it to that at every return: no secret is left in a
+part of the result its type declares public. A value declassified with `:>T`
+is public, so a constant-time function may return `x:>u64` as a public `u64`
+([Declassification](#declassification)). A result returned through memory, as a
+large record is, is held to the same contract: the callee's build holds that it
+leaves no secret in a byte its type declares public, and the caller takes those
+bytes as holding what they held before the call.
 
-The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
-carry no divide, multiply or float instruction at all, so it reaches only their
-register-count shifts. riscv64's grammar admits the whole M-extension, so on that
-target the check is substantive.
+A callee that a shared library exports stays the definition its callers in the
+library were checked against: an exported constant-time function that is not
+`#[weak]` takes protected visibility on ELF, so no other image preempts it. A
+PE DLL reaches its own exports directly, and on Mach-O only a weak definition
+is coalesced across images, so neither needs it.
 
-`#[oblivious]` remains a **per-function** contract. A call out to a non-oblivious
-function is not validated — that is the boundary the decorator draws, not a hole in
-it, and it applies to a callee containing `asm` exactly as it applies to any other.
+A call that passes no secret and reaches none needs nothing of its callee, so a
+constant-time function may call any function with public values while no
+secret sits where that callee could reach.
+
+The walk reads the callee's code as the image links it, so a callee another image
+could replace when it loads would void the check. In a shared library no
+definition is seen from another image unless it is `#[export]`, and an exported
+constant-time function that is not `#[weak]` is protected on ELF, as PE and
+Mach-O libraries bind their calls to their own exports at link. A call inside the
+image therefore runs the code the walk read. A `#[weak]` default is never
+trusted, since another definition of its name may replace it.
 
 The zeroizing-write guarantee is separate and broader; it is described below.
+
+### Function types marked constant time
+
+A function type carries a constant-time mode, none, soft or hard, as part of
+its identity, beside the C-variadic `...`. The only spelling of a mode is an
+alias marked with the decorator, which names the marked type instead of the
+type written after it ([def.md](def.md#a-marked-alias-of-a-function-type)):
+
+```mach
+#[constant_time("soft")]
+def Seal: fun(*^u8, u64) ^u64;
+
+rec Cipher { id: u64; seal: Seal; }
+
+#[constant_time("soft")]
+fun sum(data: *^u8, n: u64) ^u64 {
+    var acc: ^u64 = 0;
+    var i:   u64  = 0;
+    for (i < n) {
+        acc = acc + data[i]::^u64;
+        i   = i + 1;
+    }
+    ret acc;
+}
+
+#[constant_time("soft")]
+fun seal_with(table: *Cipher, which: u64, data: *^u8, n: u64) ^u64 {
+    ret table[which].seal(data, n); # trusted as a direct call of a soft function
+}
+```
+
+- **Where marked values come from.** The value of a function declared
+  `#[constant_time(mode)]` that is not `#[weak]` has its signature marked with
+  that mode, a generic's instances included. A `#[weak]` default, which
+  another definition may replace, an `ext` function and an unmarked one have
+  the plain type. So a value of `Seal` holds only a function declared soft or
+  hard with that signature, which is a rule of assignment, not of the call.
+- **Hard against soft.** A soft type holds soft and hard functions, a hard type
+  only hard ones. A call through a marked type is judged as a direct call of a
+  function in that mode: a soft caller relies on either, and a hard caller on a
+  hard type, or on a soft one only where the build guarantees every timing mode
+  a soft function's code may be held under, as [Soft and hard](#soft-and-hard)
+  states. Elsewhere it is `secret.call_untrusted`.
+- **Conversion.** A value converts with no cast from a stronger mode to a
+  weaker one: hard to soft, and any marked type to the plain one, which only
+  forgets a promise. Nothing converts the other way. Assigning an unmarked or
+  `#[weak]` function to `Seal`, or a soft one to a hard type, is refused as
+  `type.mismatch` with a note naming what the type holds. A value cast, `::` or
+  `:~`, to a marked function type or an array of them stands only where the
+  value converts with no cast, so no cast gives a type a mode (`cast.invalid`).
+  `nil` converts to a marked type, and a call through it faults. A pointer keeps
+  its target exact, so `*Seal` is not `*fun(*^u8, u64) ^u64`. A pointer cast to
+  `*Seal`, a union with a `Seal` member or a by-value cast of a record holding
+  one retypes storage, which the cast rule does not follow: like reading bytes
+  nothing wrote, it is the program's own statement.
+- **Fields, parameters, results and generics.** A marked type is an ordinary
+  type in each of them, and a type argument (`Vector[Seal]`, `Box[Seal]`). Its
+  instances are named apart from those of the plain type. A generic body is
+  checked per instance, so a call through a value whose type is a parameter
+  bound to `Seal` is trusted in that instance and refused in one bound to a
+  plain function type.
+- **ABI.** None. A marked function type is passed, returned and called as the
+  plain one in every convention, and an `ext` declaration may take or return
+  one. The mode is a fact of the type alone.
+- **The walk.** The front end states, for each call through a marked type, the
+  declaration its callee keeps: the type's mode, and the secret parameters,
+  secret result and public pointers a function of that signature declares. mirl
+  keeps it as a declaration no symbol names, and the call's model in masc's walk
+  is made from it exactly as from the declaration of a function a call names, so
+  the call trusts its callee under the same rule. The callee's own build walked
+  its body against its own declaration, which has the same signature, so the
+  declaration the call states is the callee's. The address the call jumps to is
+  a value of the caller's like any other, and a secret one is refused.
+
+### Declassification
+
+`:>T` is the declassification everywhere, a constant-time function included. A
+value that went through `:>T` is public for every purpose there: it may decide
+a branch or a loop, form an index, an address or a length, be stored into
+public memory, be returned in a public result and be passed where a callee
+declares a public parameter. The promise of `#[constant_time]` is that nothing
+secret that was not explicitly declassified decides timing or reaches public
+storage or a public result.
+
+What stays refused is everything else: a secret that did not go through `:>T`
+reaching a branch, an index, a variable-latency instruction, public memory, a
+public result or a public argument. A value declassified in part is public only
+in that part: a declassified field leaves the record's other fields as secret
+as they were, and the low half of a wide value declassified leaves the high
+half secret. A declassify of a pointer makes the address public and nothing it
+points to (`^*^u8` to `*^u8`). A record or array secret whole (`^R`) declassified
+whole is public whole. The value a declassify copies from keeps its secrecy, so
+a later use of the source is checked as the secret it is.
+
+The checker cannot judge what the author declared public. A parser that
+declassifies each byte of a secret key file to decide whether it is a padding
+character or part of the alphabet branches on a fact of every secret byte, and
+the build accepts it, since the author said that fact is public. Each `:>T` in
+a constant-time function is a claim the author makes and a reviewer checks.
+
+`mach check --declassified` lists those claims for the reviewer. Once the
+project checks, it writes every `:>T` of the project's own modules to stdout,
+one a line, as `file:line:column: function: type`: the function the cast
+stands in, `test <name>` for a test and `<module>` outside both, and the type of
+the value declassified as sema typed it. A cast in the body of a generic is
+listed once, at its place in the source, whatever instances the module makes:
+its type as the body spells it, `T` for a type parameter, and `<each
+expansion's>` for an operand no frame of the build types: one only a `$each`
+expansion types, and one in a `$if` or `$or` arm the build does not select,
+which is listed though the build compiles none of it. It lists what the source states, so a
+declassification the compiler makes itself, as the test of a division's
+divisor for zero, is not listed. The flag belongs to `check` alone. The listing
+stays plain lines on stdout under `--report json`, which turns only stderr
+into records ([readout.md](readout.md#streams)).
 
 A secret-taint bit is threaded from sema's flow typing through IR and MIR to the
 emitted instruction stream, preserved across every value replacement, inline
 clone, instruction selection, and register-allocator copy. The one place taint
-stops is the declassify barrier a `:>T` cast lowers to. Secret-free code carries
+stops is the declassification a `:>T` cast lowers to: a copy the walk of the
+encoded code takes as leaving its destination public, and nothing else. Secret-free code carries
 no taint and compiles byte-identically.
 
-A function instance that **computes** on a secret must carry `#[oblivious]`; one
-that only moves, stores, or declassifies secrets is transparent and stays
-annotation-free. The check runs per monomorphized instance, so a generic
-instantiated at a secret type is held to the concrete type's rules.
+No function is required to carry `#[constant_time]`. A function that computes on
+a secret without it compiles, held to the gates above and to nothing more: the
+compiler makes no promise about the timing of the code it emits for it. The
+decorator is how a function asks for that promise.
 
 ```mach
-#[oblivious]
+#[constant_time("hard")]
 fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 {
     ret (a & mask) | (b & ~mask);
 }
 ```
 
-A **translation validator** re-derives the taint over the lowered,
-target-independent MIR as a monotone dataflow fixpoint and independently
-re-checks the leakage conditions, so a secret reaching a branch condition, a
-memory address, or a forbidden variable-latency op is a compile error naming the
-function and the offending operation. It is a backstop behind the compile-time
-gates, not a replacement for them.
-
 ## The zeroizing-write guarantee
 
+[`$zeroize(p, count)`](comptime-intrinsics.md) is the operation that holds this
+guarantee itself, for any `*T`: public, wholly secret or mixed. It lowers to one of
+mirl's kept fills, so no pass removes, narrows or merges its stores, including at
+release when the target is dead afterwards. A kept fill never lowers to an external,
+preemptible `memset`, and its length and timing rest on the size of the target alone,
+so a secret `count` is refused.
+
 Wiping a secret is only useful if the wipe survives to run. That guarantee exists,
-but it is **not** provided by `#[oblivious]`, and it is scoped more broadly than the
+but it is **not** provided by `#[constant_time]`, and it is scoped more broadly than the
 decorator is.
 
-A store into secret storage is tainted at lowering, from two composing sources: the
-stored **value**'s secrecy, and — for a public value written into secret storage, the
-shape a wipe takes — the **destination**'s secrecy, read from the lvalue's semantic
-type. Either one marks the store. That taint is the thing an optimization must
-consult, and it is keyed on the storage, not on any decorator, so:
+A store states the secrecy of the storage it writes from the place's type, never
+from its value: secret where the type holds a secret, public where it holds none.
+Its value's secrecy is the value's, which the back end follows from register to
+memory, and a store of a value that holds a secret not declassified into storage
+stated public is refused in a constant-time function. A store of a public value
+into secret storage, the shape a wipe takes, writes a public value. A copy is marked when
+the bytes it moves are secret, and the zeroing fill that clears a secret aggregate's
+padding writes zeros and is not marked. A constant-time function's copy or fill of a
+secret needs a length known at compile time, and one whose length is known only at run
+time is refused at the copy or fill on every target, a `$zeroize` excepted. What keeps a wipe in place is that no pass
+removes a store, and that a `$zeroize` is a kept fill, which no pass may remove even
+once one does, keyed on the write, not on any decorator, so:
 
 ```mach
 use std.types.size.usize;
@@ -566,9 +979,8 @@ fun clear(p: *^u8, n: usize) {
 }
 ```
 
-**What it covers.** Memory, reached through a pointer that escapes the function — the
-shape `crypto.ct.zeroize` has. Such a store cannot be promoted out of memory, and the
-taint is present for any future pass to read.
+**What it covers.** Memory, reached through a pointer that escapes the function, the
+shape `crypto.ct.zeroize` has. Such a store cannot be promoted out of memory.
 
 **What it does not cover.** A value the compiler keeps in a **register**. Writing to a
 promoted local is not a memory write, so wiping one is not preserved:
@@ -578,42 +990,54 @@ var x: ^u8 = k;
 x = 0;          # NOT guaranteed: `x` may never have been in memory
 ```
 
-Adding `#[oblivious]` does not change this — the wipe is outside the memory-address
+Adding `#[constant_time]` does not change this: the wipe is outside the memory-address
 leakage model rather than an exception within it. To wipe reliably, write through a
 pointer whose target is memory the compiler cannot promote away, which is what the
 standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
-it (#2456).
+it.
 
 **Today the guarantee holds trivially.** mach has no dead-store elimination, so
 nothing removes a store: an entirely dead fill of a *public* local also survives at
-release. The guarantee becomes load-bearing only if such a pass is added, and the
-taint is what would hold that pass to it. `mach.lang.driver:secret_store_taint_survives_lower`
-pins the taint.
+release. The guarantee becomes load-bearing only if such a pass is added: a kept
+fill holds that pass to it, and a plain store into secret storage carries the
+secret statement of the place it writes, which such a pass would have to honour.
 
-The contract is only offered where mach emits the instructions that execute.
-A target whose back half hands a module to a downstream compiler instead — the
-experimental SPIR-V backend — **rejects `#[oblivious]`**: neither that
-translation nor the device's timing behaviour is covered by the leakage model,
-so the obligation could be neither validated nor upheld. Compile constant-time
-code for a machine target and pass such a target only public data.
+What a target offers is read at the `#[constant_time]` mark from masc's instruction
+set for the target's architecture, which says whether its rows classify their
+timing, whether it cannot guarantee timing at all, or whether it classifies none:
+
+- **Its rows classify their timing** (x86_64, aarch64, riscv64, riscv32): masc's
+  walk of the encoded code validates the function.
+- **It cannot guarantee timing** (wasm, whose runtime decides the instructions that
+  execute): the function compiles, with the warning `secret.target_unenforceable`
+  at the mark that the target cannot practically enforce constant-time execution.
+- **It classifies none** (SPIR-V, whose module a downstream compiler translates):
+  the function is **refused** under `secret.target_unverifiable`, since neither
+  that translation nor the device's timing behaviour is covered by the leakage
+  model. Compile constant-time code for a machine target and pass such a target
+  only public data.
 
 ## Constant-time multiply by instruction set
 
 `*` on a secret operand means what it means on a public one: the wrapping,
 same-width product. What changes per target is whether the machine can execute
-it without a timing leak, and mach decides that from a catalog each instruction
-set declares, never from a guess. A **row** of the catalog names one cell (a
-multiply, an operand width) and the **condition** under which that cell has
-data-independent timing:
+it without a timing leak. mirl decides that from the class masc's instruction
+set gives each row its selection emits for the multiply, never from a guess,
+and mach states no table of its own. A **cell** is one multiply at one operand
+width, and the class of the rows that realize it says the **condition** under
+which it has data-independent timing:
 
 - **always**: nothing to check;
 - **PSTATE.DIT on**: the cell is data-independent only while the processor's
-  DIT mode is set, so the row is admitted only on an operating system that
-  declares it guarantees the mode (see [PSTATE.DIT at run
-  time](#pstatedit-at-run-time));
+  DIT mode is set, which a `soft` function sets where the processor has it and
+  a `hard` function requires in the target's baseline (see [Soft and
+  hard](#soft-and-hard));
 - **extensions selected**: the cell is data-independent only on a machine that
-  has the named extensions, so the row is admitted only when the target selects
-  every one of them (`extensions` in the manifest, or the isa string).
+  has the named extensions. A `hard` function admits the row only when the
+  target selects every one of them (`ext` in the manifest, or the `isa`). A
+  `soft` function admits it without them and leaves the timing to the
+  processor, as it does an aarch64 row without DIT: riscv64's `mul` rows build
+  in a soft function on a target without `zkt`.
 
 The multiply column is the spelling `$mach.build.ct_mul` takes: `low` is the
 same-width product, `high_u` and `high_s` the upper half of the unsigned and
@@ -644,33 +1068,57 @@ The declared rows, one line per multiply:
 | `riscv64` | `high_u` | 64 | `m` and `zkt` selected |
 | `riscv64` | `high_s` | 64 | `m` and `zkt` selected |
 | `riscv64` | `high_su` | 64 | `m` and `zkt` selected |
-| `riscv32` | none | | |
+| `riscv32` | `low` | 8, 16, 32 | `m` and `zkt` selected |
+| `riscv32` | `high_u` | 32 | `m` and `zkt` selected |
+| `riscv32` | `high_s` | 32 | `m` and `zkt` selected |
+| `riscv32` | `high_su` | 32 | `m` and `zkt` selected |
 | `spirv` | none | | |
 
-A test reads this table back against the compiler's catalog, so the two cannot
-drift. A cell the table does not hold is refused, as is every lane multiply
-(`i32x4 * i32x4` on a secret vector): the vector rows exist in the contract and
-no instruction set declares one.
+The table describes masc's rows, and masc's registration of each instruction
+set is the source. Inside a constant-time function a secret multiply whose
+rows are not classified constant time under the function's mode is refused. A
+lane multiply (`i32x4 * i32x4` on a secret vector) is held to the rows its
+selection emits in the same way: on x86-64 it is `pmuludq` with shuffles, each
+on Intel's list, and a target with no vector unit runs it as one scalar
+multiply per lane.
 
-**Realized cells.** A cell no instruction executes directly is admitted exactly
-when every cell of its realization is, under the union of their conditions. On
-x86-64 the one-operand `mul` and `imul` write the full product to a register
+**Realized cells.** A multiply is classified as the build computes it, after
+mirl's legalisations, which is what both the constant-time check of a
+function's selected code and `$mach.build.ct_mul` read. A cell is admitted
+exactly when every multiply of its realization is, under the union of their
+conditions:
+
+- a product at a width the target's multiply does not run at is widened to the
+  narrowest one above it, so an 8- or 16-bit `low` cell on x86-64 and riscv64
+  is the 32-bit multiply, and a narrow high half is that multiply of the
+  operands extended, shifted down;
+- a high half the target has no form for, at a width it multiplies at, is four
+  low products of the operands' half-width pieces at that width, so x86-64's
+  `high_su` at 32 and 64 bits and riscv64's high halves at 32 bits are low
+  cells;
+- a multiply wider than the widest arithmetic is split into words, its low and
+  unsigned high products of words, so a 128-bit cell on a 64-bit target is the
+  64-bit `low` and `high_u` cells, and a 64-bit cell on riscv32 the 32-bit
+  ones;
+- a width the target has no multiply for at all calls a helper, which no cell
+  covers, so the cell is 0.
+
+On x86-64 the one-operand `mul` and `imul` write the full product to a register
 pair, so the high halves and the widening products are the same instruction;
 on aarch64 and riscv64 the full product is the low multiply beside the high
 one (`mul` + `umulh`/`smulh`, `mul` + `mulhu`/`mulh`), so the 64-bit `wide_u`
-and `wide_s` are admitted there through the 64-bit `low` and high rows. A
-**128-bit** multiply is never declared by a target, because no target executes
-one: `(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
+and `wide_s` are admitted there through the 64-bit `low` and high rows.
+`(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
 product, one instruction, and its high half `(... >> 64)::^u64` is that same
-instruction; a secret `^u128 * ^u128` low product is the schoolbook over the
-lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(low,
-128)` and `$mach.build.ct_mul(wide_u, 64)` answer for the realized cells the
-same way the gate does, so on aarch64 they need DIT like the 64-bit high half.
+instruction. A secret `^u128 * ^u128` low product is the schoolbook over the
+words, three 64-bit low products and the widening one.
+`$mach.build.ct_mul(wide_u, 64)` answers for the 64-bit low and high halves
+together, so on aarch64 it needs DIT like the 64-bit high half.
 
 **Why each row holds.** Every row cites its source beside the declaration in the
 instruction set's registration, and the kind of each claim is marked:
 
-- **x86-64, always, Intel and AMD (#3508).** On Intel it is a vendor guarantee:
+- **x86-64, always, Intel and AMD.** On Intel it is a vendor guarantee:
   the "Data Operand Independent Timing" guidance states that processors which
   do not enumerate DOITM may be assumed to behave as if it were enabled for the
   listed instructions, and `mul` (F6, F7), `imul` (69, 6B, 0F AF, F6, F7) and
@@ -690,215 +1138,342 @@ instruction set's registration, and the kind of each claim is marked:
   `umaddl` (`umull`), `umsubl` and `umulh` as data-independent while DIT is
   set. The 8- and 16-bit low halves are the 32-bit `madd`, the 64-bit high
   halves are `umulh` and `smulh`, and the 32-bit widening rows are `umaddl`
-  and `smaddl`. Whether a process can set and hold the mode is the operating
-  system's declaration, and on an OS that declares nothing (windows,
-  freestanding) the refusal names the instruction set that declares the rows
-  and the operating system that declares no guarantee.
+  and `smaddl`. A `soft` function sets the mode around itself where the
+  processor has it, and a `hard` one builds only where the target's baseline
+  holds DIT, and its refusal names the feature.
 - **riscv64, `m` and `zkt` selected.** The RISC-V Cryptography Extensions
   Volume I (scalar), chapter "Data Independent Execution Latency Subset: Zkt",
   table RVM, lists `mul`, `mulh`, `mulhsu`, `mulhu` and (rv64) `mulw`, and
   excludes `div` and `rem`. Zkt changes no instruction: it is a promise about
   the hart's timing, so like any selected extension it is assumed of every
-  machine the binary runs on. riscv32 declares no rows yet.
+  machine the binary runs on. riscv32 declares the same rows at its 32-bit width,
+  under the same condition.
 - **SPIR-V** has no timing model and declares nothing.
 
-**DOITM is not a multiply condition.** Intel's Data Operand Independent Timing
-Mode (`IA32_UARCH_MISC_CTL[0]`) hardens the data dependent prefetcher and the
-fast store forwarding predictor, memory-side predictors keyed on data values;
-it does not touch the multiplier, which is why the x86-64 rows hold without it
-(#3623). It is a model-specific register the kernel owns, user space cannot set
-it, and Linux does not enable it by default, so mach neither declares it nor
-offers a manifest key for it. A program that wants that hardening asks the
+**DOITM.** masc's x86-64 rows state the timing of Intel's "Data Operand
+Independent Timing Instructions" list (intel.com developer article 768547,
+updated 2026-02-23, 840 entries), which holds under its Data Operand
+Independent Timing Mode (`IA32_UARCH_MISC_CTL[0]`), and mirl checks every
+x86-64 constant-time function under that mode. It is a model-specific
+register the kernel owns and user space cannot set, so mach neither switches it
+nor offers a manifest key for it. Intel states that a processor which does not
+enumerate DOITM behaves as if it were on for the listed instructions. On one
+that enumerates it and runs with it off, the code still runs, and the listed
+instructions' timing is not promised. A program that wants the mode asks the
 operator for the kernel control, the same class as SMT and other side-channel
 mitigations.
 
-**Fail closed, never fall back.** A secret multiply the catalog does not admit
-is a compile error; the compiler never substitutes a bit-serial loop, a
-shift-add expansion or a call for it, and it has no multiply strength
-reduction, so a secret square and a secret multiply by a constant each reach
-the machine as the one multiply instruction. A per-ISA test decodes the emitted
-function and checks exactly that: one multiply, no call, branch or loop, on
-riscv64 through its Zkt rows, x86-64 through its unconditional rows and aarch64
-through its DIT rows on linux and darwin. A program that compiles
-through a `PSTATE.DIT on` row and reaches a processor without the mode is
-refused at start by the std runtime, before any secret is multiplied, as the
-next section describes.
+**Fail closed, never fall back.** In a constant-time function a secret
+multiply mirl's check does not clear is a compile error. The compiler never
+substitutes a bit-serial loop, a shift-add expansion or a call for it, so a
+secret square and a secret multiply by a constant each reach the machine as the
+multiply the selection emits, and masc's walk of the encoded code holds it to
+its row. How a constant-time function holds the mode those rows need is the
+next section.
 
-## PSTATE.DIT at run time
+## Soft and hard
 
 An aarch64 multiply has data-independent timing only while the processor's
 DIT mode is on (Arm ARM DDI 0487, "About PSTATE.DIT"; the DIT register page of
 DDI 0601 lists the instructions: `madd`, `msub`, `smaddl`, `smsubl`, `smulh`,
 `umaddl`, `umsubl`, `umulh`). The mode is per-thread processor state that user
 code turns on with `msr dit, 1`, and a processor without FEAT_DIT has no such
-bit. So admitting the aarch64 rows takes two facts the compiler does not own,
-and the design splits them:
+bit. On riscv the same promise is the Zkt extension, and for the vector unit
+the Zvkt extension, neither of which changes an instruction, each assumed of
+every machine a binary built with it runs on. A
+constant-time function's mode says what happens when the build cannot be sure
+the promise holds.
 
-**The operating system declares the guarantee.** A target's OS table declares,
-per instruction set, whether a process can set the mode at start, learn whether
-the processor has it, and keep it. The declaration is read through one accessor
-and never derived, and each carries its citation beside it:
+**`soft`** holds the mode where it can and runs anyway where it cannot. mirl
+emits a save of the DIT bit, a set and a restore around the function. The set
+is `msr dit, #1` followed by `dsb nsh` and `isb sy`, as `std.system.dit.enable`
+writes it, so no instruction after it runs speculatively under the timing from
+before it (Apple's "Writing ARM64 code for Apple platforms" asks for a
+speculation barrier after turning the mode on). The restore needs none. Where the
+target does not guarantee DIT, the set is guarded by std's byte that says
+whether the processor has the mode, and where it does, the set is
+unconditional. Without DIT the function still runs, with the code-level rules
+held and the instruction timing left to the processor. A call from one
+constant-time function to another does not toggle the mode again.
 
-- **aarch64-linux declares it.** The kernel exposes the processor's FEAT_DIT as
-  `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP` since v4.17 (commit 7206dc93a58f, "arm64:
-  Expose Arm v8.4 features"; `Documentation/arch/arm64/elf_hwcaps.rst`:
-  "Functionality implied by ID_AA64PFR0_EL1.DIT == 0b0001"). PSTATE is saved to
-  `SPSR_EL1` on every exception entry and restored on return, so the bit
-  outlives a context switch.
-- **aarch64-darwin declares it.** Apple's "Writing ARM64 code for Apple
-  platforms", section "Enable DIT for constant-time cryptographic operations",
-  documents the mode as per-thread state user code turns on with `msr dit, #1`
-  and reads back as bit 24 of `mrs dit`, and names the sysctl
-  `hw.optional.arm.FEAT_DIT` as the check for a processor that has it.
-- **aarch64-windows and freestanding aarch64 declare nothing**, so a `DIT_MODE`
-  row is refused there with a diagnostic that names the rows and the OS.
+**`hard`** is decided when the program is compiled, and never at run time. The
+build's target must guarantee data-independent timing for every operation the
+function uses, or the build is refused with a diagnostic naming the missing
+feature:
 
-**The compiler records the need and the runtime honours it.** The rows only say
-the instruction is safe *while the mode is on*; something must turn it on, and
-only for programs that need it. When a module's lowering admits a secret
-multiply through a `DIT_MODE` row, codegen marks the module: its object carries
-a local absolute symbol `__mach_needs_dit` (value 1) that reaches no linked
-image. When an executable is linked for a target whose OS declares the
-guarantee, the linker appends one synthetic input defining `__mach_dit_required`,
-a hidden one-byte read-only object that is `1` when any input carries the mark
-and `0` otherwise. The std start code reads that byte before `main`. When it is
-zero the program never touches DIT. When it is set, std checks that the
-processor has the mode (`HWCAP_DIT` on linux, `hw.optional.arm.FEAT_DIT` on
-darwin), turns it on with `msr dit, 1` followed by `dsb nsh; isb`, and does the
-same at the entry of every thread it creates, since the bit is per thread. A
-processor or kernel without the mode fails closed: std writes
+- aarch64 needs DIT in the target's baseline, as darwin-arm64 has it;
+- riscv needs Zkt in the selection. Without Zvkt the vector instructions
+  carry no promise, so a constant-time function, hard or soft, keeps the lanes
+  of its vectors in scalar registers and computes them one by one, and a
+  function that is not constant-time packs the same code. Zvkt in the
+  selection lets a constant-time function pack it too;
+- x86-64's scalar cells hold unconditionally, so they pass.
 
+**Calls between the modes.** Both modes do the same at entry and at every
+exit (`mirl.legal.timing`): a function entered with the mode on switches
+nothing and leaves it on, and one entered with it off switches it on and
+restores it before it returns. They differ only in what the check admits. A
+soft function's code is held under every mode the processor may offer, the
+switched and the promised ones included, and a hard function's only under the
+modes the build guarantees. So a soft caller may call either mode, and a hard
+caller may rely on a soft callee exactly where the build guarantees every mode
+a soft function's code may be held under, as the hard callee's own check would
+have required: every x86-64 build, whose one mode the system sets for every
+process, an aarch64 build that selects `dit` and a riscv64 build that selects
+`zkt`, and `zvkt` too where it has a vector unit. Elsewhere a hard function passing a secret to a soft one is refused
+(`secret.call_untrusted`), and masc's walk takes the soft callee as one it does
+not trust.
+
+A `hard` function needs nothing linked into the image, and a `soft` one needs
+only the availability byte below and, in a shared library, the probe that sets
+it. There is no object mark the linker checks, and a program never refuses to
+start for want of the mode. For code that holds the mode by hand,
+std keeps a manual DIT API: `std.system.dit.enable`, `disable` and `read` on
+aarch64, and `std.crypto.ct.begin`, which turns the mode on for the calling
+thread where the processor has it. `std.system.timing.mode()` answers what the
+hardware offers.
+
+The availability byte, `__mach_timing_available`, is one byte in each image,
+hidden, so no image reads another's. Every object whose `soft` functions read
+it defines it, weak and zero, and `std.system.dit` holds the strong definition
+that stands for those where the image reaches it, so an image links whether or
+not it imports std. std's program start sets it once before `main` and before
+any thread starts, from what the system reports:
+
+- **aarch64-linux** reads `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP`, which the
+  kernel exposes since v4.17 (commit 7206dc93a58f, "arm64: Expose Arm v8.4
+  features"; `Documentation/arch/arm64/elf_hwcaps.rst`: "Functionality implied
+  by ID_AA64PFR0_EL1.DIT == 0b0001"). PSTATE is saved to `SPSR_EL1` on every
+  exception entry and restored on return, so the bit outlives a context switch.
+- **aarch64-darwin** reads the sysctl `hw.optional.arm.FEAT_DIT`. Apple's
+  "Writing ARM64 code for Apple platforms", section "Enable DIT for
+  constant-time cryptographic operations", documents the mode as per-thread
+  state user code turns on with `msr dit, #1` and reads back as bit 24 of
+  `mrs dit`.
+- **freestanding aarch64** reads `ID_AA64PFR0_EL1.DIT` when it runs at EL1, and
+  leaves the byte 0 where it may not ask.
+- **aarch64-windows** leaves the byte 0, so a `soft` function runs without the
+  mode there, and a `hard` one builds only where the target's baseline holds
+  DIT.
+
+A shared library runs no program start, so on Linux each object that reads the
+byte also holds `__mach_timing_probe`, a merged hidden function, and an entry
+for it in the image's table of load-time functions at priority 0
+(`.init_array.00000`) in the probe's own group, so the image keeps one probe and
+one entry. The loader runs the table before `dlopen` returns and before any
+library that depends on this one runs its own, and mink lays the entries of a
+table by priority, a lower one first and every entry that states none after,
+so the probe runs before any other load-time function of the image, one that
+calls a `soft` function included. An executable keeps std's start: it has no
+table its loader runs before `_start`, so the entry would never run there, and
+a library initializer can reach an executable's `soft` function before `main`
+only through a pointer the executable gave it, in which case that call runs
+without the mode, as `soft` allows.
+
+The probe reads `ID_AA64PFR0_EL1` with `mrs` and sets the byte to 1 where its DIT
+field, bits 51 to 48 read signed, is at least 1. At EL0 that read traps, and
+Linux emulates it from v4.11, which advertises the emulation as `HWCAP_CPUID`,
+showing the DIT field from v4.17 and reading it as 0 before
+(`Documentation/arch/arm64/cpu-feature-registers.rst`: "the kernel emulates
+the operation if the source belongs to the supported system register space",
+and an unexposed register "causes SIGILL"). A kernel older than v4.11 has no
+emulation and sends SIGILL, so a library with a `soft` function fails to load
+there. That is accepted: a library has no other source of the answer, since it
+runs no start that is handed the auxiliary vector and mach links no C library to
+ask, and v4.9, the last kernel without the emulation, left long-term support
+in January 2023. Windows gives user code no read of the ID registers, so no
+probe is delivered there and the byte stays 0.
+
+An image that runs no table of load-time functions and no std start, such as
+a freestanding image with its own entry, keeps the byte 0, so its `soft`
+functions run without the mode, as `soft` promises and `hard` exists to
+refuse. Such an image sets the byte by calling the probe once before any
+`soft` function runs, declared as
+`#[symbol("__mach_timing_probe")] ext fun probe();`, at EL1 where the read
+is the processor's own. The probe is present in every image that holds a `soft`
+function reading the byte. `std.system.dit.available` and
+`std.crypto.ct.begin` read the same byte. A `hard` function reads no byte and
+behaves in a library as in a program.
+
+## Padding of secret aggregates
+
+A secret aggregate's padding bytes are zero. A type holding a secret, a `^T` or
+an aggregate with a secret member or element, has every byte its layout leaves
+between or after its members zeroed wherever a value of it is built: a literal,
+a member-by-member construction and a default initialization. A copy moves the
+value whole, padding included, so the padding stays zero. A stale secret
+therefore never rides in the padding of a value that is later copied or written
+out whole. An aggregate that holds no secret is laid out and built as before,
+its padding unspecified, except a literal in a constant-time function, whose
+padding is zeroed too: the function's check refuses a read of stack no store
+reached, and a load of the whole value reads its padding.
+
+A tag or union literal writes the same way. Where its type holds a secret, or
+the literal is in a constant-time function, every byte the case or member it
+names leaves unwritten is zeroed before the discriminator and the payload are
+stored, so `ret opt[u64].none{}` in a constant-time function returns a value
+whose payload bytes are zero rather than stale. Anywhere else a tag literal
+writes its discriminator and its payload alone, and a union literal its
+member alone.
+
+## What is promised about memory
+
+The compiler promises two things of secret data: a constant-time function
+processes it in constant time, and no value typed secret reaches a public one
+without a `:>`. It does not promise memory hygiene. A function's stack slots,
+spills and registers are not wiped when it returns, so a secret's bytes can
+remain in dead stack memory after the function that held them. Bytes nothing
+wrote, as a public record's padding or the unused bytes of a union or tag of a
+public type, are unspecified and may hold whatever was there before, a dead
+frame's secret included. A program that sends or stores a record by its raw
+bytes sends those bytes too. A long-lived buffer holding a secret is wiped by
+its author with std's helpers, `std.crypto.ct.zeroize` or
+`std.memory.secret.borrow_wipe`.
+
+The constant-time check takes such bytes as their type states them. A
+constant-time function that reads a union member other than the one last
+written, or looks at padding or at a tag's unused bytes through a pointer cast,
+and branches on what it finds, branches on whatever was there:
+
+```mach
+uni U { a: u8; b: [6]u64; }
+
+fun make() U { ret U{a: 1}; }       # writes one byte of the 48
+
+#[constant_time("soft")]
+fun look(u: *U) u64 {
+    if (u.b[1] != 0) { ret 1; }     # reads bytes nothing wrote
+    ret 0;
+}
 ```
-std.runtime: this program contains a constant-time multiply that requires the processor's data-independent-timing mode (PSTATE.DIT), and this processor or kernel does not provide it (aarch64-linux: HWCAP_DIT absent; aarch64-darwin: hw.optional.arm.FEAT_DIT is 0); refusing to start
-```
 
-to stderr and terminates through its panic path (exit status 255) before any
-secret is multiplied.
-
-Two consequences of the design are worth knowing. The mark is per module, so a
-module that contains such a multiply sets the byte even when the linker
-dead-strips the function; the cost is one unneeded `msr`. And "a binary without
-the need carries nothing DIT-related" holds up to that one byte: the language
-has no weak import, so std reads a cell that is always defined on a declaring
-target, and a binary without the need carries it as `0`. A shared library gets
-no cell, because no start code of std's runs in one, and an object built by
-another compiler carries no mark. `$mach.build.ct_mul(op, width)` answers `1`
-for the aarch64 rows exactly where the OS declares the guarantee.
+`look` builds, and what it branches on is what the stack held when `make` ran.
+Reading bytes nothing wrote is the program's to avoid, in marked code as in any
+other: read the member that was written, and write or send a record member by
+member. One such read is taken care of: where a constant-time function
+receives a record returned through memory, the padding of that result is
+zeroed after the call.
 
 ## Trusted base
 
-The only secret-to-public crossings are the explicit `:>T` cast and inline `asm`
-blocks (which a type system cannot check). Everything else is enforced. A proof
-is always relative to a leakage model. Its fidelity to real silicon is
-empirical.
+The guarantee rests on four parts:
+
+- mach's secrecy check, the flow typing and gates above, which hold for the
+  source,
+- mirl's lowering, which carries each secret through selection, allocation,
+  spilling and framing to the emitted instructions and adds the timing switch
+  of a `soft` function,
+- masc's check of the final program, the walk of each constant-time
+  function's encoded code against the timing class of every row it executes,
+- the hardware timing mode, DIT on aarch64 and DOITM on x86-64, where the rows
+  need it.
+
+The only secret-to-public crossings are the explicit `:>T` cast and inline
+`asm`, which masc's walk validates but a type system cannot check. A proof is
+always relative to a leakage model. Its fidelity to real silicon is empirical.
+
+mirl's own helpers, the routines a constant-time function calls for a
+division, product, conversion, copy or fill the target has no instruction for,
+are walked as constant-time functions where one calls them. A division,
+remainder or product helper's result is taken as public where every operand
+the call passes is: its text reads and writes no memory and calls nothing,
+which mirl checks when it delivers it, so the result is formed from the
+operands alone, in registers, on the stack or in a copy passed by reference.
+On wasm a 128-bit operand and the result travel in copies in the caller's
+frame, which the walk holds off the frame's base as it holds every slot there.
+
+What is checked and what is trusted: the checker verifies the functions marked
+`#[constant_time]`, their `asm` included. Code that is not marked is trusted to
+follow the type system and its declared signatures, and `asm` outside a
+constant-time function is not checked. Three consequences of that statement are
+known and accepted under it:
+
+- an untrusted callee that reads a register its declaration does not pass, and
+  so a secret the caller left there;
+- an untrusted callee whose `asm` reads its caller's frame;
+- untrusted code whose `asm` moves a secret it reaches through a global into
+  public storage it was given, directly or through a trusted callee.
+
+The check is a proof under the processor state the code runs under. On
+aarch64 that is FPCR.NEP, which a target states clear only where a source
+establishes it, cited beside the fact in mink's catalog of hosts, and which a
+constant-time function establishes itself everywhere else:
+
+| target | FPCR.NEP at a thread's start | source | what holds it clear in a constant-time function |
+|---|---|---|---|
+| linux | clear | exec clears the thread's whole float state (`fpsimd_flush_thread`), a new thread copies its parent's, a signal handler runs on the interrupted thread's | the system |
+| darwin | clear | xnu sets a 64-bit thread's FPCR to `FPCR_DEFAULT`, which is 0 | the system |
+| uefi | clear | UEFI 2.10, section 2.3.6: FPCR=0 at image entry | the system |
+| freestanding | not established | a warm reset leaves FPCR UNKNOWN, and a program may supply its own entry, so nothing outside the function establishes it | the function's own clear, where its code needs it |
+| windows | not established | no primary source states a thread's initial FPCR | the function's own clear, where its code needs it |
+
+On linux, darwin and uefi a constant-time function emits nothing for
+FPCR.NEP. On freestanding and windows the function clears it around its own
+code where that code may select a one-source scalar float instruction, as
+[the codegen contract](#constant_time-the-codegen-contract) states, in `soft`
+and `hard` alike: the state is the function's own doing, decided when it is
+compiled, and needs no feature of the processor, as the clear is harmless
+where the bit is RES0. That proof rests on nothing a startup routine does.
+Where the system establishes the bit clear, the proof rests on that source and
+on untrusted code not setting the bit and returning: a constant-time
+function's own write of `fpcr` other than its clear is refused, and code that
+sets FPCR.NEP by hand is outside what the checker proves.
 
 ## Assurance
 
-**The constant-time guarantee is incomplete. This support is an experimental
-preview and has not been audited. Do not build production cryptography on it at
-this version.**
+**The guarantee.** For code marked `#[constant_time]` and compiled for a
+covered target, the emitted machine code's branches and memory addresses never
+depend on secret values, and no instruction whose timing depends on its
+operands receives a secret. masc's walk proves this on the encoded code of each
+such function, after selection, register allocation, spilling and frame
+layout, and a build that cannot prove it is refused.
 
-What holds today: the type system checks that the source respects the leakage
-model, `#[oblivious]` carries the obligation through codegen, and the translation
-validator independently re-checks the lowered MIR. All three are static. Two
-host-executed measurements sit under them, and each only means anything on the
-machine it runs on, which is why both are unit tests rather than build checks.
+**Covered targets.** Constant time is a working feature on linux x86-64 and
+linux aarch64. Every other target is experimental, which covers linux riscv64
+and riscv32, darwin x86-64 and aarch64, windows, uefi and every freestanding
+target: the same checks run there, but the targets have not been cross-checked
+to the standard the covered ones have. wasm targets compile a constant-time
+function with the warning `secret.target_unenforceable`, since the runtime
+chooses the instructions that execute, and SPIR-V refuses one under
+`secret.target_unverifiable`.
 
-**The timing harness is a tool, not a gate.** `mach.lang.ct.probe` is a
-dudect-style harness in the tree. `mach test` runs it at deliberately tiny sample
-counts and prints its table; it asserts **nothing about the numbers** - not a
-threshold, not positivity - because even "a mean is positive" proved to be a
-property of the host's clock resolution rather than of the harness (#3092). The
-run can only fail if the harness itself crashes. **No property of a measured time
-gates anything**, here or anywhere else in the suite.
+**Soft and hard.** A `soft` function switches the hardware timing mode on
+around itself where the processor has it and runs without it where it does
+not. A `hard` function builds only where the target guarantees the timing of
+every instruction it uses, and the refusal, `secret.target_unguaranteed`,
+names the missing feature. Arm promises an instruction's timing only while DIT
+is on, and the linux aarch64
+baseline holds no DIT, so there a `hard` function builds only when the target
+selects `dit` in its `isa` or `ext`, and a `soft` one switches DIT on when the
+processor has it. On linux riscv64 the same holds of Zkt.
+[Soft and hard](#soft-and-hard) has the details.
 
-That is deliberate and it is not a gap. A dudect score is a statistic over
-wall-clock time on hardware nobody controls, so any threshold over it has a
-false-failure rate that belongs to the machine rather than to the code. A required
-check that can fail nondeterministically is worse than no check: it teaches a
-reader to re-run a red constant-time result until it turns green. An earlier form
-of this harness did assert on such thresholds, and failed a release gate on
-`x86_64-darwin` and then passed a re-run of the identical commit (#3070).
+**Out of scope.** Cache and power side channels are not covered. Neither is an
+access past the object a pointer addresses, including past a narrowed pointer
+cast: secrecy holds for in-bounds accesses only.
 
-**So the claims below are measurements, taken deliberately, not properties this
-suite enforces.** Raising the counts in `mach.lang.ct.probe` and reading the
-printed table is how they are re-taken, on a quiet machine, by a person who then
-reads the numbers. Performance and timing work belongs in
-[mach-bench](https://github.com/briar-systems/mach-bench), which is built for it,
-rather than in a correctness suite that must be deterministic.
+**The x86-64 caveat.** masc's x86-64 timing rows come from Intel's "Data
+Operand Independent Timing Instructions" list (intel.com developer article
+768547, updated 2026-02-23, 840 entries). A listed instruction's timing is
+independent of its data operands while DOITM is on, and
+[DOITM](#constant-time-multiply-by-instruction-set) says when that holds. AMD
+publishes no equivalent list, so on AMD processors the guarantee rests on
+Intel's list with no statement from AMD behind it.
 
-What such a measurement can establish is bounded. It works by refutation, because
-that is all a timing measurement can do: a clean score is consistent with a leak
-the instrument cannot see, so each mode carries a *planted* leak that must be
-detected and a constant-time reference that must not separate the way the planted
-one does. Read separations between the two class means, never `|t|` -- Welch's
-statistic divides by the sample variance, and concurrent load inflates the variance
-without moving the means, so `|t|` collapses under load while the leak is plainly
-still there. Measured at load average 27, six consecutive runs of one binary gave
-`|t|` between 7.51 and 11.24 against a threshold of 10 while the mean ratio never
-fell below 3.4.
-
-A third probe leaks nothing at all and says whether a run counts at all. Any
-separation *it* shows is the machine rather than the code, so a run in which it is
-not flat has no discriminating power and its verdict means nothing in either
-direction. Note that a flat null is necessary and not sufficient: it must also be
-sampled at a comparable cost to the probe it is bounding, or a quiet control at one
-magnitude certifies nothing about noise at another.
-
-**The x86-64 inline-asm flags table is measured, not inferred.** The twenty-two-row
-classification the `#[oblivious]` asm model rests on, naming which instructions
-*define* ZF and CF, which merely write them, and which read them, is re-derived on x86-64
-hosts by `mach.lang.target.isa.x64.probe`, which runs each instruction twice with
-RFLAGS preset all-set and all-clear and compares what the CPU did against the
-transcription. `defines_flags` is the only fact that clears a taint, so a row that
-drifts from the silicon is a permission rather than a refusal. Three rows are
-exempt and classified by reasoning instead: `popfq`, `iretq` and `syscall` pass the
-writer probe cleanly and are still not definers, because the flags came from the
-stack, the interrupt frame, or an existing value masked through `IA32_FMASK`, and
-where a value came *from* is structural rather than measurable. A non-x86-64 host
-declines the probe by name, and an extension row runs only on a host whose cpuid
-reports the extension.
-
-**What a timing harness can and cannot assure.** The leakage model has three
-channels and no single sampling regime covers them (briar-systems/mach#2363):
-
-| channel | assured by |
-|---|---|
-| control-flow trace | the source-level branch gate; a latency-mode measurement can corroborate |
-| variable-latency operands | the sema/lowering gates; a latency-mode measurement can corroborate |
-| memory-address trace | the source-level **secret-index and secret-address gates**; only an address-mode measurement can corroborate |
-
-The two modes need opposite sampling and neither substitutes for the other. Latency
-mode times a large batch of calls per sample, which is what lifts a running-time
-difference above clock resolution. That same batching *hides* an address-trace leak:
-every call in a batch is handed the same input, so after the first call both input
-classes are reading a warm cache line and the single cache miss carrying the signal
-is averaged away. Measured on one function — a secret-indexed read over a table
-larger than the last-level cache — latency mode scored |t| ≈ 1–15 across runs
-(straddling its own threshold, so it neither confirmed nor denied) while address
-mode, at one call per sample, scored in the hundreds.
-
-Two consequences worth stating plainly:
-
-- A clean latency-mode number for a table lookup is **not** evidence of
-  address-trace safety. It is the wrong instrument for that channel.
-- An address-trace leak is only *measurable* when the table exceeds the
-  last-level cache. A cache-resident table leaks its index just as truly and no
-  timing harness will see it. For small tables the property rests entirely on
-  the secret-index gate and on reading the emitted code.
-
-**Where the check runs.** The constant-time contract is checked at the **IR
-level**: the validator runs over the lowered, target-independent
-MIR before width legalization, instruction selection, register allocation,
-spilling, frame insertion, and encoding, and trusts those stages to be
-timing-preserving. What it refuses, it refuses closed: an operation it does not
-know, an out-of-range register reference, and inline assembly without a
-complete effect declaration are rejected, never defaulted to public. A proof
-over the final allocated machine program — after selection, allocation, spills
-and frame insertion, over physical registers and flags — is planned additive
-work (#3591), not something this version claims. Where mach does not own
-the later stages at all — a whole-module emitter such as SPIR-V — the contract
-is refused rather than assumed.
+**Independent checking.** The guarantee calls for two independent analyzers to
+cross-check the emitted binaries, BINSEC's checkct and valgrind's memcheck with
+the secret marked undefined (ctgrind), whose harness is mirl's
+`test/ct/oracle.sh`. Its corpus is five constant-time functions and three
+planted leaks, one each on the control, memory and latency channels, and
+neither analyzer covers latency. For the v7 toolchain both analyzers have been
+run on linux x86-64, and checkct on linux aarch64, each without and with
+optimisation: neither reported anything on the constant-time functions, and
+both flagged the planted control and memory leaks wherever they ran. On aarch64
+checkct reads each DIT access mirl emits around a constant-time function as a
+stated stub, since its decoder interprets neither the access nor the barriers
+after a write, and DIT changes an instruction's timing, never its result. The
+one item left is ctgrind on linux aarch64: it runs the program, so it waits for
+aarch64 hardware.
 
 ## See also
 
@@ -906,5 +1481,5 @@ is refused rather than assumed.
 - [tag.md](tag.md) - tagged values and outer-secret ^Tag rules
 - [comptime-intrinsics.md](comptime-intrinsics.md) - $is_secret, $holds_secret and the rest of the type-predicate family
 - [operators.md](operators.md) - the :: / :~ casts that preserve secrecy and :>T
-- [decorators.md](decorators.md) - the #[oblivious] decorator reference
+- [decorators.md](decorators.md) - the #[constant_time] decorator reference
 - [grammar.md](grammar.md) - the formal grammar of ^ and :>T

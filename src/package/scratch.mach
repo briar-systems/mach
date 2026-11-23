@@ -1,0 +1,285 @@
+# scratch: the one place the dependency manager makes temporary storage (a git output capture,
+# the bare repository release candidates are fetched into). a process has one scratch
+# directory under the system temporary directory, `mach_scratch_<16 hex digits>`, made at the
+# first request, and every request is a fresh name inside it. beside it is its lock file, the
+# same name with `.lock`, made before the directory and locked by the process for the
+# scratch's whole life; the system releases the lock when the process ends however it ends.
+#
+# the scratch is released by `end` when the command ends. while it exists the process holds
+# the interrupt (mach.host.interrupt), so an interrupt or termination is caught, the work in
+# hand stops, and the scratch is removed before the process ends. a process that is killed
+# leaves its scratch, and the next process to make one removes every scratch whose lock it
+# can take: no live process holds that lock, so its owner is gone. a name is reclaimed only
+# under its lock and only once the lock file the path names is the file locked, so a scratch
+# being made (whose lock is not yet taken) is never mistaken for an abandoned one, and
+# nothing that is not a lock file of this exact form, or the directory it names, is touched
+use std.crypto.rand;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use fsnative:   std.filesystem.native;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.system.file_identity;
+use system_os: std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_ends_with;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.host;
+use mach.host.interrupt;
+
+val PREFIX:      str   = "mach_scratch_";
+val LOCK_SUFFIX: str   = ".lock";
+val HEX_DIGITS:  usize = 16;
+val ATTEMPTS:    usize = 16;
+val PATH_ROOM:   usize = 1024;
+
+val SCRATCH_ROLE: str = "the dependency scratch directory";
+val LOCK_ROLE:    str = "the dependency scratch lock";
+
+# the process's scratch: its directory and lock file paths, the lock's handle and the
+# number of the next name handed out
+rec Scratch {
+    made:      bool;
+    lock:      usize;
+    next:      usize;
+    dir:       [1024]u8;
+    lock_path: [1024]u8;
+}
+
+# one per process, as the lock it holds is
+var global_scratch: Scratch;
+
+# a fresh path inside the process's scratch, `<role>_<n>`, made with the scratch on the
+# first request; nothing is created at the path
+# ---
+# a:    owns the returned path
+# role: the leading word of the name
+pub fun path(a: *A.Allocator, role: str) res[str, fail.Fail] {
+    if (!global_scratch.made) {
+        val err_made: err[fail.Fail] = make(a);
+        if (sel err_made.err) { ret res[str, fail.Fail].err{err_made.err}; }
+    }
+    val n: usize = global_scratch.next;
+    global_scratch.next = n + 1;
+    val res_leaf: res[str, std_format.FormatError] = std_format.sprint(a, "{}_{}", role, n);
+    if (sel res_leaf.err) { ret res[str, fail.Fail].err{fail.format_refused(res_leaf.err)}; }
+    val res_joined: res[str, A.Error] = types_path.join(a, (?global_scratch.dir[0])::str, res_leaf.ok);
+    str_free(a, res_leaf.ok);
+    if (sel res_joined.err) { ret res[str, fail.Fail].err{fail.refused(res_joined.err)}; }
+    ret res[str, fail.Fail].ok{res_joined.ok};
+}
+
+# remove the process's scratch and release its lock and its hold on the interrupt; nothing
+# when no scratch was made
+# ---
+# ret: the first refusal, once every step has run
+pub fun end(a: *A.Allocator) err[fail.Fail] {
+    if (!global_scratch.made) { ret err[fail.Fail].ok{}; }
+    global_scratch.made = false;
+    val dir:         str             = (?global_scratch.dir[0])::str;
+    val lock_path:   str             = (?global_scratch.lock_path[0])::str;
+    var failed:      bool            = false;
+    var first:       fail.Fail;
+    val err_removed: err[fs.FsError] = fs.remove_all(a, dir);
+    if (sel err_removed.err) {
+        first  = fail.refusal(a, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: SCRATCH_ROLE, path: dir}, fail.Cause.fs{err_removed.err});
+        failed = true;
+    }
+    val err_unlinked: err[io_error.Error] = fs.remove_file(lock_path);
+    if (sel err_unlinked.err) {
+        if (!failed) { first = fail.refusal(a, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: LOCK_ROLE, path: lock_path}, fail.Cause.io{err_unlinked.err}); }
+        failed = true;
+    }
+    system_os.close(global_scratch.lock);
+    val err_released: err[io_error.Error] = interrupt.release();
+    if (sel err_released.err) {
+        if (!failed) { first = fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: "restore", role: "the process event handlers"}, fail.Cause.io{err_released.err}); }
+        failed = true;
+    }
+    if (failed) { ret err[fail.Fail].err{first}; }
+    ret err[fail.Fail].ok{};
+}
+
+# hold the interrupt, reclaim abandoned scratch, then take a fresh name: its lock file made
+# and locked first, then the directory
+fun make(a: *A.Allocator) err[fail.Fail] {
+    val err_held: err[io_error.Error] = interrupt.hold();
+    if (sel err_held.err) { ret err[fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: "catch", role: "the interrupt that would leave the scratch behind"}, fail.Cause.io{err_held.err})}; }
+    var held: bool = true;
+    fin {
+        if (held) { interrupt.release(); }
+    }
+    var buf: [512]u8;
+    val dir: i64 = fsnative.temp_dir(?buf[0], 512);
+    if (dir < 0 || dir >= 512) { ret err[fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: "find", role: "the temporary directory"}, fail.Cause.native{dir})}; }
+    val temp: str = (?buf[0])::str;
+    reclaim_all(a, temp);
+    var attempt: usize = 0;
+    for (attempt < ATTEMPTS) {
+        attempt = attempt + 1;
+        val res_taken: res[bool, fail.Fail] = take(a, temp);
+        if (sel res_taken.err) { ret err[fail.Fail].err{res_taken.err}; }
+        if (res_taken.ok) {
+            held = false;
+            ret err[fail.Fail].ok{};
+        }
+    }
+    ret err[fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: "create", role: SCRATCH_ROLE, path: temp}, fail.Cause.text{"every fresh name was taken"})};
+}
+
+# try one fresh name: false when it was taken first or reclaimed before its lock was held
+fun take(a: *A.Allocator, temp: str) res[bool, fail.Fail] {
+    var rnd:        [8]u8;
+    val err_filled: err[io_error.Error] = rand.fill(?rnd[0], 8);
+    if (sel err_filled.err) { ret res[bool, fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: "name", role: SCRATCH_ROLE}, fail.Cause.io{err_filled.err})}; }
+    var leaf: [64]u8;
+    var k:    usize = 0;
+    for (k < str_len(PREFIX)) {
+        leaf[k] = PREFIX[k];
+        k       = k + 1;
+    }
+    var j: usize = 0;
+    for (j < 8) {
+        leaf[k]     = hex_digit(rnd[j] >> 4);
+        leaf[k + 1] = hex_digit(rnd[j] & 15);
+        k           = k + 2;
+        j           = j + 1;
+    }
+    leaf[k] = 0;
+    val res_dir: res[str, A.Error] = types_path.join(a, temp, (?leaf[0])::str);
+    if (sel res_dir.err) { ret res[bool, fail.Fail].err{fail.refused(res_dir.err)}; }
+    val dir: str = res_dir.ok;
+    fin { str_free(a, dir); }
+    val res_lock_path: res[str, std_format.FormatError] = std_format.sprint(a, "{}{}", dir, LOCK_SUFFIX);
+    if (sel res_lock_path.err) { ret res[bool, fail.Fail].err{fail.format_refused(res_lock_path.err)}; }
+    val lock_path: str = res_lock_path.ok;
+    fin { str_free(a, lock_path); }
+    if (str_len(lock_path) >= PATH_ROOM) { ret res[bool, fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: "create", role: SCRATCH_ROLE, path: dir}, fail.Cause.text{"its path is too long"})}; }
+
+    var handle: usize = system_os.INVALID_HANDLE;
+    val opened: i64   = system_os.open(system_os.working_dir(), lock_path, system_os.O_CREAT | system_os.O_EXCL | system_os.O_RDWR | host.OPEN_NOFOLLOW, 0o600, ?handle);
+    if (opened < 0 && system_os.error_kind(opened) == io_error.EXISTS) { ret res[bool, fail.Fail].ok{false}; }
+    if (opened < 0)                                                    { ret res[bool, fail.Fail].err{refused_at(a, "create", LOCK_ROLE, lock_path, opened, io_error.OP_CREATE)}; }
+    var kept: bool = false;
+    fin {
+        if (!kept) { system_os.close(handle); }
+    }
+    # blocking: a process reclaiming this name holds the lock until the name is gone
+    val locked: i64 = system_os.lock_fd(handle, system_os.LOCK_EX);
+    if (locked < 0)                { ret res[bool, fail.Fail].err{refused_at(a, "lock", LOCK_ROLE, lock_path, locked, io_error.OP_LOCK)}; }
+    if (!names(handle, lock_path)) { ret res[bool, fail.Fail].ok{false}; }
+
+    # a directory of this name outlived an owner that held this lock before, so it is ours to clear
+    val err_cleared: err[fs.FsError] = fs.remove_all(a, dir);
+    if (sel err_cleared.err) { ret res[bool, fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_REMOVE, fail.Op{verb: "clear", role: SCRATCH_ROLE, path: dir}, fail.Cause.fs{err_cleared.err})}; }
+    val err_made: err[io_error.Error] = fs.create_dir(dir, 0o700);
+    if (sel err_made.err) {
+        fs.remove_file(lock_path);
+        ret res[bool, fail.Fail].err{fail.refusal(a, diagnostic_kind.FS_CREATE, fail.Op{verb: "create", role: SCRATCH_ROLE, path: dir}, fail.Cause.io{err_made.err})};
+    }
+    copy_path(?global_scratch.dir[0], dir);
+    copy_path(?global_scratch.lock_path[0], lock_path);
+    global_scratch.lock = handle;
+    global_scratch.next = 0;
+    global_scratch.made = true;
+    kept                = true;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun refused_at(a: *A.Allocator, verb: str, role: str, p: str, code: i64, op: io_error.Operation) fail.Fail {
+    ret fail.refusal(a, diagnostic_kind.FS_TEMP, fail.Op{verb: verb, role: role, path: p}, fail.Cause.io{system_os.error(code, op)});
+}
+
+fun hex_digit(v: u8) u8 {
+    if (v < 10) { ret '0' + v; }
+    ret 'a' + v - 10;
+}
+
+fun copy_path(out: *u8, p: str) {
+    val n: usize = str_len(p);
+    var i: usize = 0;
+    for (i < n) {
+        out[i] = p[i];
+        i      = i + 1;
+    }
+    out[n] = 0;
+}
+
+# whether the lock file `p` names is the file `handle` holds: false once it was removed
+# or replaced
+fun names(handle: usize, p: str) bool {
+    var held:  file_identity.Identity;
+    var named: file_identity.Identity;
+    if (system_os.file_identity(handle, ?held) < 0)                    { ret false; }
+    if (system_os.identity_at(system_os.working_dir(), p, ?named) < 0) { ret false; }
+    ret file_identity.equal(held, named);
+}
+
+# whether `leaf` is a scratch lock file's name: the prefix, sixteen lowercase hex digits and
+# the suffix, nothing else
+fun is_lock_name(leaf: str) bool {
+    val prefix: usize = str_len(PREFIX);
+    if (str_len(leaf) != prefix + HEX_DIGITS + str_len(LOCK_SUFFIX))         { ret false; }
+    if (!str_starts_with(leaf, PREFIX) || !str_ends_with(leaf, LOCK_SUFFIX)) { ret false; }
+    var i: usize = prefix;
+    for (i < prefix + HEX_DIGITS) {
+        val c: u8 = leaf[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# reclaim every abandoned scratch in `temp`. what cannot be listed, opened, locked or removed
+# is left for a later run: it is not this command's work, and a later run retries it
+fun reclaim_all(a: *A.Allocator, temp: str) {
+    val res_listed: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(a, temp);
+    if (sel res_listed.err) { ret; }
+    var listed: Vector[fs.Listed] = res_listed.ok;
+    fin { fs.listed_dnit(?listed); }
+    var i: usize = 0;
+    for (i < listed.len) {
+        val entry: fs.Listed = listed.data[i];
+        if (sel entry.name) {
+            if (is_lock_name(entry.name)) { reclaim(a, temp, entry.name); }
+        }
+        i = i + 1;
+    }
+}
+
+# remove one scratch whose lock no process holds: its directory, then its lock file, both
+# under the lock
+fun reclaim(a: *A.Allocator, temp: str, leaf: str) {
+    val res_lock_path: res[str, A.Error] = types_path.join(a, temp, leaf);
+    if (sel res_lock_path.err) { ret; }
+    val lock_path: str = res_lock_path.ok;
+    fin { str_free(a, lock_path); }
+    var handle: usize = system_os.INVALID_HANDLE;
+    if (system_os.open(system_os.working_dir(), lock_path, system_os.O_RDWR | host.OPEN_NOFOLLOW, 0, ?handle) < 0) { ret; }
+    fin { system_os.close(handle); }
+    if (system_os.lock_fd(handle, system_os.LOCK_EX | system_os.LOCK_NB) < 0) { ret; }
+    if (!names(handle, lock_path))                                            { ret; }
+    val res_dir: res[str, StrError] = str_copy_slice(a, lock_path, 0, str_len(lock_path) - str_len(LOCK_SUFFIX));
+    if (sel res_dir.err) { ret; }
+    val dir: str = res_dir.ok;
+    fin { str_free(a, dir); }
+    val err_removed: err[fs.FsError] = fs.remove_all(a, dir);
+    if (sel err_removed.err) { ret; }
+    fs.remove_file(lock_path);
+}

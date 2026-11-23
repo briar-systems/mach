@@ -1,0 +1,762 @@
+# `#[handle]` declarations, the types a target mints, and where a handle may be held
+#
+# a bodyless `def` marked `#[handle(target, constructor, operands...)]` is typed from its
+# constructor and operands when the build selects its target, and is inert otherwise. a handle's
+# representation is the target's, not the program's, so it may not be a field or payload, sit in
+# an array or behind a pointer to a pointer, and a module binding of one must carry its
+# descriptor decorator. only a handle binding takes `gpu.attachment`, which the target
+# holds to the handles it declares subpass inputs.
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+
+use A: std.allocator;
+
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.front.ast;
+use ast_decl: mach.front.ast.decl;
+use ast_expr: mach.front.ast.expr;
+use ast_id:   mach.front.ast.id;
+use ast_type: mach.front.ast.type;
+use mach.front.comptime;
+use comptime_failure: mach.front.comptime.failure;
+use comptime_value:   mach.front.comptime.value;
+use mach.front.decorator;
+use mach.front.resolve;
+use sema_context: mach.front.sema.context;
+use report_phase: mach.report.phase;
+use mach.session;
+use mach.session.module;
+use mach.type;
+use type_field: mach.type.field;
+use type_kind:  mach.type.kind;
+use type_prim:  mach.type.prim;
+use type_query: mach.type.query;
+use mach.type.query.mention;
+use mach.type.query.subst;
+use type_scan: mach.type.scan;
+use mach.type.visit;
+
+val FIXED_ARGS: u32 = 2;
+
+pub def ReadStatus: u8;
+pub val READ_OK:      ReadStatus = 0;
+val     READ_INERT:   ReadStatus = 1;
+val     READ_REFUSED: ReadStatus = 2;
+
+# what a `handle` decorator reads as
+# ---
+# status: ok, inert for another target, or refused
+# ctor:   the interned kind the target mints, NO_HANDLE_CTOR unless ok
+# ops:    the operands as part and value pairs, allocated from the session and freed by `read_dnit`
+# len:    how many words `ops` holds, twice the operand count
+rec Read {
+    status: ReadStatus;
+    ctor:   u32;
+    ops:    *u32;
+    len:    u32;
+}
+
+fun decorator_of(sc: *sema_context.SemaContext, d: *ast_decl.Decl) *ast_decl.Decorator {
+    val opt_found: opt[*ast_decl.Decorator] = decorator.get(sc.view.a, d, decorator.HANDLE);
+    if (sel opt_found.none) { ret nil; }
+    ret opt_found.some;
+}
+
+# whether a handle operand names a type, which is read as one and never as a value
+pub fun arg_is_type(sc: *sema_context.SemaContext, dec: *ast_decl.Decorator, index: u32) bool {
+    if (dec.id != decorator.HANDLE)                  { ret false; }
+    if (index < FIXED_ARGS || index >= dec.args_len) { ret false; }
+    val e: *ast_expr.Expr = arg_expr(sc, dec, index);
+    if (e == nil || e.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
+    val opt_sym: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, sc.view.a.expr_ids.data[dec.args_start + index]);
+    if (!sel opt_sym.some) { ret false; }
+    val k: resolve.SymKind = opt_sym.some.definition_kind;
+    ret k == resolve.SYM_REC || k == resolve.SYM_UNI || k == resolve.SYM_TAG || k == resolve.SYM_DEF
+        || k == resolve.SYM_GENERIC || k == resolve.SYM_PRIM || k == resolve.SYM_VECTOR;
+}
+
+# the handle type `sym` names: a bodyless `def` of this module typed from its decorator, or
+# a declaration elsewhere whose type is a handle, the error type for anything else
+fun handle_type_named(sc: *sema_context.SemaContext, sym: *resolve.Symbol, depth: u32) type_kind.TypeId {
+    if (depth > MAX_COMPOSE_DEPTH)                                       { ret type_kind.TYPE_ERROR; }
+    if (sym.kind != resolve.SYM_DEF && sym.kind != resolve.SYM_IMPORTED) { ret type_kind.TYPE_ERROR; }
+
+    if (sym.kind == resolve.SYM_DEF && !sema_context.foreign(sc, sym)) {
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+        if (!sel opt_d.some) { ret type_kind.TYPE_ERROR; }
+        val d: *ast_decl.Decl = opt_d.some;
+        if (d.kind != ast_decl.DECL_KIND_DEF)    { ret type_kind.TYPE_ERROR; }
+        if (!ast_id.type_is_nil(d.data.def_.ty)) { ret type_kind.TYPE_ERROR; }
+        ret type_at(sc, sym.decl, d, depth + 1);
+    }
+
+    val ty: type_kind.TypeId = sema_context.decl_type_for(sc, sym);
+    if (!type.is_handle(sc.s.types, ty)) { ret type_kind.TYPE_ERROR; }
+    ret ty;
+}
+
+pub val MAX_COMPOSE_DEPTH: u32 = 8;
+
+# reads the `handle` decorator `dec` on `d`: the kind its target mints and its operands, each a
+# type or a constant word. one naming a target the build does not select is inert
+# ---
+# sc:     the sema context of the module being typed
+# d:      the declaration carrying the decorator
+# dec:    the `handle` decorator
+# report: whether a refusal is reported, or only returned
+# depth:  how many handles deep the read is, bounded by MAX_COMPOSE_DEPTH
+# ret:    the read, refused after a misplaced or malformed decorator or an internal failure,
+#         whose operands the caller releases with `read_dnit`
+pub fun read(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_decl.Decorator, report: bool, depth: u32) Read {
+    var out: Read;
+    out.status = READ_REFUSED;
+    out.ctor   = type.NO_HANDLE_CTOR;
+    out.ops    = nil;
+    out.len    = 0;
+
+    if (d.kind != ast_decl.DECL_KIND_DEF) {
+        if (report) { sema_context.report(sc, diagnostic_kind.HANDLE_NOT_DEF, dec.name, "`handle` applies only to a `def` declaration"); }
+        ret out;
+    }
+    if (!ast_id.type_is_nil(d.data.def_.ty)) {
+        if (report) { sema_context.report(sc, diagnostic_kind.HANDLE_HAS_BODY, dec.name, "a `handle` declaration has no body. write `def Name;` and the target supplies the definition"); }
+        ret out;
+    }
+    if (dec.args_len < FIXED_ARGS) {
+        if (report) { sema_context.report(sc, diagnostic_kind.HANDLE_ARGUMENTS, dec.name, "`handle` takes at least two string arguments, the target and the type constructor, then the constructor's operands"); }
+        ret out;
+    }
+
+    val ctr_e: *ast_expr.Expr = arg_expr(sc, dec, 1);
+    if (ctr_e == nil) { ret out; }
+    val opt_tgt_c: opt[str] = string_arg(sc, dec, 0, report);
+    val opt_ctr_c: opt[str] = string_arg(sc, dec, 1, report);
+    if (sel opt_tgt_c.none) { ret out; }
+    if (sel opt_ctr_c.none) { ret out; }
+
+    if (!target_is_selected(sc, opt_tgt_c.some)) {
+        out.status = READ_INERT;
+        out.ctor   = type.NO_HANDLE_CTOR;
+        ret out;
+    }
+    # the kind is the family-qualified name the target's catalog mints it under, as
+    # `spirv.image`, and its operands are a type or a constant word each. mirl's handle
+    # catalog holds them to the kind's parts where the lowering assembles the target
+    val res_joined: res[str, types_string.StrError] = str_join(sc.s.alloc, opt_tgt_c.some, ".", opt_ctr_c.some);
+    if (sel res_joined.err) {
+        report_phase.internal(?sc.status, fail.message("a handle kind's name could not be built"));
+        ret out;
+    }
+    val res_kind: res[intern.StrId, A.Error] = intern.add(sc.s.interner, res_joined.ok);
+    str_free(sc.s.alloc, res_joined.ok);
+    if (sel res_kind.err) {
+        report_phase.internal(?sc.status, fail.refused(res_kind.err));
+        ret out;
+    }
+    val count: u32  = (dec.args_len - FIXED_ARGS) * 2;
+    var ops:   *u32 = nil;
+    if (count > 0) {
+        val res_made: res[*u32, A.Error] = A.allocate[u32](sc.s.alloc, count::usize);
+        if (sel res_made.err) {
+            report_phase.internal(?sc.status, fail.refused(res_made.err));
+            ret out;
+        }
+        ops = res_made.ok;
+    }
+    var i: u32 = FIXED_ARGS;
+    for (i < dec.args_len) {
+        val k:     u32              = (i - FIXED_ARGS) * 2;
+        val typed: type_kind.TypeId = operand_type(sc, dec, i, depth);
+        if (!type_kind.is_error(typed)) {
+            ops[k]     = type.HANDLE_PART_TYPE;
+            ops[k + 1] = type_kind.index(typed);
+        }
+        or (arg_is_type(sc, dec, i)) {
+            if (report) {
+                sema_context.report(sc, diagnostic_kind.HANDLE_OPERAND_TYPE, sema_context.decorator_arg_span(sc, sc.view.a.expr_ids.data[dec.args_start + i], dec.name),
+                    "a handle operand that names a type must name a scalar or a handle a `def` declares");
+            }
+            if (ops != nil) { A.deallocate[u32](sc.s.alloc, ops, count::usize); }
+            ret out;
+        }
+        or {
+            val opt_word: opt[Word] = operand_word(sc, dec, i, report);
+            if (sel opt_word.none) {
+                A.deallocate[u32](sc.s.alloc, ops, count::usize);
+                ret out;
+            }
+            ops[k]     = opt_word.some.part;
+            ops[k + 1] = opt_word.some.value;
+        }
+        i = i + 1;
+    }
+    out.status = READ_OK;
+    out.ctor   = res_kind.ok::u32;
+    out.ops    = ops;
+    out.len    = count;
+    ret out;
+}
+
+# the type a handle operand names: a scalar spelled as itself or through an alias, or a
+# handle type a `def` declares, the error type for any other operand
+fun operand_type(sc: *sema_context.SemaContext, dec: *ast_decl.Decorator, index: u32, depth: u32) type_kind.TypeId {
+    val e: *ast_expr.Expr = arg_expr(sc, dec, index);
+    if (e == nil || e.kind != ast_expr.EXPR_KIND_IDENT) { ret type_kind.TYPE_ERROR; }
+    val opt_sym: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, sc.view.a.expr_ids.data[dec.args_start + index]);
+    if (!sel opt_sym.some) { ret type_kind.TYPE_ERROR; }
+    val sym: *resolve.Symbol = opt_sym.some;
+    if (sym.kind == resolve.SYM_PRIM) { ret scalar_or_error(sc, prim_type(sc, sym.slot::type_kind.TypeKind)); }
+    if (sym.kind == resolve.SYM_DEF && !sema_context.foreign(sc, sym)) {
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+        if (sel opt_d.some) {
+            val d: *ast_decl.Decl = opt_d.some;
+            if (d.kind == ast_decl.DECL_KIND_DEF && !ast_id.type_is_nil(d.data.def_.ty)) {
+                ret scalar_or_error(sc, sema_context.resolved_type_of(sc, d.data.def_.ty));
+            }
+        }
+    }
+    if (sym.kind == resolve.SYM_IMPORTED) {
+        val imported: type_kind.TypeId = sema_context.decl_type_for(sc, sym);
+        if (!type_kind.is_error(scalar_or_error(sc, imported))) { ret imported; }
+    }
+    ret handle_type_named(sc, sym, depth);
+}
+
+fun prim_type(sc: *sema_context.SemaContext, kind: type_kind.TypeKind) type_kind.TypeId {
+    val opt_tid: opt[type_kind.TypeId] = type.prim(sc.s.types, kind);
+    if (sel opt_tid.some) { ret opt_tid.some; }
+    ret type_kind.TYPE_ERROR;
+}
+
+# `t` where it is an integer or float scalar, the error type otherwise
+fun scalar_or_error(sc: *sema_context.SemaContext, t: type_kind.TypeId) type_kind.TypeId {
+    if (type_kind.is_nil(t) || type_kind.is_error(t)) { ret type_kind.TYPE_ERROR; }
+    val opt_t: opt[*type.Type] = type.get(sc.s.types, t);
+    if (!sel opt_t.some) { ret type_kind.TYPE_ERROR; }
+    val class: type_prim.PrimClass = type_prim.prim_desc(opt_t.some.kind).class;
+    if (class == type_prim.PRIM_CLASS_INT || class == type_prim.PRIM_CLASS_FLOAT) { ret t; }
+    ret type_kind.TYPE_ERROR;
+}
+
+# a constant handle operand: its part, a word or a name, and its value
+rec Word {
+    part:  u32;
+    value: u32;
+}
+
+# the constant a handle operand states: an integer a 32-bit word holds, for an operand its
+# row takes as a number, or a string, the name of an enumerant its row's grammar states
+fun operand_word(sc: *sema_context.SemaContext, dec: *ast_decl.Decorator, index: u32, report: bool) opt[Word] {
+    val eid:          ast_id.ExprId                                          = sc.view.a.expr_ids.data[dec.args_start + index];
+    val res_evaluate: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc, sc.typing.caps, sc.view.a, sc.view.source, eid, sc.s.interner);
+    if (sel res_evaluate.ok) {
+        if (res_evaluate.ok.kind == comptime_value.CT_KIND_INT && res_evaluate.ok.data.i >= 0 && res_evaluate.ok.data.i <= 0xFFFF_FFFF) { ret opt[Word].some{Word{part: type.HANDLE_PART_WORD, value: res_evaluate.ok.data.i::u32}}; }
+        if (res_evaluate.ok.kind == comptime_value.CT_KIND_STR)                                                                         { ret opt[Word].some{Word{part: type.HANDLE_PART_NAME, value: res_evaluate.ok.data.s::u32}}; }
+    }
+    if (report) {
+        sema_context.report(sc, diagnostic_kind.HANDLE_ARGUMENTS, sema_context.decorator_arg_span(sc, eid, dec.name),
+            "a handle operand must be a type, a constant string naming an enumerant the target's grammar states, or a constant integer from 0 through 4294967295 where the target takes a number");
+    }
+    ret opt[Word].none{};
+}
+
+# releases the operands of a read
+# ---
+# sc: the sema context whose allocator holds them
+# r:  the read to release
+pub fun read_dnit(sc: *sema_context.SemaContext, r: Read) {
+    if (r.ops != nil) { A.deallocate[u32](sc.s.alloc, r.ops, r.len::usize); }
+}
+
+fun target_is_selected(sc: *sema_context.SemaContext, tgt: str) bool {
+    val opt_interner_entry: opt[str] = intern.get(sc.s.interner, sc.view.ctx.env.build.isa_name);
+    if (!sel opt_interner_entry.some) { ret false; }
+    ret str_equals(tgt, opt_interner_entry.some);
+}
+
+# the target and the constructor are strings the target registry is searched for
+fun string_arg(sc: *sema_context.SemaContext, dec: *ast_decl.Decorator, ord: u32, report: bool) opt[str] {
+    if (!report) { ret decorator.string_of(sc.s.interner, sc.view.ctx, sc.view.a, dec, ord); }
+    ret sema_context.decorator_string_arg(sc, dec, ord, diagnostic_kind.HANDLE_ARGUMENTS,
+        "the `handle` target and constructor arguments must be strings");
+}
+
+fun arg_expr(sc: *sema_context.SemaContext, dec: *ast_decl.Decorator, index: u32) *ast_expr.Expr {
+    if (index >= dec.args_len) { ret nil; }
+    val opt_e: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, sc.view.a.expr_ids.data[dec.args_start + index]);
+    if (!sel opt_e.some) { ret nil; }
+    ret opt_e.some;
+}
+
+fun intern_name(sc: *sema_context.SemaContext, span: base_source.Span) intern.StrId {
+    if (span.len == 0) { ret intern.STR_NIL; }
+    val res_range_add: res[intern.StrId, A.Error] = intern.range_add(sc.s.interner, sc.view.source, span.offset, span.len);
+    if (sel res_range_add.err) {
+        sema_context.report_internal(sc, span, fail.refused(res_range_add.err));
+        ret intern.STR_NIL;
+    }
+    ret res_range_add.ok;
+}
+
+# reports every problem `read` finds in the `handle` decorator `dec` on `d`
+# ---
+# sc:  the sema context of the module being typed
+# d:   the declaration carrying the decorator
+# dec: the `handle` decorator
+pub fun validate(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_decl.Decorator) {
+    read_dnit(sc, read(sc, d, dec, true, 0));
+}
+
+# the handle type the declaration `d` mints, inert when its target is not the one selected
+# ---
+# sc:  the sema context of the module being typed
+# did: the declaration's id
+# d:   the bodyless `def` carrying the decorator
+# ret: the handle type, or the error type when `d` has no readable `handle` decorator or
+#      interning the type failed
+pub fun type_of(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) type_kind.TypeId {
+    ret type_at(sc, did, d, 0);
+}
+
+# the handle type `d` mints, read `depth` handles deep
+fun type_at(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl, depth: u32) type_kind.TypeId {
+    val dec: *ast_decl.Decorator = decorator_of(sc, d);
+    if (dec == nil) { ret type_kind.TYPE_ERROR; }
+
+    val r: Read = read(sc, d, dec, false, depth);
+    if (r.status == READ_REFUSED) { ret type_kind.TYPE_ERROR; }
+
+    val name: intern.StrId     = intern_name(sc, d.data.def_.name);
+    var tid:  type_kind.TypeId = type_kind.TYPE_ERROR;
+    if (r.status == READ_INERT) {
+        val owner: type.TypeOwner = resolve.type_owner(sc.s, sc.view.own_module, sc.view.a.file_id);
+        var site:  [3]u32;
+        site[0] = owner.module::u32;
+        site[1] = owner.file::u32;
+        site[2] = name::u32;
+        val res_intern_handle: res[type_kind.TypeId, fail.Fail] = type.intern_handle(sc.s.types, name, type.NO_HANDLE_CTOR, ?site[0], 3);
+        if (sel res_intern_handle.ok)  { tid = res_intern_handle.ok; }
+        or (sel res_intern_handle.err) { report_phase.internal(?sc.status, res_intern_handle.err); }
+    }
+    or {
+        val res_intern_handle: res[type_kind.TypeId, fail.Fail] = type.intern_handle(sc.s.types, name, r.ctor, r.ops, r.len);
+        if (sel res_intern_handle.ok)  { tid = res_intern_handle.ok; }
+        or (sel res_intern_handle.err) { report_phase.internal(?sc.status, res_intern_handle.err); }
+    }
+    read_dnit(sc, r);
+    ret tid;
+}
+
+# every annotation's check shares one walk, so a type that several annotations spell, as a
+# chain of defs each over the one before does, is walked once rather than once per annotation
+pub fun check_annotation_handles_all(sc: *sema_context.SemaContext) {
+    if (sc.view.type_resolved_ty == nil) { ret; }
+    var walked: type_scan.Scan;
+    if (!scan_begin(sc, ?walked)) { ret; }
+    var i: u32 = 0;
+    for (i < sc.view.a.types.len::u32) {
+        check_annotation_handles(sc, ?walked, ast_id.type(i));
+        i = i + 1;
+    }
+    type.type_scan_end(sc.s.types, ?walked);
+}
+
+# begins a scan over the session's type table, reporting a failure as internal
+# ---
+# sc:   the sema context of the module being typed
+# scan: the scan to begin, which the caller ends
+# ret:  true when the scan began
+pub fun scan_begin(sc: *sema_context.SemaContext, scan: *type_scan.Scan) bool {
+    val err_opened: err[fail.Fail] = type.type_scan_begin(sc.s.types, scan);
+    if (sel err_opened.err) {
+        report_phase.internal(?sc.status, err_opened.err);
+        ret false;
+    }
+    ret true;
+}
+
+# whether `t` holds a handle, directly or under a pointer, array or secret
+# ---
+# sc:  the sema context whose type table is read
+# t:   the type asked about
+# ret: true when it carries a handle
+pub fun type_carries_handle(sc: *sema_context.SemaContext, t: type_kind.TypeId) bool {
+    ret type.carries_handle(sc.s.types, t);
+}
+
+# a field or payload type carrying a handle, other than through a chain of pointers over one,
+# which its annotation is refused for already
+fun handle_storage_unreported(sc: *sema_context.SemaContext, t: type_kind.TypeId) bool {
+    if (!type_carries_handle(sc, t)) { ret false; }
+    ret !type.has_handle_pointer_pointer(sc.s.types, t);
+}
+
+# a binding whose written annotation holds a chain of pointers over a handle has drawn that
+# annotation's refusal, and a binding whose type is inferred has no annotation to draw it
+pub fun annotation_refuses_indirection(sc: *sema_context.SemaContext, ann: ast_id.TypeId, t: type_kind.TypeId) bool {
+    if (ast_id.type_is_nil(ann)) { ret false; }
+    ret type.has_handle_pointer_pointer(sc.s.types, t);
+}
+
+# reports each field of the module's records and unions, and each payload of its tags, that
+# holds a handle
+# ---
+# sc: the sema context of the module being typed
+pub fun check_handle_fields_all(sc: *sema_context.SemaContext) {
+    if (sc.view.decl_type == nil) { ret; }
+    var d: u32 = 0;
+    for (d < sc.view.a.decls.len::u32) {
+        val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, ast_id.decl(d));
+        if (!sel opt_decl.some) {
+            d = d + 1;
+            cnt;
+        }
+        val dd: *ast_decl.Decl = opt_decl.some;
+        if (dd.kind == ast_decl.DECL_KIND_REC) {
+            check_handle_fields(sc, dd.data.rec_.fields_start, dd.data.rec_.fields_len);
+        }
+        or (dd.kind == ast_decl.DECL_KIND_UNI) {
+            check_handle_fields(sc, dd.data.uni_.fields_start, dd.data.uni_.fields_len);
+        }
+        or (dd.kind == ast_decl.DECL_KIND_TAG) {
+            var i: u32 = 0;
+            for (i < dd.data.tag_.cases_len) {
+                val c: *ast_decl.TagCase = ?sc.view.a.tag_cases.data[dd.data.tag_.cases_start + i];
+                if (handle_storage_unreported(sc, sema_context.resolved_type_of(sc, c.payload))) {
+                    sema_context.report(sc, diagnostic_kind.HANDLE_STORAGE, c.name, "a handle cannot be a tag payload because its representation is owned by the target");
+                }
+                i = i + 1;
+            }
+        }
+        d = d + 1;
+    }
+}
+
+# reports each field in a run of record or union fields that holds a handle
+fun check_handle_fields(sc: *sema_context.SemaContext, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        val tn: *ast_decl.TypedName = ?sc.view.a.typed_names.data[start + i];
+        if (handle_storage_unreported(sc, sema_context.resolved_type_of(sc, tn.ty))) {
+            sema_context.report(sc, diagnostic_kind.HANDLE_STORAGE, tn.name,
+                "a handle cannot be a record or union field, because a handle has no layout the program knows. declare the handle itself");
+        }
+        i = i + 1;
+    }
+}
+
+# a function's parameters and result are values the program passes, and a handle reaches
+# one by value or behind a pointer to its binding, never inside an array
+pub fun check_handle_signature(sc: *sema_context.SemaContext, d: *ast_decl.Decl) {
+    if (d.kind != ast_decl.DECL_KIND_FUN) { ret; }
+    var i: u32 = 0;
+    for (i < d.data.fun_.params_len) {
+        val tn: *ast_decl.TypedName = ?sc.view.a.typed_names.data[d.data.fun_.params_start + i];
+        sema_context.check_handle_in_array(sc, sema_context.resolved_type_of(sc, tn.ty), tn.name);
+        i = i + 1;
+    }
+    sema_context.check_handle_in_array(sc, sema_context.resolved_type_of(sc, d.data.fun_.return_type), d.data.fun_.name);
+}
+
+# holds a module binding to the rules of handle storage: a handle stands only as itself, is
+# bound with `gpu.sampler` or `gpu.storage`, and `gpu.sampler` and `gpu.attachment` bind
+# nothing else. a uniform, storage or push block of an ordinary type is an unpacked record
+# ---
+# sc:  the sema context of the module being typed
+# did: the declaration's id
+# d:   the declaration checked, which is passed over unless it is a module binding
+pub fun check_handle_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) {
+    if (sc.view.decl_type == nil)                { ret; }
+    if (!sema_context.is_global_binding(d.kind)) { ret; }
+    val ty:      type_kind.TypeId = sc.view.decl_type[ast_id.decl_index(did)];
+    val carries: bool             = type_carries_handle(sc, ty);
+    val sampler: bool             = decorator.has(sc.view.a, d, decorator.GPU_SAMPLER);
+    val storage: bool             = decorator.has(sc.view.a, d, decorator.GPU_STORAGE);
+
+    if (carries && !type.is_handle(sc.s.types, ty)) {
+        if (annotation_refuses_indirection(sc, d.data.bind.ty, ty)) { ret; }
+        sema_context.report(sc, diagnostic_kind.HANDLE_STORAGE, d.span,
+            "a handle cannot be behind a pointer or inside an array, because it has no size the program knows. declare the handle itself");
+        ret;
+    }
+    if (!carries) {
+        if (sampler) {
+            sema_context.report(sc, diagnostic_kind.DECORATOR_MISPLACED, d.span,
+                "`gpu.sampler` applies only to a binding of a `#[handle(...)]` type. a block or buffer of an ordinary type takes `#[gpu.uniform(set, binding)]` or `#[gpu.storage(set, binding)]`");
+        }
+        val opt_attachment: opt[*ast_decl.Decorator] = decorator.get(sc.view.a, d, decorator.GPU_ATTACHMENT);
+        if (sel opt_attachment.some) {
+            sema_context.report(sc, diagnostic_kind.DECORATOR_MISPLACED, opt_attachment.some.name,
+                "`gpu.attachment` applies only to a subpass input, a handle binding such as an `image` of `Dim` \"SubpassData\"");
+        }
+        val block: bool = storage || decorator.has(sc.view.a, d, decorator.GPU_UNIFORM) || decorator.has(sc.view.a, d, decorator.GPU_PUSH);
+        if (block && !type_kind.is_error(ty) && !type.is_record(sc.s.types, type.strip_secret(sc.s.types, ty))) {
+            sema_context.report(sc, diagnostic_kind.DECORATOR_MISPLACED, d.span,
+                "a `gpu.uniform`, `gpu.storage` or `gpu.push` binding must be a `rec`. wrap the value in a one-field record");
+        }
+        or (block && !type_kind.is_error(ty) && type.decoration_of(sc.s.types, type.strip_secret(sc.s.types, ty)).packed) {
+            sema_context.report(sc, diagnostic_kind.DECORATOR_CONFLICT, d.span,
+                "a `packed` record cannot be a `gpu.uniform`, `gpu.storage` or `gpu.push` block, because the block's layout rules fix its member offsets");
+        }
+        ret;
+    }
+
+    if (sampler || storage) { ret; }
+    if (decorator.has(sc.view.a, d, decorator.GPU_INPUT) || decorator.has(sc.view.a, d, decorator.GPU_OUTPUT)
+        || decorator.has(sc.view.a, d, decorator.GPU_BUILTIN) || decorator.has(sc.view.a, d, decorator.GPU_UNIFORM)
+        || decorator.has(sc.view.a, d, decorator.GPU_PUSH) || decorator.has(sc.view.a, d, decorator.GPU_SHARED)) {
+        sema_context.report(sc, diagnostic_kind.HANDLE_ROLE, d.span,
+            "a handle must be bound with `#[gpu.sampler(set, binding)]`, or `#[gpu.storage(set, binding)]` for a storage image, and not with this role");
+        ret;
+    }
+    sema_context.report(sc, diagnostic_kind.HANDLE_UNBOUND, d.span,
+        "a handle binding needs `#[gpu.sampler(set, binding)]`, or `#[gpu.storage(set, binding)]` for a storage image");
+}
+
+# a generic record, union or tag instantiated so that a field or payload holds a handle,
+# directly or through a pointer, array or secret: the instance is the declaration its
+# arguments spell, and the same declaration written out is refused for that field. a
+# pointer to a pointer to a handle is refused at the annotation that spells or forms it. the
+# check of one annotation, whose walk skips the types `walked` holds and adds those it walks
+pub fun check_annotation_handles(sc: *sema_context.SemaContext, walked: *type_scan.Scan, ast_tid: ast_id.TypeId) {
+    if (sc.view.type_resolved_ty == nil)                        { ret; }
+    if (ast_id.type_index(ast_tid) >= sc.view.a.types.len::u32) { ret; }
+    val opt_type: opt[*ast_type.Type] = ast.get_type(sc.view.a, ast_tid);
+    if (!sel opt_type.some) { ret; }
+    check_handle_indirection(sc, sc.view.type_resolved_ty[ast_id.type_index(ast_tid)], opt_type.some.span);
+    val tid: type_kind.TypeId = sema_context.apply_subst(sc, sc.view.type_resolved_ty[ast_id.type_index(ast_tid)]);
+    if (type_kind.is_nil(tid) || type_kind.is_error(tid)) { ret; }
+
+    var q:    type_query.Query = sema_context.query_of(sc);
+    var scan: type_scan.Scan;
+    if (!type_query.scan_begin(?q, ?scan)) { ret; }
+    var at: Held = Held{sc: sc, q: ?q, scan: ?scan, walked: walked, span: opt_type.some.span};
+    held_walk(?at, tid);
+    type_query.scan_end(?q, ?scan);
+    sema_context.query_settle(sc, ?q, opt_type.some.span);
+}
+
+val HANDLE_INDIRECTION_MESSAGE: str = "a handle cannot be behind a pointer to a pointer. take the handle as `*Handle`, as in `img: *Image`, and pass the binding's address, as in `f(?binding)`";
+
+# where an annotation's handle check reports
+rec Site {
+    sc:   *sema_context.SemaContext;
+    span: base_source.Span;
+}
+
+# a pointer to a pointer to a handle roots the handle at no binding. every annotation is
+# visited once and a written chain has one annotation at its innermost double pointer, so
+# that one site reports. an instance reports only a chain its substitution forms, once per
+# type, since the template already reported every written one and its sites repeat
+fun check_handle_indirection(sc: *sema_context.SemaContext, raw: type_kind.TypeId, span: base_source.Span) {
+    if (type_kind.is_nil(raw) || type_kind.is_error(raw)) { ret; }
+    val s: *session.Session = sc.s;
+    if (sc.instance.subst == nil) {
+        val opt_t: opt[*type.Type] = type.get(s.types, raw);
+        if (!sel opt_t.some)                            { ret; }
+        if (opt_t.some.kind != type_kind.TYPE_POINTER)  { ret; }
+        if (!type.handle_pointer_pointer(s.types, raw)) { ret; }
+        sema_context.report(sc, diagnostic_kind.HANDLE_STORAGE, span, HANDLE_INDIRECTION_MESSAGE);
+        ret;
+    }
+    if (!sema_context.awaits_instance(sc, raw)) { ret; }
+    var at: Site             = Site{sc: sc, span: span};
+    var w:  visit.Walk[Site] = visit.Walk[Site]{types: s.types, status: ?sc.status, scan: nil,
+        edges: visit.EDGES_SPELLING, ctx: ?at, leaf: indirection_leaf};
+    visit.reaches[Site](?w, sema_context.apply_subst(sc, raw));
+}
+
+fun indirection_leaf(at: *Site, tid: type_kind.TypeId, t: *type.Type) visit.Verdict {
+    val sc: *sema_context.SemaContext = at.sc;
+    if (type.handle_pointer_pointer(sc.s.types, tid)) {
+        if (sema_context.uni_report_mark(sc.typing.handle_reports, tid)) {
+            sema_context.report(sc, diagnostic_kind.HANDLE_STORAGE, at.span, HANDLE_INDIRECTION_MESSAGE);
+        }
+        ret visit.PRUNE;
+    }
+    if (t.kind == type_kind.TYPE_SECRET || t.kind == type_kind.TYPE_POINTER || t.kind == type_kind.TYPE_ARRAY
+        || t.kind == type_kind.TYPE_FUN || t.kind == type_kind.TYPE_INSTANCE) {
+        ret visit.DESCEND;
+    }
+    ret visit.PRUNE;
+}
+
+# an instance check's walk: the context it reports in, the query its type questions go
+# to, the instances already checked, and the annotation it reports at
+rec Held {
+    sc:   *sema_context.SemaContext;
+    q:    *type_query.Query;
+    scan: *type_scan.Scan;
+    # the types the walk has met, across every annotation that shares it
+    walked: *type_scan.Scan;
+    span:   base_source.Span;
+}
+
+fun held_walk(at: *Held, tid: type_kind.TypeId) {
+    var w: visit.Walk[Held] = visit.Walk[Held]{types: at.q.types, status: at.q.status, scan: at.walked, once: true,
+        edges: visit.EDGE_BASE | visit.EDGE_POINTEE | visit.EDGE_ELEMENT | visit.EDGE_SIGNATURE, ctx: at,
+        leaf:  held_leaf};
+    visit.reaches[Held](?w, tid);
+}
+
+fun held_leaf(at: *Held, tid: type_kind.TypeId, t: *type.Type) visit.Verdict {
+    if (t.kind == type_kind.TYPE_INSTANCE) {
+        held_instance(at, tid, t);
+        ret visit.PRUNE;
+    }
+    if (t.kind == type_kind.TYPE_SECRET || t.kind == type_kind.TYPE_POINTER || t.kind == type_kind.TYPE_ARRAY
+        || t.kind == type_kind.TYPE_FUN) {
+        ret visit.DESCEND;
+    }
+    ret visit.PRUNE;
+}
+
+# whether an instance's fields carry a handle turns only on which of its arguments carry
+# one, so instances agreeing on that are one visit: a pointer-recursive generic whose
+# arguments grow at every level is then still a finite walk
+fun handle_visit_key(q: *type_query.Query, gnom: type_kind.TypeId, args: *type_kind.TypeId, args_len: u32) opt[type_kind.TypeId] {
+    val opt_plain: opt[type_kind.TypeId] = type.prim(q.types, type_kind.TYPE_U8);
+    if (sel opt_plain.none) {
+        report_phase.internal(q.status, fail.message("handle instance walk: the u8 type is not interned"));
+        ret opt[type_kind.TypeId].none{};
+    }
+    val res_canon: res[*type_kind.TypeId, A.Error] = A.allocate[type_kind.TypeId](q.types.a, args_len::usize);
+    if (sel res_canon.err) {
+        type_query.refused(q, res_canon.err);
+        ret opt[type_kind.TypeId].none{};
+    }
+    val canon: *type_kind.TypeId = res_canon.ok;
+    fin { A.deallocate[type_kind.TypeId](q.types.a, canon, args_len::usize); }
+    var i: u32 = 0;
+    for (i < args_len) {
+        canon[i] = opt_plain.some;
+        if (type.carries_handle(q.types, args[i])) { canon[i] = carried_handle(q, args[i]); }
+        i = i + 1;
+    }
+    val res_key: res[type_kind.TypeId, fail.Fail] = type.intern_instance(q.types, gnom, canon, args_len);
+    if (sel res_key.err) {
+        type_query.failed(q, res_key.err);
+        ret opt[type_kind.TypeId].none{};
+    }
+    ret opt[type_kind.TypeId].some{res_key.ok};
+}
+
+fun mention_leaf(q: *type_query.Query, tid: type_kind.TypeId, t: *type.Type) visit.Verdict {
+    if (t.kind == type_kind.TYPE_HANDLE) { ret visit.FOUND; }
+    if (t.kind == type_kind.TYPE_SECRET || t.kind == type_kind.TYPE_POINTER || t.kind == type_kind.TYPE_ARRAY
+        || t.kind == type_kind.TYPE_FUN || t.kind == type_kind.TYPE_INSTANCE) {
+        ret visit.DESCEND;
+    }
+    ret visit.PRUNE;
+}
+
+# whether a handle appears anywhere `tid` is spelled
+fun mentions_handle(q: *type_query.Query, tid: type_kind.TypeId) bool {
+    var w: visit.Walk[type_query.Query] = visit.Walk[type_query.Query]{types: q.types, status: q.status, scan: nil,
+        edges: visit.EDGES_SPELLING, ctx: q, leaf: mention_leaf};
+    ret visit.reaches[type_query.Query](?w, tid);
+}
+
+# the handle a type carries, under every pointer, array and secret over it
+fun carried_handle(q: *type_query.Query, tid: type_kind.TypeId) type_kind.TypeId {
+    var at: type_kind.TypeId = tid;
+    for {
+        val opt_t: opt[*type.Type] = type.get(q.types, at);
+        if (!sel opt_t.some) { ret at; }
+        val t: *type.Type = opt_t.some;
+        if (t.kind == type_kind.TYPE_SECRET)  { at = t.data.secret.base; }
+        or (t.kind == type_kind.TYPE_POINTER) { at = t.data.pointer.base; }
+        or (t.kind == type_kind.TYPE_ARRAY)   { at = t.data.array.base; }
+        or                                    { ret at; }
+    }
+}
+
+# reports an instance whose substituted fields or payloads hold a handle, once per set of
+# arguments that carry one, and walks on into its arguments and fields
+fun held_instance(at: *Held, tid: type_kind.TypeId, t: *type.Type) {
+    val sc: *sema_context.SemaContext = at.sc;
+    val q:  *type_query.Query         = at.q;
+
+    val gnom:       type_kind.TypeId = t.data.instance.nominal;
+    val args_start: u32              = t.data.instance.args_start;
+    val args_len:   u32              = t.data.instance.args_len;
+    if (args_len == 0) { ret; }
+
+    val res_args: res[*type_kind.TypeId, A.Error] = A.allocate[type_kind.TypeId](q.types.a, args_len::usize);
+    if (sel res_args.err) {
+        type_query.refused(q, res_args.err);
+        ret;
+    }
+    val args: *type_kind.TypeId = res_args.ok;
+    fin { A.deallocate[type_kind.TypeId](q.types.a, args, args_len::usize); }
+    var i: u32 = 0;
+    for (i < args_len) {
+        val opt_param: opt[type_kind.TypeId] = type.get_param(q.types, args_start + i);
+        if (!sel opt_param.some) { ret; }
+        args[i] = opt_param.some;
+        held_walk(at, args[i]);
+        i = i + 1;
+    }
+
+    # an instance none of whose arguments mentions a handle has fields holding none, since
+    # a generic's own fields are checked as its declaration
+    var mentioned: bool = false;
+    i = 0;
+    for (i < args_len) {
+        if (mentions_handle(q, args[i])) { mentioned = true; }
+        i = i + 1;
+    }
+    if (!mentioned) { ret; }
+
+    # a chain of pointers over a handle in an argument is refused at its annotation, so a
+    # field that holds a handle only through that chain draws nothing more here
+    var arg_chain: bool = false;
+    i = 0;
+    for (i < args_len) {
+        if (type.has_handle_pointer_pointer(q.types, args[i])) { arg_chain = true; }
+        i = i + 1;
+    }
+
+    val opt_key: opt[type_kind.TypeId] = handle_visit_key(q, gnom, args, args_len);
+    if (sel opt_key.none)                                 { ret; }
+    if (!type_query.scan_fresh(q, at.scan, opt_key.some)) { ret; }
+
+    # fields that mention no parameter are the declaration's own, which its check covers
+    val opt_who: opt[type.GenericOwner] = mention.owner(q, gnom);
+    if (!sel opt_who.some) { ret; }
+    var who: type.GenericOwner = opt_who.some;
+
+    val opt_tab: opt[*type_field.Table] = type.field_table_for(q.types, gnom);
+    if (!sel opt_tab.some) { ret; }
+    val fields_len: u32 = opt_tab.some.fields_len;
+    var f:          u32 = 0;
+    for (f < fields_len) {
+        val opt_field: opt[*type_field.Entry] = type.field_at(q.types, gnom, f);
+        if (!sel opt_field.some) { ret; }
+        val fty: type_kind.TypeId = subst.apply(q, opt_field.some.ty, ?who, args, args_len);
+        if (sel q.status.kind.internal || q.nested) { ret; }
+        if (type.carries_handle(q.types, fty)) {
+            if (arg_chain && type.has_handle_pointer_pointer(q.types, fty)) { ret; }
+            if (sema_context.uni_report_mark(sc.typing.handle_reports, tid)) {
+                sema_context.report(sc, diagnostic_kind.HANDLE_STORAGE, at.span, "this instantiation puts a handle in a record or union field or a tag payload, which is not allowed. pass the handle itself, or a pointer to its binding");
+            }
+            ret;
+        }
+        held_walk(at, fty);
+        f = f + 1;
+    }
+}

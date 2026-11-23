@@ -2,19 +2,20 @@
 
 Mach has a small set of compiler-shipped concrete types plus a uniform
 type-construction grammar for pointers, arrays, and function types. There
-are no compiler-known type aliases — names like `bool`, `usize`, and `str`
-are stdlib `def`s.
+are no compiler-known type aliases. Names like `bool`, `usize`, and `str`
+are stdlib `def`s, and a module that does not import one cannot spell it.
 
 ## Primitive scalars
 
 | Family | Members |
 |---|---|
-| Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128` |
-| Signed int | `i8`, `i16`, `i32`, `i64`, `i128` |
+| Truth value | `u1` |
+| Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128`, `u256`, `u512` |
+| Signed int | `i8`, `i16`, `i32`, `i64`, `i128`, `i256`, `i512` |
 | Float | `f16`, `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
-These fourteen names are the complete set of compiler-seeded primitive types.
+These names are the complete set of compiler-seeded primitive types.
 
 A **type** may not take one of these names. `rec`, `uni`, `tag`, `def` and a
 generic parameter named after a primitive are refused with `name.builtin_type`,
@@ -71,26 +72,43 @@ the result is the same bits either way, is on
 [SIMD vectors](#simd-vectors) below, and the calling conventions on
 [ext-fun.md](ext-fun.md#f16-and-_float16).
 
+### Floats on a target with no float unit
+
+`f16`, `f32` and `f64` and every float operator are available on every target,
+whatever unit its instruction set selects. Where the selection computes a width
+in no unit, as a RISC-V selection without `f` and `d` (`rv32imc` or `rv32imac`
+under `ilp32`, `rv64imac` under `lp64`) computes every width, or one with `f`
+alone computes `f64`, each operation on that width is a call of a helper the
+compiler writes into the program as integer code: the arithmetic operators,
+`%`, the comparisons, and the conversions to and from integers and between
+widths, each correctly rounded to nearest with ties to even. A value of such a
+width crosses a call or a return as its encoding, where the calling convention
+places it (`ilp32` and `lp64` in integer registers). Nothing is refused for the
+missing unit and nothing extra is linked. Which widths a selection computes in a
+unit is on [manifest.md](manifest.md), under the RISC-V instruction sets.
+
 ### 128-bit integers
 
 `u128` and `i128` are integers like the others: every arithmetic, bitwise,
 shift, comparison and conversion operator applies, literals take the `u128`
 and `i128` suffixes, comptime evaluates them exactly, and `$size_of` is 16
 with `$align_of` 16, which is what C's `__int128` has on every ABI mach
-targets.
+targets. SPIR-V has no C ABI, and its `$align_of` is 8, its 64-bit word's.
 
-No target has a 128-bit register. A 128-bit value is **realized** as two
-64-bit lanes on the 64-bit targets (x86-64, aarch64, riscv64), the way a
-vector wider than the vector register is realized as pieces: addition and
-subtraction carry across the lanes, shifts move bits between them, and a
-comparison decides on the high lane first. Which targets realize the width is
-a declaration of the machine model, not a consequence of its name. A target
-that declares no 128-bit integer (riscv32, spirv) refuses the type where it
-is used, at the declaration or expression that names it:
-
-```text
-error[target.int_width]: a 128-bit integer is not realized on riscv32: the target declares no integer of that width
-```
+No target has a 128-bit register. A 128-bit value is **realized** as words of
+the widest width the target computes at, the way a vector wider than the
+vector register is realized as pieces: two 64-bit words on x86-64, aarch64,
+riscv64 and wasm32, and four 32-bit words on riscv32. Addition and subtraction
+carry across the words, shifts move bits between them, and a comparison decides
+on the high word first. The width a target computes at is a declaration of its
+machine model, not a consequence of its name, and every target realizes every
+integer width this way, so no target refuses a 128-bit integer. SPIR-V
+splits a 128-bit integer into 64-bit words as it does any integer wider than its
+widest arithmetic, so it needs `Int64`, and since SPIR-V has no 128-bit type
+it holds one in memory as an array of its two words, low word first: a local,
+a global, an initializer, a member and a block member are each that array
+(`OpTypeArray` of the 64-bit integer, with an `ArrayStride` of 8 in a block),
+and each access reaches its words as the array's elements.
 
 Three operations have a shape worth knowing:
 
@@ -104,22 +122,49 @@ Three operations have a shape worth knowing:
   schoolbook over its lanes, three multiplies and the widening one.
 - **Division and remainder** at 128 bits have no instruction on any target
   and are calls into helpers the compiler provides with the program.
-- **Vectors** have lanes of 8 to 64 bits, so `u128x2` is not a vector type;
-  it is refused with the lane rule named.
+- **Vectors** have lanes of 8 to 64 bits, so `u128x2` is not a vector type.
+  It is refused with `vector.invalid_type`, naming the lane rule.
 
 The secrecy page states which 128-bit operations a secret may reach
-([secrecy.md](secrecy.md)); the calling conventions for `u128` and `i128`
+([secrecy.md](secrecy.md)), and the calling conventions for `u128` and `i128`
 across an `ext fun` boundary are on [ext-fun.md](ext-fun.md).
 
-There is no compiler `bool`. `bool` is a stdlib `def bool: u8;` with `true` /
-`false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).
+### 256 and 512-bit integers
+
+`u256`, `i256`, `u512` and `i512` are integers like the narrower widths: every
+operator applies at run time, and conversions to and from every other integer
+width follow the same rules. Size and alignment are mirl's layout of the width
+on the target, and code generation is mirl's legalisation of the width over
+the target's registers. A target whose layout holds no such width refuses the
+type where it is laid out.
+
+Constants at these widths are held in 128 bits:
+
+- No literal suffix names them, and a literal or constant of one of them
+  reaches what an `i128` holds: `-2^127` to `2^127 - 1` for `i256` and `i512`,
+  and `0` to `2^127 - 1` for `u256` and `u512`. A literal outside that range is
+  refused with `const.out_of_range`. A signed one extends to the full width by
+  its sign.
+- Comptime evaluation reads a value of one of them as an untyped integer, exact
+  to 128 bits, with any overflow past that refused.
+
+`u1` is the truth value: one byte holding 0 or 1, with its layout read from mirl's
+row of the one-bit integer. Comparisons, `&&`, `||`, `!` and `sel` produce it, and a
+condition requires it. It has `&`, `|`, `^`, `==` and `<` but no arithmetic, so it stays
+0 or 1. Arithmetic and `~` on a `u1` are refused with `type.mismatch`, and a
+condition of any other type with `condition.type`. `x::u1` asks whether the
+integer `x` is non-zero. A float cast to `u1` is refused with `cast.invalid`, so
+a float is compared instead (`x != 0.0`). There is no `i1`.
+
+There is no compiler `bool`. `bool` is a stdlib alias, `def bool: u1;`, with `true` /
+`false` as stdlib `val`s (`1` / `0`), see [def.md](def.md).
 
 ## SIMD vectors
 
 A vector type is a **form**, not a fixed list: any primitive numeric element
 followed by `x` and a lane count.
 
-On a 128-bit target the spellings this currently accepts are:
+On a 128-bit target the spellings that fill one vector register are:
 
 ```mach fragment
 f16x8  f32x4  f64x2             # float lanes
@@ -128,7 +173,7 @@ u8x16  u16x8  u32x4  u64x2      # unsigned integer lanes
 ```
 
 The spelling is `<u|i|f><width>x<count>` with a **single** `x`. A name like
-`f32x4x4` is not a vector type (it resolves as an ordinary identifier); a matrix
+`f32x4x4` is not a vector type (it resolves as an ordinary identifier). A matrix
 is an algorithm over vectors and belongs in a library over vector elements, not
 the language.
 
@@ -140,9 +185,9 @@ val f32x4: i64 = 7; # fine: values are a different position
 ```
 
 A **type** may not. `rec`, `uni`, `tag`, `def` and a generic parameter reject a name
-spelled as a vector form, because a type declared with a vector's name would be
-silently unreachable:
-every use in type position resolves to the vector instead:
+spelled as a vector form with `decl.vector_spelled_name`, because a type declared
+with a vector's name would be silently unreachable. Every use in type position
+resolves to the vector instead:
 
 ```mach error is spelled as a vector type
 rec f32x3     { x: f32; } # error: `f32x3` is spelled as a vector type
@@ -152,23 +197,24 @@ tag f32x4: u8 { empty; } # error: `f32x4` is spelled as a vector type
 This holds for any well-formed spelling, so the name cannot be claimed by a type
 and then collide with the vector it spells.
 
-Two rules bound the form, and **neither depends on the target**:
+Two rules bound the form, and **neither depends on the target**. Each is refused
+with `vector.invalid_type`, as is a lane type outside the lane rule below:
 
-- **At least 2 lanes.** `f32x1` is refused; a one-lane vector is just its scalar.
+- **At least 2 lanes.** `f32x1` is refused. A one-lane vector is just its scalar.
 - **At most 65535 lanes.** A compiler limit, not a machine one: the lane count is
   carried as a 16-bit field through code generation.
 
 Everything else is legal at every width. `f32x3` is 96 bits, `f32x8` is 256, and
-both compile on every target — including one with no vector unit at all.
+both compile on every target, including one with no vector unit at all.
 
 **Width is a realization question, not a legality one.** How a shape is realized
-does depend on the target, and there are three answers: one packed instruction
-when the shape fits a vector register and the operation has a packed form; one
-packed instruction per register-width piece when the shape is wider than the
-register; and per-lane scalar code where the operation has no packed form for the
+does depend on the target, and there are three answers. A shape that fits a
+vector register is one packed instruction where the operation has a packed form.
+A shape wider than the register is one packed instruction per register-width
+piece. Per-lane scalar code serves where the operation has no packed form for the
 lane shape, or on a target with no vector unit (rv64gc today). All three
-compute identical lanes — the expansion is a fixed unroll, never a reassociation
-— so only performance varies. The `simd` manifest lever (see
+compute identical lanes (the expansion is a fixed unroll, never a reassociation),
+so only performance varies. The `simd` manifest lever (see
 [manifest.md](manifest.md)) reports or refuses the scalar cases if a project
 cannot afford them.
 
@@ -181,12 +227,14 @@ shift, a conversion that keeps its lanes in place) runs on each piece. One that
 moves lanes between pieces has its own lowering over the pieces: a range
 `v[start, count]` reads the pieces it crosses and joins them, a widening
 conversion or multiply writes each half of a source piece into its own result
-piece (`i16x8 → i32x8` is `pmullw`/`pmulhw` with `punpcklwd`/`punpckhwd` on
+piece (`i16x8` to `i32x8` is `pmullw`/`pmulhw` with `punpcklwd`/`punpckhwd` on
 x86-64, and `smull` with `smull2` on aarch64), and a narrowing one joins the
 narrowed lanes of its pieces. A reduction written over the lanes reads each lane
 from its piece. An operation with no packed form for the lane shape (a 64-bit
-lane multiply on x86-64) runs lane by lane on each piece, and under
-`simd = "scalarize"` it warns at its site while `simd = "require"` refuses it.
+lane multiply on x86-64) runs lane by lane on each piece, and a build with debug
+information warns at its site (`vector.scalarize`), or every build refuses it
+under `simd = "require"` (see
+[operators.md](operators.md#legality-is-target-independent-realization-is-not)).
 
 The piece width is the target's **declared** vector width, not its name, so a
 target that gains wider vector registers gets **better code**, not new
@@ -210,26 +258,25 @@ way the target realizes the shape:
 
 | target | `f16` lane arithmetic | `f16` lane comparisons |
 |---|---|---|
-| aarch64 with `fp16` | packed `.8h` and `.4h` instructions | packed `.8h` and `.4h` compares |
-| aarch64 without `fp16` | each lane's scalar `f16` operation | the lanes widened to `f32` (`fcvtl`) and compared there |
-| x86-64 with `f16c` (`x86-64-v3` and up) | four lanes at a time widened to `f32` lanes (`vcvtph2ps`), computed there and narrowed back (`vcvtps2ph`) | four lanes at a time widened to `f32` lanes and compared there |
-| x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
-| riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
-| spirv with `float16` | the core float instructions on an `f16` vector | the same |
-| spirv without `float16` | each lane's scalar `f16` operation | each lane's scalar comparison |
+| aarch64, x86-64, riscv64, riscv32 | each lane widened to `f32` as integer code on its encoding, computed by the scalar `f32` operation and narrowed back, with or without `fp16` or `f16c` | each lane widened to `f32` and compared there by the scalar comparison |
+| spirv with `Float16` | the core float instructions on an `f16` vector | the same |
+| spirv without `Float16` | the lanes widened to `f32` lanes as integer code on their encodings, computed there and narrowed back, at the vector's width | the lanes widened to `f32` lanes and compared there |
 
-A lane's scalar operation is the target's own half instruction where it has one
-and the inline expansion otherwise (see
-[operators.md](operators.md#half-precision-arithmetic)). On aarch64 the
-conversions between `f16` and `f32` lanes are packed (`fcvtl`, `fcvtn`) with or
-without `fp16`. A comparison makes no NaN and every widening is exact, so
-comparing in `f32` lanes gives the scalar mask. x86-64 has no packed `f16`
-arithmetic below AVX-512 FP16, and the AVX-512 FP16 rows are #4159.
+The widening and narrowing are the inline expansion (see
+[operators.md](operators.md#half-precision-arithmetic)), so no register target
+emits a half instruction or a packed conversion (`fcvtl`, `vcvtph2ps`) for a
+lane. A comparison makes no NaN and every widening is exact, so comparing in
+`f32` gives the scalar mask. x86-64 has no packed `f16`
+arithmetic below AVX-512 FP16, and mach does not emit AVX-512 FP16.
 
 ### Size and alignment
 
-`$size_of` is **lane-derived**: `lanes × element size`, packed, with no padding
-at any width.
+`$size_of` is **lane-derived**: the lanes are packed, `lanes x element size`
+bytes, and that extent is rounded up to a multiple of `$align_of`, as every
+type's size is. A vector that aligns to a single lane has no padding, so
+`f32x3` is 12 bytes. One that aligns to a register width is padded when its
+lanes are not a multiple of that width: `f32x5` holds 20 bytes of lanes, aligns
+to 16 and is 32 bytes.
 
 | type | `$size_of` | `$align_of` |
 |---|---|---|
@@ -239,22 +286,24 @@ at any width.
 | `f32x3` | 12 | 4 |
 | `f32x4` | 16 | 16 |
 | `i16x4` | 8 | 2 |
-| `f32x5` | 20 | 16 |
+| `f32x5` | 32 | 16 |
 | `f32x8` | 32 | 16 (32 where the target's vector register is 256 bits) |
+| `i32x9` | 48 (64 where the register is 256 bits) | 16 (32 there) |
 
 `$align_of` has **two rungs, each for its own reason**. A vector *narrower* than
 the vector register is a packed aggregate that loads piecewise, so it aligns to a
 single lane. One that *fills* the register aligns to its whole size, because the
 machine's vector load requires it. One *wider* than the register is split into
 register-width pieces, each loaded and stored on its own, so it aligns to the
-register width — 16 for `f32x8`, not 32, because each piece is one 16-byte load
+register width (16 for `f32x8`, not 32), because each piece is one 16-byte load
 and a larger alignment would serve none of them.
 
 The register is the widest the target's selected extensions give it. On x86-64
 with `avx` it is the 32-byte `ymm`, and a vector aligns to the widest register it
 fills: 32 for `f32x8`, `i32x8` and every wider vector, 16 for `f32x4` and for a
-20- or 24-byte vector, and a lane for one narrower than 16 bytes, as C aligns
-`__m256` and `__m128`.
+vector of 20 to 31 bytes of lanes (which is then 32 bytes in size), and a lane
+for one narrower than 16 bytes, matching the psABI alignment of `__m256` and
+`__m128`.
 
 The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
 `f32x3` to 16 bytes would make it indistinguishable from `f32x4` in memory.
@@ -262,8 +311,9 @@ The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
 Arrays of vectors (`[4]f32x4`) and pointers to vectors (`*f32x4`) are ordinary
 composite types over a vector element.
 
-**Literals** are full-arity — one initializer per lane, mirroring array literals.
-The lane count must match exactly; too few or too many lanes is a compile error.
+**Literals** are full-arity: one initializer per lane, mirroring array literals.
+The lane count must match exactly. Too few or too many lanes is refused with
+`vector.literal_length`.
 
 ```mach fragment
 val v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
@@ -292,8 +342,9 @@ The load is one unaligned vector load and the store one vector store (`movups` o
 x86-64), with no array value in between, so any element offset is valid. Nothing
 requires `i` to be a multiple of the lane count. `::` between an array and a
 vector is type-checked like every other `::`: the element type and the count must
-be the same on both sides, so `[4]i32` does not convert to `f32x4` and `[8]i16`
-does not convert to `i32x4`. The range and the conversion are described with the
+be the same on both sides, so `[4]i32` does not convert to `f32x4`
+(`cast.vector_element`) and `[8]i16` does not convert to `i32x4`
+(`cast.vector_shape`). The range and the conversion are described with the
 index and cast operators in [operators.md](operators.md#range).
 
 **The reinterpret is the bit-level view.** `@((?A[i]):~*f32x4)` reads the sixteen
@@ -314,13 +365,14 @@ val hi: i32x4 = v[4, 4]::i32x4;         # widen the high half
 Where the target packs the lane-halving extension (x86-64, aarch64) each line is
 that one instruction, signed or unsigned by the source lanes, and elsewhere it is the
 lane path. A vector range's start is a comptime constant, as a lane index is, and
-it takes at least 2 lanes (one lane is `v[i]`).
+it takes at least 2 lanes (one lane is `v[i]`). A one-lane range is refused with
+`vector.range_width`.
 
 **Lane access** `v[i]` reads or writes a single lane. The index must be a
-comptime constant in `[0, lanes)`; a dynamic (runtime) lane index is not
-supported in this increment. The bound is the same compile-time rule an array
-gets, reported the same way — `v[4]` on a `u32x4` is `index 4 is out of bounds
-for `u32x4` of length 4`.
+comptime constant in `[0, lanes)`. A dynamic (runtime) lane index is not
+supported in this increment and is refused with `vector.lane_index_dynamic`. The
+bound is the same compile-time rule an array gets, reported the same way:
+`v[4]` on a `u32x4` is `index 4 is out of bounds for `u32x4` of length 4`.
 
 ```mach fragment
 var v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
@@ -328,16 +380,17 @@ val x: f32 = v[0];              # read lane 0
 v[3] = 9.0;                     # write lane 3
 ```
 
-There are no scalar↔vector casts in this increment: neither an implicit
-scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. Between
+There are no casts between a scalar and a vector in this increment: neither an
+implicit scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. Between
 two vectors with the same lane count, `::` converts each lane with the scalar
 rule (a lane of `-7` becomes `-7.0` in `i32x4::f32x4`), and `:~` reads the
 bits of any vector of the same byte size. The lane-wise operators and the
 comparison-to-mask rule are in [operators.md](operators.md), including the
 shifts, whose two forms are `vec << vec` and `vec >> vec` with a count of the
 same shape (a uniform count is the same count in every lane of a literal,
-`v >> u32x4{k, k, k, k}`, never a scalar); what a target
-without hardware SIMD does with a vector operator is the `simd` profile lever ([manifest.md](manifest.md),
+`v >> u32x4{k, k, k, k}`, and a scalar count is refused with
+`vector.shift_count`). What a target without hardware SIMD does with a vector
+operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
 ## Handles
@@ -350,7 +403,7 @@ The language knows only the machinery. A handle is a **bodyless `def`** carrying
 operands each takes, and what an operand means all belong to the named target:
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, "2D", 0, 0, 0, 1, "Unknown")]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -365,52 +418,75 @@ promises no fields and no storage, which is exactly what a handle is. There is n
 body because the target supplies the definition.
 
 The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
-order: the texel scalar (`0` `f32`, `1` `i32`, `2` `u32`, `3` `i64`, `4` `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
-`Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
-a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
-image, read and written directly and bound through `#[storage]` (see
+order: the texel scalar, written as the type itself (`f32`, `i32`, `u32`, `i64` or `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
+`Image Format`, then the optional `Access Qualifier`. An operand SPIR-V defines as an
+enumerant, `Dim`, `Image Format` and `Access Qualifier`, is written as the string
+SPIR-V's grammar names it by, such as `"2D"`, `"Cube"`, `"Unknown"` or `"Rgba8"`, and a
+name the grammar does not state is refused with the names it does. `Depth`,
+`Arrayed`, `MS` and `Sampled` are numbers. The format is required, and `"Unknown"` is
+the usual choice for a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
+image, read and written directly and bound through `#[gpu.storage]` (see
 [decorators.md](decorators.md)). A storage image of a known format needs no device
 feature to read or write, and a format other than `Rgba32f`, `Rgba16f`, `R32f`,
 `Rgba8`, `Rgba8Snorm` and the `Rgba32`, `Rgba16`, `Rgba8` and `R32` integer forms
 declares `StorageImageExtendedFormats`. An `Unknown` storage image is read and
 written under `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat`,
 which `vulkan1.3` accepts and an earlier `env` accepts only with the
-`storage_read_without_format` and `storage_write_without_format` extensions (see
+`StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` extensions (see
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
-format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit texels,
+format as `i32` and an unsigned one as `u32`, `R64i` as `i64` and `R64ui` as `u64`
+(Vulkan's image format and type matching, `VUID-StandaloneSpirv-Image-04965`). Each
+format's number and component count is masc's typing data, which the target's handle
+catalog reads, and a declaration whose texel scalar is not its format's number is refused
+with `handle.arguments`, naming the format operand. A module declares its integer types without
+signedness, except the `Sampled Type` of an image of signed texels, which is a signed
+integer: one of a signed integer format, or one of `Unknown` format whose texel scalar is
+`i32` or `i64`, so every access to its texels is signed as Vulkan requires (the
+signedness of an access is its image's `Sampled Type`'s where it sets neither `SignExtend`
+nor `ZeroExtend`), in every `env`. Each texel the instruction reads or writes, or an
+atomic reaches through a texel pointer, is that signed integer, reinterpreted from or to
+the `i32` the program holds. `R64ui` and `R64i` hold 64-bit texels,
 the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
-`image_int64_atomics` extension.
+`Int64ImageEXT` and `SPV_EXT_shader_image_int64` extensions.
 
 `Depth` `1` is a **depth image**, the shadow map a depth comparison samples, and
 `0` any other. Only a depth image is sampled by the `OpImage*Dref*` comparisons
 (see [decorators.md](decorators.md)), and it is read without one like any other
 image. Vulkan places no `Depth` constraint on a storage image, so a storage image
 may declare `1` too, though no comparison reads it: a comparison samples through a
-sampler. `2`, which states no indication either way, is refused.
+sampler. `2` states no indication either way, which SPIR-V's `OpTypeImage` admits and
+Vulkan places no rule on, so it is accepted, and a comparison reads it as it reads a
+depth image, since a comparison asks only that `Depth` is not `0`.
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, "2D", 1, 0, 0, 1, "Unknown")]
 pub def ShadowMap;
 
 #[handle("spirv", "sampled_image", ShadowMap)]
 pub def ShadowSampler;
 ```
 
-`MS` `1` is a **multisampled** image, which only a `2D` image is, arrayed or not:
-it is refused on `1D`, `3D`, `Cube` and `Buffer`. A multisampled image is never
-sampled, so a `sampled_image` cannot compose over one, and its texels are read per
-sample with the `Sample` image operand (see [decorators.md](decorators.md)). A
+`MS` `1` is a **multisampled** image. SPIR-V's `OpTypeImage` places no rule on which
+`Dim` holds one, and states each multisample rule on the instruction that reads the
+image, so each is refused at the call with `op.operand_value`: a sample, a gather and a
+level-of-detail query take only an image whose `MS` is `0`, `OpImageQuerySamples` only a
+`2D` one whose `MS` is `1`, and a fetch or read of one takes the `Sample` image operand
+(see [decorators.md](decorators.md)). A `sampled_image` may compose over one, which
+`OpImageFetch` then reads through `OpImage`, though no sampling instruction takes it. A
 multisampled sampled image needs no capability. A multisampled storage image
-declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, under
-the `storage_image_multisample` extension.
+declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, each
+under the extension of its name: Vulkan's `shaderStorageImageMultisample` enables
+both, so a target whose consumer enables it names both.
 
-The operands are ordinary comptime constants. One position is not: a constructor
-that composes over another handle takes a **type name**, so `Sampler2D` names the
-image it wraps rather than restating that image's operands and cannot disagree with
-it. That is the only place a decorator argument is read as a type.
+The operands are ordinary comptime constants, except where the constructor's part
+takes a **type name**. An image's texel scalar is the scalar itself (`f32`) or an
+alias of it, and a constructor that composes over another handle names that handle,
+so `Sampler2D` names the image it wraps rather than restating that image's operands
+and cannot disagree with it. These are the only places a decorator argument is read
+as a type, and a name there that is neither a scalar nor a handle is refused.
 
-Every rule a handle carries follows from the one fact the directive states, and the
+Every rule a handle carries follows from the one fact the decorator states, and the
 set is fixed and closed rather than varied per declaration:
 
 - no fields, no indexing, no construction
@@ -419,6 +495,9 @@ set is fixed and closed rather than varied per declaration:
 - it cannot sit behind a pointer or inside an array
 - it reaches an operation only by being passed to one, bound as a descriptor
 - its extent is declared by the owning target
+
+A handle declared as a local binding, a record or union field, an array element
+or behind a pointer to a pointer is refused with `handle.storage`.
 
 A generic function takes a handle as a type argument, and each instance is held to
 these rules as the same function written out would be: the handle is passed by value,
@@ -433,18 +512,44 @@ every annotation (a parameter, a result, a local, a field or a type argument), s
 the inner pointer would be one the program stores and may reassign, so the handle
 would trace to no binding.
 
-`$size_of` a handle is the target's pointer size: it is a name for a resource, and
-a pointer is the shape every target already has for that. On a target that mints no
-such type the declaration is **inert**: it still denotes a type and still sizes, and
+`$size_of` a handle is the target's pointer size, and `$align_of` its alignment: it is
+a name for a resource, and a pointer is the shape every target already has for that, so
+a handle sizes as `ptr` does on the same build. On SPIR-V that is the physical pointer's
+8 bytes where the target selects `PhysicalStorageBufferAddresses`, as `vulkan1.3` and no
+`env` do, and under logical addressing alone, where a pointer has no size, `$size_of` a
+handle is refused with `spirv.unsupported` as `$size_of(ptr)` is. On a target that mints
+no such type the declaration is **inert**: it still denotes a type and still sizes, and
 an operation over it is an undefined symbol at link.
 
-A target refuses an operand combination its constructor spells but it cannot emit,
-naming the operand rather than the declaration. The SPIR-V target refuses a
-`Depth` other than `0` or `1`, an `MS` other than `0` or `1`, a `Dim` past `Cube`
-other than `Buffer`, and a `Sampled` other than `1` or `2`, each with what SPIR-V
-would need instead.
+An `image` of `Dim` `SubpassData` is a **subpass input**, which reads the attachment a
+previous subpass wrote at the fragment's own place. It is declared with `Sampled` `2`,
+the `Unknown` format and `Arrayed` `0`, its `MS` matching the attachment's samples, and
+a module binding of one carries `#[gpu.storage(set, binding)]` and
+`#[gpu.attachment(index)]`, the input attachment it reads. It is read by `OpImageRead`
+at the coordinate (0, 0), from a fragment stage alone (see
+[gpu.md](gpu.md#gpuattachmentindex-and-subpass-inputs)):
 
-See [decorators.md](decorators.md) for `#[handle]` and `#[sampler(set, binding)]`,
+```mach fragment
+#[handle("spirv", "image", f32, "SubpassData", 0, 0, 0, 2, "Unknown")]
+pub def SubpassInput;
+
+#[gpu.storage(0, 0)] #[gpu.attachment(0)] var albedo: SubpassInput;
+```
+
+A target refuses an operand combination its constructor spells but it cannot emit,
+naming the operand rather than the declaration, with `handle.arguments`. The SPIR-V
+target's handle catalog refuses a `Depth` other than `0`, `1` or `2`, an `MS` or
+`Arrayed` other than `0` or `1`, a `Dim` the grammar does not state, a `Sampled` other
+than `1` or `2` (Vulkan's `VUID-StandaloneSpirv-OpTypeImage-04657`), a texel scalar that
+is not its format's number, a `SubpassData` image whose `Sampled` is not `2`, whose format
+is not `Unknown` (SPIR-V 1.6, `OpTypeImage`) or whose `Arrayed` is not `0`
+(`VUID-StandaloneSpirv-OpTypeImage-06214`), and a `sampled_image` over an image whose
+`Sampled` is not `1` (`VUID-StandaloneSpirv-OpTypeSampledImage-06671`), or, where the
+target's version is SPIR-V 1.6 or later, as `vulkan1.3` and no `env` are, over an image of
+`Dim` `Buffer` (SPIR-V 1.6, `OpTypeSampledImage`), the refusal naming the version. A texel
+buffer is read with `OpImageFetch` of the image itself.
+
+See [decorators.md](decorators.md) for `#[handle]` and `#[gpu.sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.
 
 ## ABI types
@@ -460,7 +565,7 @@ pub def VaList;
 
 It exists for the one C type that has no correct spelling in mach source.
 `va_list` is a plain pointer on System V x86-64, Apple arm64, Microsoft x64 and
-RISC-V lp64d, and a 32-byte 8-aligned composite under AAPCS64 — so `ptr` binds
+RISC-V lp64d, and a 32-byte 8-aligned composite under AAPCS64, so `ptr` binds
 correctly on four platforms and silently corrupts on the fifth, where the psABI
 passes the composite indirectly with the caller owning the copy.
 
@@ -478,8 +583,11 @@ What a program may do with one is bounded to the opposite end from a handle's:
 - it cannot be a local binding, a global, or a record or union field
 - it cannot sit behind a pointer or inside an array
 
-Reading one needs `va_arg`, which mach has no callee shape for: mach has no runtime
-variadics, so nothing walks its own argument tail. `$size_of` and `$align_of`
+Each use the list forbids is refused with `abi_type.opaque`, and a name other
+than `va_list` with `abi_type.unknown`.
+
+Reading one needs `va_arg`, and no mach function walks its own argument tail:
+variadics are a C FFI form and a comptime pack, never a runtime callee shape. `$size_of` and `$align_of`
 answer with the target's declared numbers, which are published psABI facts rather
 than anything about a value.
 
@@ -492,7 +600,7 @@ See [ext-fun.md](ext-fun.md) for the binding recipe and
 
 ## Pointer
 
-`*T` — pointer to a value of type `T`.
+`*T` is a pointer to a value of type `T`.
 
 ```mach fragment
 var x: i64;
@@ -505,6 +613,10 @@ Immutability is a property of the binding (`val`), and volatility is a property
 of a declared record, union or tag (`#[volatile]`, see
 [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)),
 so an access through `*T` is volatile exactly when `T`'s storage is.
+
+`ptr` is an address with no pointee type. Nothing is read or written through it:
+a dereference, an index or a member access on a `ptr` is refused with
+`ptr.untyped_access`. Cast it to a typed pointer (`p::*u64`) first.
 
 ### Pointers on SPIR-V
 
@@ -526,10 +638,10 @@ the storage class of every pointer on that target.
 ```mach fragment
 rec Node { next: *Node; value: u32; }
 rec Head { first: *Node; total: u32; }
-#[storage(0, 0)] var head: Head;
+#[gpu.storage(0, 0)] var head: Head;
 
-#[stage("compute")]
-#[workgroup(1, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(1, 1, 1)]
 fun walk() {
     var p:   *Node = head.first;
     var sum: u32   = 0;
@@ -543,36 +655,100 @@ fun walk() {
 
 A physical pointer is a full `*T`. It is dereferenced, indexed, stepped (`?p[i]`),
 compared, ordered as an unsigned 64-bit address and cast to and from `u64`, and it
-can be held in memory, passed and returned. Its pointee is laid out by the std430
-rules a `#[storage]` block follows (see [decorators.md](decorators.md)), refused
-where mach's layout disagrees with them. A record that reaches itself through
+can be held in memory, passed and returned. Comparing, ordering, casting and adding
+a byte offset read the address as the `u64` it is, so they need `Int64` as any `u64`
+does. The rest need nothing past `PhysicalStorageBufferAddresses`. Its pointee is
+laid out by the std430 rules a `#[gpu.storage]` block follows (see [decorators.md](decorators.md)), relaxed
+for vectors where the environment states relaxed block layout, and refused with
+`spirv.interface` at the first access that reaches it where mach's layout disagrees with them. A record that reaches itself through
 pointers, like `Node` above, is a recursive type, and so is a set of records that
-reach each other. A tag cannot sit behind a physical pointer.
+reach each other. A tag behind one is held as it is in a storage buffer, its
+discriminant first and its payload as its largest case. An 8- or 16-bit scalar or an `f16`
+behind one needs the storage feature of its width, as in a storage buffer, and the width's own
+feature (`Int8`, `Int16` or `Float16`) as well, since the module makes the pointer to it with
+`OpBitcast`, and the storage features make a pointer to such a type only as the result of a
+variable or an access chain (SPIR-V 2.16.1, "Data rules").
 
 Every load and store through a physical pointer carries the pointee's alignment, so
 an address made from an integer must be aligned for the type it points at. An atomic
 through one takes no memory operands and carries no alignment, so its address is held
 to the same rule, and the semantics passed to it name its memory `UniformMemory`, as
-on a storage buffer. A 64-bit or float atomic needs the `buffer_*` feature of its
-operation (see [decorators.md](decorators.md)). Every
-variable and parameter holding one is decorated aliased, since mach makes no
-promise that two pointers do not overlap. Accesses through one are private under
-the Vulkan memory model: no `"coherent"` qualifier reaches device memory.
+on a storage buffer. A 64-bit or float atomic needs the capability of its
+operation (see [gpu.md](gpu.md)). The module holds a physical pointer as its
+address, two 32-bit words with the low one first, in memory, in a variable, as a
+parameter and as a result, and makes a `PhysicalStorageBuffer` pointer of it with
+`OpBitcast` at each access, since a `PhysicalStorageBuffer` pointer has no null
+constant for `nil`. So no variable or parameter holds a SPIR-V pointer to decorate,
+and mach makes no promise that two pointers do not overlap. Accesses through one
+are private under the Vulkan memory model: no `"coherent"` qualifier reaches device
+memory.
 
 A register that one path makes logical and another physical is refused, as is
 every operation a logical pointer has no form for, each naming why. Physical
-pointers need the `buffer_device_address` device feature (see
+pointers need the `PhysicalStorageBufferAddresses` device feature (see
 [manifest.md](manifest.md#finished-module-targets)). A module that holds no physical
 pointer keeps the Logical addressing model and is unchanged by them.
 
 ## Array
 
-`[N]T` — array of exactly `N` values of type `T`. Nested: `[N][M]T`.
+`[N]T` is an array of exactly `N` values of type `T`. Nested: `[N][M]T`.
 
 ```mach
 val a: [4]i64    = [4]i64{1, 2, 3, 4};
 val g: [2][2]i64 = [2][2]i64{[2]i64{1, 2}, [2]i64{3, 4}};
 ```
+
+An array of `u8` is also initialized by a string literal, which holds its bytes
+and nothing else, so a terminator is stored only when written:
+
+```mach fragment
+val A: [3]u8    = "abc";                       # 61 62 63
+val B: [4]u8    = "abc\0";                     # 61 62 63 00
+val C: [4]u8    = "abc";                       # error: the string literal holds 3 bytes and the array 4
+val P: [2][3]u8 = [2][3]u8{"abc", "def"};
+```
+
+The literal's byte count must be the array's length, and the element must be
+`u8` or an alias of it. The same literal bound to `*u8` stores a terminator
+after its bytes, so `"abc"` is 4 bytes there and 3 in `[3]u8`. See
+[literals.md](literals.md#string).
+
+An array aligns to its element. A module `val` or `var` of array type also takes
+the floor its target's `abi` states for a global array variable: `sysv64` and
+`basic` align one of at least 16 bytes to 16, `aapcs64win` aligns
+one of at least 2, 8 and 64 bytes to 4, 8 and 16, and the other conventions
+state none. The floor never lowers an alignment, `#[align]` raises it further,
+and it leaves local arrays, the anonymous data of literals and a global `#[at]`
+places as they are.
+
+### Inferred length `[_]T`
+
+`[_]T` leaves the length for an array literal to give. It is legal only
+where an array literal of known element count fixes it: the literal's own
+type spelling, and the annotation of a `val` or `var` initialized by one. The
+length is the literal's element count, the same count `array.literal_length`
+checks. A string literal initializing a `val` or `var` gives its byte count
+the same way, after escapes and with no terminator unless one is written.
+
+```mach fragment
+val NAMES: [_]str = [_]str{"a", "b", "c"};   # [3]str
+val K:     [_]u8  = [2]u8{1, 2};              # [2]u8
+val S:     ^[_]u8 = [2]u8{1, 2};              # ^[2]u8
+val GRID:  [_][2]u8 = [_][2]u8{[2]u8{1, 2}, [2]u8{3, 4}}; # [2][2]u8
+val D:     [_]u8  = "abc";                    # [3]u8
+val Z:     [_]u8  = "abc\0";                  # [4]u8
+```
+
+Every other `[_]` is refused with `array.inferred_length`: a parameter, a field,
+a result, a `var` with no initializer, an initializer that is not an array or
+string literal, and a `[_]` nested in another type, whether as the element of an array
+(`[_][_]T`, `[3][_]T`) or behind a pointer (`*[_]T`). A `val` or `var`
+annotation may wrap the `[_]` in a secret (`^[_]T`), since an array length is public.
+Only the outermost length is inferred, since one literal counts only its own
+elements. An `#[embed]` declaration takes its length from the file instead (see
+[decorators.md](decorators.md#embedstr--compile-time-file-embedding)). The
+inferred type is an ordinary `[N]T`, so a generic body, a comptime `val` and a
+secret element type (`[_]^T`) behave as the written length would.
 
 **Constant indices are bounds-checked at compile time.** `N` is part of the
 type, so an index the compiler can fold must land in `[0, N)`:
@@ -582,7 +758,7 @@ fun read() i32 {
     var xs: [4]i32;
     val a:  i32 = xs[3]; # ok
     val b:  i32 = xs[4]; # error: index 4 is out of bounds for `[4]i32` of length 4
-    val c:  i32 = xs[-1]; # error: index -1 is out of bounds ...
+    val c:  i32 = xs[-1]; # error: index -1 is out of bounds for `[4]i32` of length 4
     ret a + b + c;
 }
 ```
@@ -594,12 +770,15 @@ same way. It is exactly the length `$length_of` reports
 ([comptime-intrinsics.md](comptime-intrinsics.md)), and a vector's lane count
 takes the identical rule.
 
-Only a **constant** index is checked. A runtime index is not, and a pointer is
-not indexed against any length at all — `*T` carries none.
+An index out of bounds is refused with `index.out_of_bounds`, and a range with
+`range.out_of_bounds`. Only a **constant** index is checked. A runtime index is
+not, and a pointer is not indexed against any length at all, since `*T` carries
+none.
 
 **A range** `x[start, count]` is `count` consecutive elements from `start`, as a
 `[count]T` value, over an array or through a pointer. `count` is a comptime
-constant of at least 1, and `start` is any index. A constant `start` is checked the
+constant of at least 1 (a count of 0 is refused with `range.count_invalid`), and
+`start` is any index. A constant `start` is checked the
 way a constant index is, against the whole range: `start + count` may reach `N`
 and may not pass it.
 
@@ -614,13 +793,14 @@ fun window() i32 {
 
 A range is also an assignment target, storing `count` elements from `start`: the
 stored value's type is exactly `[count]T`. A range read is a value, not a view:
-`?xs[0, 2]` is an error, and writing into a range (`xs[0, 2][1] = 3`) is too. With
+`?xs[0, 2]` is an error (`address.temporary`), and writing into a range
+(`xs[0, 2][1] = 3`) is too (`assign.not_place`). With
 `::` to a vector of the same shape it is the vector load and store in
 [SIMD vectors](#simd-vectors).
 
 ## Function type
 
-`fun(T1, T2) R` — first-class function-pointer type.
+`fun(T1, T2) R` is a first-class function-pointer type.
 
 ```mach
 use std.print;
@@ -640,6 +820,15 @@ fun main(argc: i64, argv: **u8) i64 {
     ret 0;
 }
 ```
+
+### Function pointers on WebAssembly
+
+A wasm module has no code addresses, so a function's address is its slot in the
+module's indirect call table, and a call through a `fun(...)` value is a call
+through that slot. Slots start at 1, one for each function whose address the program
+takes. Two function values are equal when they name the same slot, and they order
+as the unsigned slot numbers, which carry no meaning beyond that. An address of a function at an offset
+has no slot and is refused.
 
 ## Record and union types
 
@@ -668,7 +857,7 @@ other declaration (`use std.types.result.res;`):
 - `err[E]` is an outcome with error case `err: E` first and payloadless success `ok` second
 
 `err[E]` is not an alias of `opt[E]`. There are no defaulted generic
-arguments, no general type inference and no dummy success types; the compiler
+arguments, no general type inference and no dummy success types. The compiler
 has no knowledge of the three names, so a module that imports none of them
 cannot spell them, and a module may declare its own.
 
@@ -686,6 +875,6 @@ case test and the lexical payload guards are in [tag.md](tag.md).
 
 ## See also
 
-- [secrecy.md](secrecy.md) — the `^` secret qualifier over any of these types
-- [operators.md](operators.md) — what operations work on each type
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`
+- [secrecy.md](secrecy.md): the `^` secret qualifier over any of these types
+- [operators.md](operators.md): what operations work on each type
+- [comptime-intrinsics.md](comptime-intrinsics.md): `$size_of`, `$align_of`
