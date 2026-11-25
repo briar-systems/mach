@@ -270,6 +270,7 @@ pub fun request(
     normal_object: *NormalObject,
     shared_artifact: bool,
     debug: bool,
+    directory: mach.base.intern.StrId,
     standalone: bool,
     checks: bool,
     diags: *mach.base.diagnostic.DiagnosticStore,
@@ -296,6 +297,7 @@ a lowering request for one module, checked for every reader and table it needs
 | `normal_object` | nil for the normal object, what it defines for the test object |
 | `shared_artifact` | whether the artifact fed is a shared library |
 | `debug` | whether debug information is kept |
+| `directory` | the directory the build runs in, absolute |
 | `standalone` | whether the objects are an archive's members |
 | `checks` | whether runtime checks are emitted |
 | `diags` | the diagnostic store |
@@ -633,6 +635,7 @@ pub rec LowerRequest {
     # exports nothing is worth a warning
     shared_artifact: bool;
     debug:           bool;
+    directory:       mach.base.intern.StrId;
     # the objects are an archive's members, which a link takes only some of, so each
     # describes every type it names (see debug_describe)
     standalone: bool;
@@ -655,6 +658,7 @@ the fields not listed here are described in place
 | `malloc` | `*std.allocator.Allocator` | the allocator the unit's facts are held in |
 | `module` | `ModuleScope` | the scope of the module lowered |
 | `debug` | `bool` | whether debug information is kept |
+| `directory` | `mach.base.intern.StrId` | the directory the build runs in, which debug information names as the unit's compilation directory |
 | `checks` | `bool` | whether debug-profile runtime checks are emitted |
 
 ## LowerContext
