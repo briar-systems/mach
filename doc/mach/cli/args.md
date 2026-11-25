@@ -52,8 +52,6 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 | Constants | |
 | :--- | :--- |
-| [`EMIT_KIND_ASM`](#constants) | masc's listing of each module, beside its object |
-| [`EMIT_KIND_IR`](#constants) | mirl's text of each module, beside its object |
 | [`EMIT_KIND_OBJ`](#constants) | the objects, with no link |
 | [`EMIT_KIND_EXE`](#constants) | the linked artifact |
 | [`EMIT_ERROR`](#constants) | the refusal of an `--emit` value no product is named by |
@@ -125,7 +123,7 @@ what it sets over the profile it builds
 | `selectors` | `mach.manifest.select.Selectors` | the `-a`, `-t` and `-p` patterns and `--all` |
 | `overrides` | `mach.compile.request.Overrides` | everything else the command sets, typed |
 | `settings` | `Vector[mach.manifest.setting.Assignment]` | every `--set`, in argv order |
-| `emits` | `u8` | the EMIT_KIND_* bits `--emit` names, 0 when it is absent |
+| `emits` | `u8` | the EMIT_KIND_* bits `--emit` names besides the views, 0 when it names none |
 | `entry` | `EntryArgs` | what the command line states of an entry build |
 
 ### build_cli_invocation
@@ -435,10 +433,8 @@ any other failure is returned as given
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `EMIT_KIND_ASM` | `u8` | `1` | masc's listing of each module, beside its object |
-| `EMIT_KIND_IR` | `u8` | `2` | mirl's text of each module, beside its object |
-| `EMIT_KIND_OBJ` | `u8` | `4` | the objects, with no link |
-| `EMIT_KIND_EXE` | `u8` | `8` | the linked artifact |
+| `EMIT_KIND_OBJ` | `u8` | `1` | the objects, with no link |
+| `EMIT_KIND_EXE` | `u8` | `2` | the linked artifact |
 | `EMIT_ERROR` | `str` | `"--emit expects asm, ir, obj or exe"` | the refusal of an `--emit` value no product is named by |
 | `ARTIFACT` | `std.args.Flag` | `std_args.Flag{long: "artifact", short: 'a', value: "pattern", repeat: true, negatable: false, help: "select artifacts by name or glob (default: the default selection)"}` | `--artifact <pattern>`, `-a`, a selector |
 | `TARGET` | `std.args.Flag` | `std_args.Flag{long: "target", short: 't', value: "pattern", repeat: true, negatable: false, help: "which targets: a name or glob of the manifest's targets in a project, a <sys>-<arch> in an entry build (default: the host's)"}` | `--target <pattern>`, `-t`, a selector, or an entry build's target |

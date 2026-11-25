@@ -102,9 +102,9 @@ pub rec BuildUnit {
     out_dir: str;
     obj_dir: str;
     # the compiler-only state of the cell's output directory, `<out>/.cache`
-    cache_dir:    str;
-    ir_dir:       str;
-    asm_dir:      str;
+    cache_dir: str;
+    # the tree of each view of compile/view the build writes, "" for one it does not
+    view_dirs:    [compile_view.COUNT]str;
     test_dir:     str;
     link_inputs:  Vector[mach.target.input.Input];
     phases:       Vector[PhaseKind];

@@ -9,7 +9,7 @@ them, and `semantic_hash` digests the fields that decide what the build produces
 
 Source: [`src/compile/request.mach`](../../../src/compile/request.mach)
 
-Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.manifest.model`](../manifest/model.md).
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.view`](view.md), [`mach.manifest.model`](../manifest/model.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -79,8 +79,7 @@ a binary profile lever as the command line sets it
 pub rec Overrides {
     output:       *u8;
     work:         *u8;
-    emit_asm:     bool;
-    emit_ir:      bool;
+    views:        mach.compile.view.Set;
     verify:       bool;
     passes:       bool;
     dep_warnings: bool;
@@ -102,6 +101,7 @@ a lever or value left unset leaves the profile's
 | :--- | :--- | :--- |
 | `output` | `*u8` | the `-o` path, nil when absent |
 | `work` | `*u8` | the `-w` work directory, nil when absent |
+| `views` | `mach.compile.view.Set` | the views of each unit `--emit` names, written beside its object |
 | `optimize` | `Lever` | whether to optimize, or LEVER_PROFILE |
 | `debug` | `Lever` | whether to emit debug information, or LEVER_PROFILE |
 | `threads` | `u32` | the worker count, 0 for the host's |
@@ -232,9 +232,9 @@ pub rec BuildRequest {
     dep_warnings: bool;
     threads:      u32;
 
-    emit_ir:  bool;
-    emit_asm: bool;
-    out:      str;
+    # the views of each unit written beside its object (compile/view)
+    views: mach.compile.view.Set;
+    out:   str;
     # `-w`, the root manifest's work directory in place of its `[project].work`;
     # "" for none
     work: str;
