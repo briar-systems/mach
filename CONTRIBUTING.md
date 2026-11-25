@@ -12,21 +12,21 @@ where a new module goes.
 
 Mach is self-hosting, so building it needs an existing Mach compiler. Install
 the latest [release](https://github.com/briar-systems/mach/releases) for your
-host and put `mach` on `PATH`; CI seeds from the same archive
-(`.github/scripts/bootstrap.sh`, see [Fixpoint](#fixpoint)).
+host and put `mach` on `PATH`. CI seeds from the release named on the `seed=`
+line of `.github/scripts/bootstrap.sh` (see [Fixpoint](#fixpoint)).
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
 cd mach
-bash .github/scripts/seed-build.sh mach a
-./a dep pull .
+mach dep pull .
+mach build . -o a
 ./a build .
 ```
 
-A 6.x release reads only the previous manifest keys, so it builds `a` through
-`seed-build.sh` (see [Fixpoint](#fixpoint)), and `a` builds the compiler. It is
-written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe` on Windows. A
-default Linux x86_64 build writes `out/linux-x86_64/debug/bin/mach`.
+The release builds `a`, and `a` builds the compiler, so the compiler you run
+comes from this tree's own code generator. It is written to
+`out/<target>/<profile>/bin/mach`, or `bin/mach.exe` on Windows. A default
+Linux x86_64 build writes `out/linux-x86_64/debug/bin/mach`.
 
 
 ## Fixpoint
@@ -43,10 +43,9 @@ RUNNER_OS=Linux RUNNER_TEMP=$PWD/out/boot GITHUB_ENV=$PWD/out/boot/env \
     bash .github/scripts/bootstrap.sh --fixpoint
 ```
 
-The script installs the seed release named on the `seed` line of
-`.github/bootstrap-chain`, never whichever `mach` is on `PATH`, and walks the
-chain through each pinned mach commit. The last step builds `a` from your tree
-at the debug profile, so no older compiler's optimiser compiles it, `a` builds
+The script installs the release named on its `seed=` line, never whichever
+`mach` is on `PATH`. The seed builds `a` from your tree at the debug profile,
+so no older compiler's optimiser compiles it, `a` builds
 `b` at the profile on two threads, and `b` builds `c` at the profile on three,
 so the fixpoint also holds the output to being the same at every thread count.
 It fails when `cmp b c` differs and
@@ -54,6 +53,10 @@ otherwise leaves `c` as the compiler, with its path in `out/boot/env`. Use `RUNN
 `Windows` on those hosts (the outputs are then `a.exe`, `b.exe` and `c.exe` on
 Windows), and `--profile release` for the release fixpoint. Without
 `--fixpoint` it stops at `b`.
+
+The compiler's own source uses only what the seed reads. A language feature
+reaches it once a release ships the feature and the `seed=` line moves to that
+release.
 
 `-o` names a canonical path inside the project root: relative, `/`-separated,
 with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
@@ -89,7 +92,7 @@ python3 test/run.py --mach out/linux-x86_64/debug/bin/mach
 
 The compiler carries no unit `test` blocks and no goldens. `mach test` and the
 language's `test` blocks are features for the projects Mach builds. CI is the
-build: it walks the bootstrap chain and builds the compiler with itself, and
+build: it builds the compiler from the seed release and then with itself, and
 nothing else.
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
@@ -149,8 +152,8 @@ For example, `chore: update dependencies`.
 - Link the issue with `Closes #N`.
 - Leave `CHANGELOG.md` alone. The changelog is written from the merged
   commits when `dev` is released to `main`.
-- Say briefly what changed. Every pull request builds the compiler through the
-  bootstrap chain on the linux runners. The windows, darwin and release lanes
+- Say briefly what changed. Every pull request builds the compiler from the
+  seed release on the linux runners. The windows, darwin and release lanes
   run when the CI workflow is dispatched with a `lane`, which is worth doing
   before a windows or darwin change reaches `dev`, and `lane=all` runs green on
   `dev` before every release. Every other check is local, see
