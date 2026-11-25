@@ -16,6 +16,7 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ### Changed
 - Builds against mirl 0.2.0, whose scheduled-text writer supplies the `ir-opt` text (#4986).
+- CI and CD build the compiler from the mach 7.0.0 release. The chain of pinned mach commits that walked up from the 6.10.1 seed, and the manifest rewriting that seed needed, are gone (#4992).
 
 ### Fixed
 - A view whose file cannot be created reports that failure, where it reported that the listing's compile did not run (#4986).
