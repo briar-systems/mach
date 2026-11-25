@@ -161,8 +161,8 @@ key, `name` and `description` included, is an unknown-key error
 (`mach.toml: unknown key 'name' in [project]`). The previous major's `out` is
 refused by name, with the rename to `work` as its fix, and so is `{project.out}`
 in any template, with `{project.work}` as its fix. `[profile.<name>]`
-likewise carries no `emit_ir` or `emit_asm`: emission is `--emit ir` and `--emit asm` on
-the command line.
+likewise carries no `emit_ir` or `emit_asm`: emission is `--emit ir`, `--emit ir-opt`
+and `--emit asm` on the command line.
 
 ### The work directory
 
@@ -172,7 +172,7 @@ expanded `work`, in one layout:
 | Path | Holds |
 | --- | --- |
 | `obj/` | one object per module, each carrying its cache key, or for a target whose back end compiles an artifact whole (SPIR-V) one object for every module, named for the last; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
-| `ir/`, `asm/` | the human-readable views `--emit ir` and `--emit asm` write |
+| `ir/`, `ir-opt/`, `asm/` | the human-readable views `--emit ir`, `--emit ir-opt` and `--emit asm` write |
 | `.cache/` | compiler-only state, read and written by nothing but the compiler |
 | `.cache/steps/` | one fingerprint stamp per [build step](#stepname--build-steps) |
 | `.stage/` | build step scratch space, one directory per step, reset before the step runs |
@@ -185,7 +185,7 @@ Test objects sit in `obj/` beside the module objects, as
 `obj/<project>/<module>.test.o`. An artifact goes wherever its own `out` names,
 under the work directory when it is written from `{project.work}`.
 
-`mach clean` removes `obj/`, `ir/`, `asm/`, `.cache/`, `.stage/`, `test/` and
+`mach clean` removes `obj/`, `ir/`, `ir-opt/`, `asm/`, `.cache/`, `.stage/`, `test/` and
 `dep/` along with every artifact output, for every cell `mach build --all` plans,
 dependency requirement cells included, so the build after it is a cold one that
 reuses nothing. It plans as that build does, so a manifest the build refuses is
@@ -1400,7 +1400,8 @@ error[selection.ambiguous] mach.toml: several profiles are declared and none has
    |          -------
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
-concern: it is controlled only by the `--emit ir` and `--emit asm` flags of `mach build`.
+concern: it is controlled only by the `--emit ir`, `--emit ir-opt` and `--emit asm` flags of
+`mach build`.
 
 `relax = ["float-reassoc"]` is the one lever here that *adds*, and the only profile
 key that can change a program's computed answer. It widens that same pass to float

@@ -304,10 +304,8 @@ pub rec ModuleEntry {
     object_output: str;
     # the object went to object_output and `object` is empty until a link reads it back
     object_away: bool;
-    # where its step writes mirl's text of the module, "" for nowhere
-    ir_output: str;
-    # where its step writes masc's listing of the module's object, "" for nowhere
-    asm_output:    str;
+    # where its step writes each view of the module, by compile_view.VIEWS, "" for nowhere
+    view_outputs:  [compile_view.COUNT]str;
     staged:        *Object;
     staged_facts:  mach.compile.cache.record.Facts;
     record:        Record;

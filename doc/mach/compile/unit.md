@@ -6,7 +6,7 @@ one unit's object, normal or test, made in two steps: a unit is one module, or e
 artifact where the target's family compiles it whole. `lower` lowers the unit's
 code into a mirl module on a heap of its own and hands both back as one value, which its
 owner keeps until `compile` has bound the offers of other modules' bodies it was given,
-verified it, written it as text when asked and compiled it into an object; `dnit` then tears
+verified it, written the views asked of it and compiled it into an object; `dnit` then tears
 the heap down. compiling reads the lowered unit and its job and writes only what it returns,
 so compiles of different units can run side by side on one shared target (mirl#406). each
 step times the stages it runs and keeps the counts each owner holds of the module, for the
@@ -108,14 +108,13 @@ down. the facts are the holder's, who gives them back or hands them on
 
 ```mach
 pub rec Job {
-    back:     *mach.compile.backend.Back;
-    codegen:  Codegen;
-    out:      *std.allocator.Allocator;
-    ir_path:  str;
-    asm_path: str;
-    name:     str;
-    timed:    bool;
-    owner:    str;
+    back:       *mach.compile.backend.Back;
+    codegen:    Codegen;
+    out:        *std.allocator.Allocator;
+    view_paths: [compile_view.COUNT]str;
+    name:       str;
+    timed:      bool;
+    owner:      str;
 }
 ```
 
@@ -126,8 +125,7 @@ how one lowered unit is compiled, all of it read only to the step
 | `back` | `*mach.compile.backend.Back` | the assembled target, shared by every step and never written |
 | `codegen` | `Codegen` | how mirl compiles the module |
 | `out` | `*std.allocator.Allocator` | where the object lives, which outlives the step |
-| `ir_path` | `str` | where mirl's text of the module is written before it compiles, "" for nowhere |
-| `asm_path` | `str` | where masc's listing of the object is written as it compiles, "" for nowhere |
+| `view_paths` | `[compile_view.COUNT]str` | where each view of compile/view is written, by its row, "" for nowhere |
 | `name` | `str` | the name of the object it makes, the module's or its test object's, no other object's in a link, which refusals name and the object's format may name symbols after |
 | `timed` | `bool` | whether mirl times and counts its stages, which only a readout reads |
 | `owner` | `str` | the dependency whose code the module is, which a refusal names, nil for the project being built |

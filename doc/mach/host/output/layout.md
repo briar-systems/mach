@@ -20,6 +20,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 | :--- | :--- |
 | [`OBJ`](#constants) | each module's objects, one subdirectory per project id |
 | [`IR`](#constants) | `-e ir` output |
+| [`IR_OPT`](#constants) | `-e ir-opt` output |
 | [`ASM`](#constants) | `-e asm` output |
 | [`TEST`](#constants) | a test run's dispatcher and logs, one subdirectory per tested artifact |
 | [`CACHE`](#constants) | compiler-only state: nothing but the compiler reads or writes it |
@@ -61,12 +62,13 @@ runs, a step's staging or a dependency's artifacts
 | :--- | :--- | :--- | :--- |
 | `OBJ` | `str` | `"obj"` | each module's objects, one subdirectory per project id |
 | `IR` | `str` | `"ir"` | `-e ir` output |
+| `IR_OPT` | `str` | `"ir-opt"` | `-e ir-opt` output |
 | `ASM` | `str` | `"asm"` | `-e asm` output |
 | `TEST` | `str` | `"test"` | a test run's dispatcher and logs, one subdirectory per tested artifact |
 | `CACHE` | `str` | `".cache"` | compiler-only state: nothing but the compiler reads or writes it |
 | `STEPS` | `str` | `".cache/steps"` | one fingerprint stamp per build step, under CACHE |
 | `STAGE` | `str` | `".stage"` | build step scratch space, one subdirectory per step, reset before the step runs |
 | `DEPENDENCY` | `str` | `"dep"` | a dependency's artifact outputs, one subdirectory per dependency id |
-| `TREE_COUNT` | `u32` | `7` | every tree beneath the work directory a build writes, STEPS within CACHE |
-| `TREES` | `[7]str` | `[7]str{OBJ, IR, ASM, TEST, CACHE, STAGE, DEPENDENCY}` |  |
+| `TREE_COUNT` | `u32` | `8` | every tree beneath the work directory a build writes, STEPS within CACHE |
+| `TREES` | `[8]str` | `[8]str{OBJ, IR, IR_OPT, ASM, TEST, CACHE, STAGE, DEPENDENCY}` |  |
 
