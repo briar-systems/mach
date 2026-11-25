@@ -12,8 +12,8 @@ where a new module goes.
 
 Mach is self-hosting, so building it needs an existing Mach compiler. Install
 the latest [release](https://github.com/briar-systems/mach/releases) for your
-host and put `mach` on `PATH`. CI seeds from the release named on the `seed=`
-line of `.github/scripts/bootstrap.sh` (see [Fixpoint](#fixpoint)).
+host and put `mach` on `PATH`. CI seeds from the release named by `SEED` at the
+top of `.github/workflows/ci.yml` and `cd.yml` (see [Fixpoint](#fixpoint)).
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
@@ -33,30 +33,36 @@ Linux x86_64 build writes `out/linux-x86_64/debug/bin/mach`.
 
 A change to the compiler has to reach the self-host fixpoint: the compiler it
 builds must build itself byte for byte. CI does not check it, so run it
-locally. `.github/scripts/bootstrap.sh` is the one way: it reads `RUNNER_OS`
-and `RUNNER_TEMP` and writes `MACH` to the file `GITHUB_ENV` names, so a local
-run names them. From the repository root:
+locally from the repository root:
 
 ```bash
-mkdir -p out/boot
-RUNNER_OS=Linux RUNNER_TEMP=$PWD/out/boot GITHUB_ENV=$PWD/out/boot/env \
-    bash .github/scripts/bootstrap.sh --fixpoint
+seed=$(sed -n 's/^  SEED: //p' .github/workflows/ci.yml)
+MACH_VERSION=$seed MACH_INSTALL_DIR=$PWD/out/seed sh dist/install.sh
+out/seed/mach dep pull .
+out/seed/mach build . --profile debug -o a
+./a dep pull .
+./a build . --profile release --threads 2 -o b
+./b build . --profile release --threads 3 -o c
+cmp b c
 ```
 
-The script installs the release named on its `seed=` line, never whichever
-`mach` is on `PATH`. The seed builds `a` from your tree at the debug profile,
-so no older compiler's optimiser compiles it, `a` builds
-`b` at the profile on two threads, and `b` builds `c` at the profile on three,
-so the fixpoint also holds the output to being the same at every thread count.
-It fails when `cmp b c` differs and
-otherwise leaves `c` as the compiler, with its path in `out/boot/env`. Use `RUNNER_OS=macOS` or
-`Windows` on those hosts (the outputs are then `a.exe`, `b.exe` and `c.exe` on
-Windows), and `--profile release` for the release fixpoint. Without
-`--fixpoint` it stops at `b`.
+These are the steps CI runs, plus `c`. The seed is the release `SEED` names,
+never whichever `mach` is on `PATH`, and the install script checks its archive
+against the release's `SHA256SUMS`. The seed builds `a` at the debug profile,
+so no older compiler's optimiser compiles your tree. `a` builds `b` on two
+threads and `b` builds `c` on three, so the fixpoint also holds the output to
+being the same at every thread count. When `cmp` finds no difference, `c` is
+the compiler. Use `--profile debug` for `b` and `c` to check the debug
+fixpoint.
+
+On Windows, install the seed with `pwsh -NoProfile -File dist/install.ps1` and
+the same two variables, and name the outputs `a.exe`, `b.exe` and `c.exe`. On
+a Mac, run in a native shell: Rosetta 2 cannot host the compiler's worker
+threads.
 
 The compiler's own source uses only what the seed reads. A language feature
-reaches it once a release ships the feature and the `seed=` line moves to that
-release.
+reaches it once a release ships the feature and `SEED` moves to that release
+in both workflows.
 
 `-o` names a canonical path inside the project root: relative, `/`-separated,
 with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
