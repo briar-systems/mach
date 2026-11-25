@@ -482,6 +482,10 @@ pub rec Project {
     # the cell's expanded `[project].work`, borrowed from its plan: the build
     # owns the layout beneath it
     out_dir: str;
+    # the directory the build runs in, absolute and interned: a relative source path
+    # resolves against it, and a build with debug information names it as every
+    # unit's compilation directory
+    directory: mach.base.intern.StrId;
 
     modules: mach.base.handle.StableChunks[ModuleEntry];
     # the front end's load over the cell's packages, read through the session's open buffers
