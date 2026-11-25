@@ -133,8 +133,8 @@ for.
 program it launches.
 
 The products `--emit` names are the products made. An `--emit` set without `exe`
-stops at the objects, with their `ir/` and `asm/` text when it names those, and
-links nothing. `-o` names the linked artifact, so it is refused as
+stops at the objects, with the `ir/`, `ir-opt/` and `asm/` text of each view it
+names, and links nothing. `-o` names the linked artifact, so it is refused as
 `cli.flag_inapplicable` when `--emit` names no `exe`.
 
 `-o` is accepted exactly when the selection resolves to a single (artifact, target,
@@ -179,8 +179,8 @@ Nothing is rolled back.
 A cell that fails, or is not built because an artifact it needs failed, leaves
 nothing at its output path that could be taken for its product: the artifact
 there is removed, whether this build or an earlier one wrote it, and so are the
-`ir/` and `asm/` trees of its work directory when `--emit ir` or `--emit asm`
-asked for them, since a refusal can come after a module's text was written. Its
+`ir/`, `ir-opt/` and `asm/` trees of its work directory when `--emit ir`,
+`--emit ir-opt` or `--emit asm` asked for them, since a refusal can come after a module's text was written. Its
 objects in `obj/` stay, as the object cache keys each one by everything that
 made it. The
 exit code is `0` when all cells succeeded, and otherwise the code of the worst failure
