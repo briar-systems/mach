@@ -9,6 +9,17 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.1.0] - 2026-11-25
+
+### Added
+- `--emit ir-opt` writes each module's text after mirl's pass schedule and before its back end, as `<work>/ir-opt/<module path>.ir` beside `ir/` and `obj/`, on every target. Under a profile that does not optimise it shows the module after the legalising passes alone (#4986).
+
+### Changed
+- Builds against mirl 0.2.0, whose scheduled-text writer supplies the `ir-opt` text (#4986).
+
+### Fixed
+- A view whose file cannot be created reports that failure, where it reported that the listing's compile did not run (#4986).
+
 ## [7.0.0] - 2026-11-23
 
 ### Added
