@@ -3,9 +3,9 @@
 # mach.compile.view
 
 the texts of a unit a build writes beside its object when `--emit` names them: mirl's text of
-the module mach lowered and masc's listing of the object. each is a row of VIEWS, which every
-layer reads, so a new view is one row, and a new case of Source where mirl writes it from a
-stream of its own
+the module mach lowered, mirl's text of it after mirl's pass schedule, and masc's listing of the
+object. each is a row of VIEWS, which every layer reads, so a new view is one row, and a new case
+of Source where mirl writes it from a stream of its own
 
 Source: [`src/compile/view.mach`](../../../src/compile/view.mach)
 
@@ -14,7 +14,7 @@ Source: [`src/compile/view.mach`](../../../src/compile/view.mach)
 | [`Source`](#source) | `tag` | where a view's text is taken from |
 | [`View`](#view) | `rec` | one view of a unit |
 | [`Set`](#set) | `def` | a set of views, bit `i` for the view at VIEWS[i] |
-| [`Streams`](#streams) | `rec` | the texts mirl writes as it compiles a unit, each where a view of it asks: masc's listing of the object |
+| [`Streams`](#streams) | `rec` | the texts mirl writes as it compiles a unit, each where a view of it asks: the module after the pass schedule and masc's listing of the object |
 
 | On `Set` | |
 | :--- | :--- |
@@ -45,6 +45,7 @@ Source: [`src/compile/view.mach`](../../../src/compile/view.mach)
 ```mach
 pub tag Source: u8 {
     lowered;
+    scheduled;
     listing;
 }
 ```
@@ -54,6 +55,7 @@ where a view's text is taken from
 | Case | Payload | |
 | :--- | :--- | :--- |
 | `lowered` |  | the module mach hands mirl, which mach prints before mirl compiles it |
+| `scheduled` |  | the module as mirl's pass schedule left it, which mirl prints before its back end |
 | `listing` |  | masc's listing of the object, which mirl writes as its back end makes it |
 
 ## View
@@ -108,16 +110,17 @@ whether `s` holds the view at VIEWS[i]
 
 ```mach
 pub rec Streams {
-    listing: opt[*std.io.writer.Writer];
+    scheduled: opt[*std.io.writer.Writer];
+    listing:   opt[*std.io.writer.Writer];
 }
 ```
 
-the texts mirl writes as it compiles a unit, each where a view of it asks: masc's listing of the
-object
+the texts mirl writes as it compiles a unit, each where a view of it asks: the module after the
+pass schedule and masc's listing of the object
 
 | Name | Value | |
 | :--- | :--- | :--- |
-| `UNSTREAMED` | `Streams{listing: opt[*io_writer.Writer].none{}}` | no text written as mirl compiles |
+| `UNSTREAMED` | `Streams{scheduled: opt[*io_writer.Writer].none{}, listing: opt[*io_writer.Writer].none{}}` | no text written as mirl compiles |
 
 ### streams
 
@@ -157,6 +160,6 @@ whether mirl writes the view at VIEWS[i] as it compiles, rather than mach before
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COUNT` | `usize` | `2` | the views a build can write |
-| `VIEWS` | `[COUNT]View` | `[COUNT]View{ View{name: "ir", tree: layout.IR, ext: "ir", source: Source.lowered{}}, View{name: "asm", tree: layout.ASM, ext: "s", source: Source.listing{}}, }` | every view, in the order `--emit` lists them |
+| `COUNT` | `usize` | `3` | the views a build can write |
+| `VIEWS` | `[COUNT]View` | `[COUNT]View{ View{name: "ir", tree: layout.IR, ext: "ir", source: Source.lowered{}}, View{name: "ir-opt", tree: layout.IR_OPT, ext: "ir", source: Source.scheduled{}}, View{name: "asm", tree: layout.ASM, ext: "s", source: Source.listing{}}, }` | every view, in the order `--emit` lists them |
 

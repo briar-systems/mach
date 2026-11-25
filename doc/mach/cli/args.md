@@ -435,7 +435,7 @@ any other failure is returned as given
 | :--- | :--- | :--- | :--- |
 | `EMIT_KIND_OBJ` | `u8` | `1` | the objects, with no link |
 | `EMIT_KIND_EXE` | `u8` | `2` | the linked artifact |
-| `EMIT_ERROR` | `str` | `"--emit expects asm, ir, obj or exe"` | the refusal of an `--emit` value no product is named by |
+| `EMIT_ERROR` | `str` | `"--emit expects asm, ir, ir-opt, obj or exe"` | the refusal of an `--emit` value no product is named by |
 | `ARTIFACT` | `std.args.Flag` | `std_args.Flag{long: "artifact", short: 'a', value: "pattern", repeat: true, negatable: false, help: "select artifacts by name or glob (default: the default selection)"}` | `--artifact <pattern>`, `-a`, a selector |
 | `TARGET` | `std.args.Flag` | `std_args.Flag{long: "target", short: 't', value: "pattern", repeat: true, negatable: false, help: "which targets: a name or glob of the manifest's targets in a project, a <sys>-<arch> in an entry build (default: the host's)"}` | `--target <pattern>`, `-t`, a selector, or an entry build's target |
 | `PROFILE` | `std.args.Flag` | `std_args.Flag{long: "profile", short: 'p', value: "pattern", repeat: true, negatable: false, help: "select profiles by name or glob (default: the default profile)"}` | `--profile <pattern>`, `-p`, a selector |
@@ -456,7 +456,7 @@ any other failure is returned as given
 | `EXT` | `std.args.Flag` | `std_args.Flag{long: "ext", short: 0, value: "name", repeat: true, negatable: false, help: "add an instruction set extension, once each"}` | `--ext <name>` |
 | `CODE_MODEL` | `std.args.Flag` | `std_args.Flag{long: "code-model", short: 0, value: "name", repeat: false, negatable: false, help: "the code model (default: the target's)"}` | `--code-model <name>` |
 | `WORK` | `std.args.Flag` | `std_args.Flag{long: "work-dir", short: 'w', value: "path", repeat: false, negatable: false, help: "the work directory (default: the project's)"}` | `-w <path>`, the work directory |
-| `EMIT` | `std.args.Flag` | `std_args.Flag{long: "emit", short: 0, value: "asm\|ir\|obj\|exe", repeat: true, negatable: false, help: "a product to write, once each (default: exe)"}` | `--emit <kind>`, once per product |
+| `EMIT` | `std.args.Flag` | `std_args.Flag{long: "emit", short: 0, value: "asm\|ir\|ir-opt\|obj\|exe", repeat: true, negatable: false, help: "a product to write, once each (default: exe)"}` | `--emit <kind>`, once per product |
 | `THREADS` | `std.args.Flag` | `std_args.Flag{long: "threads", short: 0, value: "n", repeat: false, negatable: false, help: "how many threads a build compiles and links on, and test processes run at once (default: host CPUs)"}` | `--threads <n>` |
 | `LIB_DIR` | `std.args.Flag` | `std_args.Flag{long: "library-dir", short: 'L', value: "dir", repeat: true, negatable: false, help: "add a library search directory"}` | `--library-dir <dir>`, `-L` |
 | `LIB` | `std.args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
