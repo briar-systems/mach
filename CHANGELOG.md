@@ -9,6 +9,14 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.1.1] - 2026-11-25
+
+### Changed
+- Builds against mirl 0.3.0, whose debug table states the unit's directory, and mink 0.1.1, whose DWARF objects and linked debug images read without errors in `objdump` and `llvm-dwarfdump --verify` (#4987).
+
+### Fixed
+- A debug build names the directory it ran in as every unit's compilation directory (`DW_AT_comp_dir`) and the line table's directory 0, where it named `.`, so a debugger started outside the build directory finds the sources. A debug build's cache is keyed on that directory, and release builds are unchanged (#4987).
+
 ## [7.1.0] - 2026-11-25
 
 ### Added
