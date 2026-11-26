@@ -7,10 +7,11 @@ diagnostic, a failure, a test finishing. The command renders each event as it
 arrives, in human text or as [records](report-records.md). This page is the
 contract for what each level shows, on which stream, and when.
 
-Human text has three kinds of line:
+Human text has three kinds of output:
 
-- a **result line** says what the command did, once per thing it acted on.
-  Result lines are the same at every level.
+- a **result** says what the command did, once per thing it acted on: a line
+  with its verb and what it acted on, and its fields beneath it. Results are the
+  same at every level.
 - a **log line** says how a stage of the work went: when it closed, how long it
   took and what it processed. Log lines show only under `-v` and `-vv`.
 - the **live line** says what is running now. It shows only on a terminal, and
@@ -23,74 +24,102 @@ its own form, and is written the moment it is found, followed by a blank line.
 
 | Flag | What shows |
 |---|---|
-| none | diagnostics and result lines |
+| none | diagnostics and results |
 | `-v` | also a log line for each stage as it closes |
 | `-vv` | also a log line for each item a stage processed, the target's facts, and for a build the unit's recap after its last stage |
 
 `-v` and `-vv` cannot be combined with `--quiet` or `-q`, which is refused as
-`cli.flag_conflict`. `--quiet` leaves out the result lines and the live line,
+`cli.flag_conflict`. `--quiet` leaves out the results and the live line,
 and keeps the diagnostics.
 
 ## Streams
 
-Result lines go to stdout. Log lines, the recap, diagnostics and the live line
+Results go to stdout. Log lines, the recap, diagnostics and the live line
 go to stderr. So a pipe that reads stdout sees the same lines at every level,
 and a log that keeps stderr holds the work's timing.
 
 `--report json` and `--report lines` turn stderr into records, the test run's
-among them, and leave out the result lines and the live line. A listing, as
+among them, and leave out the results and the live line. A listing, as
 `mach test --list`, `mach dep list`, `mach dep outdated` or the declassified
 listing `mach check --declassified` writes
 ([secrecy.md](secrecy.md#declassification)), is stdout at every level.
 
-## Result lines
+## Results
 
-A result line is a verb from one closed table, left-aligned in a gutter ten
-columns wide, then what it acted on and its details, each two columns apart.
-The verbs are one table in `mach.report.layout`: `created`, `realized`,
-`updated`, `unchanged`, `added`, `removed`, `built`, `checked`, `formatted`,
-`migrated`, `differs`, `documented`, `verified`, `fetched`, `passed`, `failed`
-and `skipped`.
+A result opens with a verb from one closed table and what it acted on, one
+space apart. Its fields follow, one a line, indented two spaces: a key, padded
+to the widest key of the result, then two spaces and the value. The verbs are
+one table in `mach.report.layout`: `created`, `realized`, `updated`,
+`unchanged`, `added`, `removed`, `built`, `checked`, `formatted`, `migrated`,
+`differs`, `documented`, `verified`, `fetched`, `passed`, `failed` and
+`skipped`.
 
-A build names the artifact, its wall time and its output. A build with nothing
-to do says `unchanged`, a check says `checked`, and a build or check that
-reported errors says `failed` with their count, in place of a tally:
+A build names the artifact, then its target and profile, its wall time and its
+output. A build with nothing to do says `unchanged`, a check says `checked`,
+and a build or check that reported errors says `failed` with their count, in
+place of a tally:
 
 ```
-built       demo  369ms  out/linux-x86_64/debug/bin/demo
-unchanged   demo  179ms  out/linux-x86_64/debug/bin/demo
-checked     demo  136ms
-failed      demo  2 errors  222ms
+built demo
+  target  linux-x86_64 debug
+  time    369ms
+  output  out/linux-x86_64/debug/bin/demo
+checked demo
+  target  linux-x86_64 debug
+  time    136ms
+failed demo
+  target  linux-x86_64 debug
+  errors  2
+  time    222ms
 ```
 
-A count of warnings joins the line the same way, as `built  demo  3 warnings
-369ms  out/...`. A count that is zero is never printed, so a line names only
-what happened. A path drops its leading `./`.
+A count of warnings is a field the same way, `warnings  3`, after `errors`. A
+field with nothing to say is left out, so a count that is zero is never
+printed and a result names only what happened. A path drops its leading `./`.
 
 A selection of several units, across targets, artifacts or profiles, writes one
-result line per unit as each closes. The target joins the line when the units
-differ in target, and the profile when they differ in profile, each in a column
-as wide as its widest value, and the time is right-aligned:
+result per unit as each closes. Each result names its own target, so it reads
+alone:
 
 ```
-unchanged   demo  linux-x86_64   debug     261ms  out/linux-x86_64/debug/bin/demo
-built       demo  linux-x86_64   release   725ms  out/linux-x86_64/release/bin/demo
-built       demo  linux-aarch64  release    1.7s  out/linux-aarch64/release/bin/demo
+unchanged demo
+  target  linux-x86_64 debug
+  time    261ms
+  output  out/linux-x86_64/debug/bin/demo
+built demo
+  target  linux-aarch64 release
+  time    1.7s
+  output  out/linux-aarch64/release/bin/demo
 ```
 
-The other commands follow the same shape:
+The other commands follow the same shape. A result with nothing more to say is
+its one line:
 
 ```
-formatted   src/calc/leap.mach
-unchanged   demo  2 files  3.6ms
-removed     out/linux-x86_64/debug/obj
-documented  demo  2 source files  5 pages  8.0ms  doc/demo
-created     initq  3 files  initq/
-realized    std  ^10  378ad6bb40a8  3.8s  initq/dep/std
+formatted src/calc/leap.mach
+unchanged demo
+  files  2
+  time   3.6ms
+removed out/linux-x86_64/debug/obj
+documented demo
+  sources  2
+  pages    5
+  time     8.0ms
+  output   doc/demo
+created initq
+  files  3
+  path   initq/
+realized std
+  version  ^10
+  commit   378ad6bb40a8
+  time     3.8s
+  path     initq/dep/std
 ```
 
 A run that changes nothing says `unchanged`, so silence never has to be
-interpreted.
+interpreted. A listing is not a result: `mach dep list`, `mach dep outdated`,
+`mach test --list`, `mach info` and `mach info targets` print tables, one row
+per entry under one header row.
 
 ## Log lines
 
@@ -152,7 +181,10 @@ object writes no `codegen` line:
 [  0.15] resolve      12ms  34 modules
 [  0.17] sema         29ms  34 modules
 [  0.18] link        413us  up to date
-unchanged   demo  179ms  out/linux-x86_64/debug/bin/demo
+unchanged demo
+  target  linux-x86_64 debug
+  time    179ms
+  output  out/linux-x86_64/debug/bin/demo
 ```
 
 A phase that reported diagnostics says how many on its line, after them, as
@@ -179,7 +211,7 @@ shows while it runs:
 
 ### The recap
 
-Under `-vv` each unit ends with its recap before its result line: a table of
+Under `-vv` each unit ends with its recap before its result: a table of
 its phases, its counters, and a table each of its modules' code generation
 times and counters, each block after a blank line.
 
@@ -344,28 +376,40 @@ mirl's: what each pass counts is stated by its pass record
 ## The test readout
 
 A test run reads like a build: the test build's readout, then the run's. Tests
-run concurrently, up to `--threads` at once. A module's result line is written
+run concurrently, up to `--threads` at once. A module's result is written
 once the last of its tests finishes, so a slow test holds back only its own
-module's line. A failure is a `test.failed` diagnostic, written the moment its
-test finishes. The run closes with one result line for the whole run:
+module's result. A failure is a `test.failed` diagnostic, written the moment
+its test finishes. The run closes with one result for the whole run:
 
 ```
-passed      demo.bin.main   1 test   1.0ms
+passed demo.bin.main
+  tests  1
+  time   1.0ms
 error[test.failed] test is_leap_year__negative exited with 3
    @ src/calc/leap.mach:21:1
 21 | test is_leap_year__negative {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
    note rerun it alone with ./out/linux-x86_64/debug/test/demo/demo 3
 
-failed      demo.calc.leap  4 tests  1 failed  1 skipped  1.0ms
-failed      demo  5 tests  1 failed  1 skipped  705ms
+failed demo.calc.leap
+  tests    4
+  failed   1
+  skipped  1
+  time     1.0ms
+failed demo
+  target   linux-x86_64 debug
+  tests    5
+  failed   1
+  skipped  1
+  time     705ms
 ```
 
-A module's line is `passed`, `failed` when any of its tests failed, or
-`skipped` when every one was skipped, then the module, its count of tests, how
-many failed, timed out and were skipped, each only when not zero, and its
-slowest test's time. The run's line is `passed` or `failed` with the same
-counts and the time since the command began.
+A module's result is `passed`, `failed` when any of its tests failed, or
+`skipped` when every one was skipped, then the module, its count of `tests`,
+how many `failed`, `timed out` and were `skipped`, each only when not zero, and
+its slowest test's `time`. The run's result is `passed` or `failed` for the
+artifact, with its `target`, the same counts and the time since the command
+began.
 
 A failure's diagnostic says why the test failed (`exited with 3`, `was stopped
 by signal 6`, `timed out after 10s`, `could not be launched`), points at where
@@ -385,12 +429,16 @@ output beneath it:
 [  0.71] run         1.4ms  5 tests  1 failed  1 skipped
 ```
 
-When the selection holds several (target, profile) pairs, the result lines
-carry the target and profile as a build's do, and each pair that is built and
-not run is a `skipped` line that says why:
+When the selection holds several (target, profile) pairs, each run's result
+names its target and profile as a build's does, and each pair that is built and
+not run is a `skipped` result that says why, and what was done instead:
 
 ```
-skipped     demo  linux-aarch64  debug  not native to this host (linux-x86_64), built, not run
+skipped demo
+  target   linux-aarch64 debug
+  reason   not native to this host
+  host     linux-x86_64
+  instead  built, not run
 ```
 
 Under `--report json` or `lines` each test is a `test` record on stderr as it

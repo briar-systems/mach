@@ -150,9 +150,9 @@ artifact's objects exactly as `mach build` does, adds a test object beside each
 module that declares tests, links one test **dispatcher** executable covering
 the selected tests, then runs each of them as its own process
 (`<exe> <index>`), captures its output, times
-it, and writes a result line per module as its tests finish, each failure as a
-`test.failed` diagnostic the moment its test finishes, then the run's result
-line. What `-v` and
+it, and writes a result per module as its tests finish, each failure as a
+`test.failed` diagnostic the moment its test finishes, then the run's result.
+What `-v` and
 `-vv` add, and the order lines come out in, is the [readout](readout.md). The
 full flag reference is `mach help test`, and the options that select and shape a
 run are:
@@ -169,35 +169,46 @@ run are:
 --allow-unrunnable       exit 0 when nothing selected can run on this host, after building it
 ```
 
-A module's result line is `passed`, `failed` when any of its tests failed, or
-`skipped` when every one was skipped, then the module, its count of tests, how
-many failed, timed out and were skipped, each only when not zero, and its
-slowest test's time. It is written once the module's last test finishes, so the
-lines come out in the order modules finish. A failure is an `error[test.failed]`
+A module's result is `passed`, `failed` when any of its tests failed, or
+`skipped` when every one was skipped, then the module, and as fields its count
+of `tests`, how many `failed`, `timed out` and were `skipped`, each only when
+not zero, and its slowest test's `time`. It is written once the module's last
+test finishes, so the results come out in the order modules finish. A failure is an `error[test.failed]`
 diagnostic, written the moment its test finishes: why it failed (`exited with
 N`, `was stopped by signal N`, `timed out after <duration>`), where the test is
 declared, then as notes the child's captured output, where its whole output is
 when the capture was cut, and the command that reruns it alone. A passing or
-skipped test stays quiet. The run's result line closes the run: `passed` or
-`failed`, the count, the same counts as a module's, and the time since the
-command began (see [readout.md](readout.md#the-test-readout)):
+skipped test stays quiet. The run's result closes the run: `passed` or
+`failed` for the artifact, its `target`, the same counts as a module's, and the
+time since the command began (see [readout.md](readout.md#the-test-readout)):
 
 ```
-passed      app.parser    1 test   323us
+passed app.parser
+  tests  1
+  time   323us
 error[test.failed] test fails_on_purpose exited with 3
    @ src/bin/main.mach:13:1
 13 | test fails_on_purpose {
    | ^^^^^^^^^^^^^^^^^^^^^^^
    note rerun it alone with ./out/linux-x86_64/debug/test/app/app 1
 
-failed      app.bin.main  3 tests  1 failed  1 skipped  615us
-failed      app  4 tests  1 failed  1 skipped  764ms
+failed app.bin.main
+  tests    3
+  failed   1
+  skipped  1
+  time     615us
+failed app
+  target   linux-x86_64 debug
+  tests    4
+  failed   1
+  skipped  1
+  time     764ms
 ```
 
 The exit code of `mach test`:
 
 - `0`: every test that ran passed or skipped. A project that declares no
-  test runs none, reports `passed  <artifact>  0 tests` and exits `0`.
+  test runs none, reports `passed <artifact>` with `tests  0` and exits `0`.
 - `1`: at least one test failed, was killed by a signal, or timed out. It is
   also a user error, such as an unknown flag, a rejected manifest, or a source
   the build refuses (a test body that does not compile).
@@ -240,7 +251,7 @@ left in the group. On Windows the test's job object is terminated, which ends
 every process in it. A test that exceeds
 the bound is the distinct outcome **timed out**: its diagnostic says `timed out
 after <duration>` with the command that reruns it, it is counted separately on
-the module's and the run's result lines, and it is still a failing test for the
+the module's and the run's results, and it is still a failing test for the
 exit code, so the suite exits `1`.
 
 ```
@@ -250,8 +261,17 @@ error[test.failed] test spins timed out after 1s
   | ^^^^^^^^^^^^
   note rerun it alone with ./out/linux-x86_64/debug/test/app/app 0
 
-failed      app.bin.main  1 test  1 failed  1 timed out  1.0s
-failed      app  1 test  1 failed  1 timed out  1.2s
+failed app.bin.main
+  tests      1
+  failed     1
+  timed out  1
+  time       1.0s
+failed app
+  target     linux-x86_64 debug
+  tests      1
+  failed     1
+  timed out  1
+  time       1.2s
 ```
 
 A timed-out test counts in the `run_end` record's `resource_exhaustion` beside
@@ -274,7 +294,7 @@ and not run, a `case` per test under `--list`, and the closing `summary`, as
 `file`, `line` and dispatcher `index`. A skipped test reports
 `"outcome":"skip"` and counts in the `run_end` record's `skipped`. A timed-out test reports
 `"outcome":"timeout"` with its bound in nanoseconds in `timeout_ns`. The human
-result lines and `test.failed` diagnostics are not written then.
+results and `test.failed` diagnostics are not written then.
 
 ## The runner
 
@@ -349,15 +369,18 @@ to resolve to one (artifact, target, profile), foreign or not.
 A [finished-module target](manifest.md#finished-module-targets), a shader on
 `vulkan`, links no executable, so it has no dispatcher. A
 cell on one is built as `mach build` builds it, its module written to the
-artifact's own `out`, and its (target, profile) is reported on a `skipped` line
+artifact's own `out`, and its (target, profile) is reported as a `skipped` result
 that gives the reason while the other cells build and run:
 
 ```
-skipped     shader  spirv  debug  a finished-module target links no test executable, built, not run
+skipped shader
+  target   spirv debug
+  reason   a finished-module target links no test executable
+  instead  built, not run
 ```
 
-Under `--list` such a cell is type checked, not built, and the line ends `checked,
-not listed`. This holds whether the selection named the cell exactly or reached it
+Under `--list` such a cell is type checked, not built, and its result says
+`instead  checked, not listed`. This holds whether the selection named the cell exactly or reached it
 through a glob or `--all`, so `mach test --all` also catches a shader that does not
 compile. `--runner` over a finished-module cell is refused with
 `target.output_unsupported`, since there is no program to launch, and a selection
