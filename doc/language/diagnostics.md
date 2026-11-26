@@ -33,9 +33,9 @@ lines with `| ...` between them.
 A note says what a command did or found and never fails it. Its human text is
 `note <message>`, without the key, which the
 [json record](report-records.md#notes) carries. A note that reports what a
-command did is written in human text as that command's progress line instead,
+command did is written in human text as that command's result line instead,
 as `mach init` writes `created` and `realized` (see
-[readout.md](readout.md#progress-lines)).
+[readout.md](readout.md#result-lines)).
 
 ## Keys
 

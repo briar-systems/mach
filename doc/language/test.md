@@ -150,8 +150,9 @@ artifact's objects exactly as `mach build` does, adds a test object beside each
 module that declares tests, links one test **dispatcher** executable covering
 the selected tests, then runs each of them as its own process
 (`<exe> <index>`), captures its output, times
-it, and renders a row per module as the tests finish, then each failure once
-with its captured output and location, then the verdict. What `-v` and
+it, and writes a result line per module as its tests finish, each failure as a
+`test.failed` diagnostic the moment its test finishes, then the run's result
+line. What `-v` and
 `-vv` add, and the order lines come out in, is the [readout](readout.md). The
 full flag reference is `mach help test`, and the options that select and shape a
 run are:
@@ -168,33 +169,35 @@ run are:
 --allow-unrunnable       exit 0 when nothing selected can run on this host, after building it
 ```
 
-A module row is `<module>  <duration>  <ok> ok[  <skip> skip][  <fail> FAIL]`, written once
-the module's last test finishes, so rows come out in the order modules finish.
-Its `<duration>` is the module's wall span, from the launch of its first test to
-the exit of its last, and the verdict's duration is the run's wall time, so
-every time the readout prints is wall time (see
-[readout.md](readout.md#the-test-readout)).
-When the run ends each failure is shown once, in collection order: `FAIL`, its
-name, `file:line` and the exit code (`(exit N)`), signal (`(signal N)`) or
-`(timed out after <duration>)`, then the child's captured output indented
-beneath and the exact `rerun:` command. A passing or skipped test stays quiet.
-The verdict closes the run: `passed` and the count, or `failed` and how many of
-the count failed, with the skip count after it whenever a test skipped:
+A module's result line is `passed`, `failed` when any of its tests failed, or
+`skipped` when every one was skipped, then the module, its count of tests, how
+many failed, timed out and were skipped, each only when not zero, and its
+slowest test's time. It is written once the module's last test finishes, so the
+lines come out in the order modules finish. A failure is an `error[test.failed]`
+diagnostic, written the moment its test finishes: why it failed (`exited with
+N`, `was stopped by signal N`, `timed out after <duration>`), where the test is
+declared, then as notes the child's captured output, where its whole output is
+when the capture was cut, and the command that reruns it alone. A passing or
+skipped test stays quiet. The run's result line closes the run: `passed` or
+`failed`, the count, the same counts as a module's, and the time since the
+command began (see [readout.md](readout.md#the-test-readout)):
 
 ```
-app.bin.main       615us     1 ok     1 skip     1 FAIL
-app.parser         323us     1 ok
+passed      app.parser    1 test   323us
+error[test.failed] test fails_on_purpose exited with 3
+   @ src/bin/main.mach:13:1
+13 | test fails_on_purpose {
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   note rerun it alone with ./out/linux-x86_64/debug/test/app/app 1
 
-FAIL  app.bin.main#fails_on_purpose  src/bin/main.mach:13  (exit 3)
-      rerun: ./out/linux-x86_64/debug/test/app/app 1
-
-    failed  1 of 4 tests, 1 skipped   764us
+failed      app.bin.main  3 tests  1 failed  1 skipped  615us
+failed      app  4 tests  1 failed  1 skipped  764ms
 ```
 
 The exit code of `mach test`:
 
 - `0`: every test that ran passed or skipped. A project that declares no
-  test runs none, reports `passed  0 tests` and exits `0`.
+  test runs none, reports `passed  <artifact>  0 tests` and exits `0`.
 - `1`: at least one test failed, was killed by a signal, or timed out. It is
   also a user error, such as an unknown flag, a rejected manifest, or a source
   the build refuses (a test body that does not compile).
@@ -235,18 +238,20 @@ killed as a group (`SIGKILL`), so no process the test started outlives it,
 even one that ignores the request. The second runs out early once nothing is
 left in the group. On Windows the test's job object is terminated, which ends
 every process in it. A test that exceeds
-the bound is the distinct outcome **timed out**: it renders as
-`(timed out after <duration>)` with its `rerun:` command, is counted
-separately on the summary line, and is still a failing test for the exit code,
-so the suite exits `1`.
+the bound is the distinct outcome **timed out**: its diagnostic says `timed out
+after <duration>` with the command that reruns it, it is counted separately on
+the module's and the run's result lines, and it is still a failing test for the
+exit code, so the suite exits `1`.
 
 ```
-app.bin.main        1.0s     0 ok                1 FAIL
+error[test.failed] test spins timed out after 1s
+  @ src/bin/main.mach:8:1
+8 | test spins {
+  | ^^^^^^^^^^^^
+  note rerun it alone with ./out/linux-x86_64/debug/test/app/app 0
 
-FAIL  app.bin.main#spins  src/bin/main.mach:8  (timed out after 1s)
-      rerun: ./out/linux-x86_64/debug/test/app/app 0
-
-    failed  1 of 1 test (1 timed out)   1.0s
+failed      app.bin.main  1 test  1 failed  1 timed out  1.0s
+failed      app  1 test  1 failed  1 timed out  1.2s
 ```
 
 A timed-out test counts in the `run_end` record's `resource_exhaustion` beside
@@ -256,7 +261,7 @@ A timed-out test counts in the `run_end` record's `resource_exhaustion` beside
 (`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
 unit is a usage error naming the accepted forms, so no value removes the bound.
 The default is rendered in the largest whole unit, so a test that reaches it
-reports `(timed out after 1m)`.
+reports `timed out after 1m`.
 
 ### Records
 
@@ -269,7 +274,7 @@ and not run, a `case` per test under `--list`, and the closing `summary`, as
 `file`, `line` and dispatcher `index`. A skipped test reports
 `"outcome":"skip"` and counts in the `run_end` record's `skipped`. A timed-out test reports
 `"outcome":"timeout"` with its bound in nanoseconds in `timeout_ns`. The human
-readout stays on stdout.
+result lines and `test.failed` diagnostics are not written then.
 
 ## The runner
 
@@ -315,8 +320,8 @@ under `log/` beside the dispatcher, `test/<artifact>/log/` unless `-o` moves
 the dispatcher, named by the test's position in the run (a passing or skipped
 test's file is removed on the spot, a failing test's file stays), and reads its
 exit status: `0` is a pass, `77` a skip, and any other status, a signal or a
-timeout a failure. Results render
-in collection order regardless of completion order.
+timeout a failure. Results render as the tests finish, each module's line once
+its last test has.
 
 ## Which tests run
 
@@ -345,11 +350,10 @@ A [finished-module target](manifest.md#finished-module-targets), a shader on
 `vulkan`, links no executable, so it has no dispatcher. A
 cell on one is built as `mach build` builds it, its module written to the
 artifact's own `out`, and its (target, profile) is reported on a `skipped` line
-with the reason beneath while the other cells build and run:
+that gives the reason while the other cells build and run:
 
 ```
-   skipped  spirv  debug
-            a finished-module target links no test executable; built, not run
+skipped     shader  spirv  debug  a finished-module target links no test executable, built, not run
 ```
 
 Under `--list` such a cell is type checked, not built, and the line ends `checked,
@@ -365,7 +369,7 @@ same rule as a native test: `0` is a pass, `77` a skip, and anything else a fail
 mach adds nothing for the guest: how a program under an emulator gets its status
 out, through semihosting, a debug-exit port or the emulator's own passthrough, is
 the runner's business, and `wine`, for one, passes the program's status through. The
-`rerun:` line of a failure shows the whole launch command. A run that executed
+note that reruns a failure shows the whole launch command. A run that executed
 nothing exits `1`, naming the host, so a passing run always ran tests. A
 selection with nothing runnable on the host exits `0` under `--allow-unrunnable`,
 after building it and printing each skip line, and a build failure still exits non-zero.

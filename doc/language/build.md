@@ -152,25 +152,24 @@ a build never writes outside the tree it was asked to build.
 ## When one cell fails
 
 Every cell is attempted, and a failure does not abandon the ones after it. Each cell's
-diagnostics are reported as they happen, and when the selection has several cells
-they follow a line naming the cell, its target, artifact and profile as the units
-table spells them (under `-v`, the banner over the cell's table). One tally of
-every cell's errors and warnings closes the run:
+diagnostics are reported as they happen, and each cell closes with its result line
+(see [readout.md](readout.md#result-lines)), which names the cell's target and
+profile where the selection's cells differ in them. A failed cell's line counts its
+errors:
 
 ```
-one  broken  debug
 error[name.unresolved] unresolved identifier `missing`
   @ src/broken.mach:2:13
 2 |     ret x + missing;
   |             ^^^^^^^
 
-two  broken  debug
+failed      broken  one  1 error    52ms
 error[name.unresolved] unresolved identifier `missing`
   @ src/broken.mach:2:13
 2 |     ret x + missing;
   |             ^^^^^^^
 
-2 errors / 0 warnings
+failed      broken  two  1 error    48ms
 ```
 
 Every cell that succeeded leaves its artifact on disk at its own path.

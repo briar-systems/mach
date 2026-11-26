@@ -131,8 +131,9 @@ the standard library, realized at `dep/std/`, as a git submodule unless
 - **std.** `[dep.std]` is declared at the selection the running compiler states
   for std (`^10`). A ref is written as
   it is. A range is resolved before anything is written, reading std's releases
-  from the network once (`mach init` says so first, and checking std out reads
-  the same listing), and when no release in it
+  from the network once (shown on the live line and, under `-v`, logged as the
+  `fetch` stage, and checking std out reads the same listing), and when no
+  release in it
   exists nothing is created and the error names the way on: `mach init
   --no-deps`, then `mach dep add <dir> std --git <url> --ref branch/<name>` to
   take std from a branch.
