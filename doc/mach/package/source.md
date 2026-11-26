@@ -74,14 +74,17 @@ pub rec Shipped {
     manifest: mach.manifest.model.Manifest;
     excluded: str;
     detail:   str;
+    mach:     str;
 }
 ```
 
 a release's manifest as resolution reads it: `manifest` when the release is a candidate,
 and otherwise `excluded` says why it is not one, its manifest not loading or naming
 another version, and `detail` is what the manifest's load said, or nil. releases excluded
-for one reason are reported together, with the newest one's detail. the manifest is owned
-by the caller
+for one reason are reported together, with the newest one's detail. `mach` is the compiler
+range the release states when the running compiler is outside it, read before the schema
+the release may predate: resolution refuses the release by it, and `manifest` is not read.
+the manifest is owned by the caller
 
 ## Releases
 

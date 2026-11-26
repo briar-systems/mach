@@ -126,5 +126,5 @@ repository
 | `ctx` | the table, a *Remotes |
 | `url` | the source url |
 | `rel` | the release |
-| **returns** | the manifest, owned by the caller, or why the release is no candidate when its manifest is not valid TOML, does not load or names another version, err when the manifest cannot be fetched or read at all |
+| **returns** | the manifest, owned by the caller, or why the release is no candidate when its manifest is not valid TOML, states a compiler range the running compiler is outside of, does not load or names another version, err when the manifest cannot be fetched or read at all |
 

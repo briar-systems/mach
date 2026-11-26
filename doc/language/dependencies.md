@@ -68,9 +68,12 @@ error[dep.unsatisfiable] no set of releases satisfies every requirement
 When the root already declares the identity (`app requires b ^1.2` among the
 lines), declaring it is no way out, and the hint is left off.
 
-A release that needs a newer compiler appears as one of those lines (`b 2.0.0
-requires mach ^8, and this is mach 7.0.0`). Resolution never silently settles
-for a lower release than the ranges allow.
+A release whose `[project].mach` does not accept the running compiler appears
+as one of those lines (`b 2.0.0 requires mach ^8, and this is mach 7.0.0`). The
+range is read before the rest of the release's manifest, so a release written
+for another compiler shows this line, never one saying its `mach.toml` does not
+load. Resolution never silently settles for a lower release than the ranges
+allow.
 
 What `mach dep add` writes:
 
@@ -301,15 +304,16 @@ local mirror) verifies by its commit alone.
 A build locates each dependency as the directory its key names under `dep/`
 and reads its manifest. That is the whole of its dealing with dependencies: it
 never fetches, never writes under `dep/`, runs no Git process, and checks no
-pin, selector, identity or checkout state. It builds what exists, so a stale
+pin, selector or checkout state. It builds what exists, so a stale
 or drifted dependency surfaces as a build error, and `mach dep pull` brings it
 back to its pin. A dependency with nothing checked out, whether `dep/<id>` is
 absent or is the empty directory Git leaves for an uninitialized gitlink on a
 fresh clone, is refused naming that command (`error[dep.unrealized]
 dependency 'std' is not checked out at './dep/std'. run `mach dep pull .``,
 where the path is the project root as given). A build
-also refuses a cycle in the manifests it reads, and a compiler outside any
-manifest's `[project].mach` (see [Compiler range](manifest.md#compiler-range)).
+also refuses a dependency whose `[project].id` is not its key, a cycle in the
+manifests it reads, and a compiler outside any manifest's `[project].mach` (see
+[Compiler range](manifest.md#compiler-range)).
 
 A build shows the warnings of the project being built, never a dependency's
 unless `--dep-warnings` asks, and then each dependency's under its own `allow`
