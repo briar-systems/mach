@@ -8,7 +8,7 @@ stream. `mach fmt` and `mach migrate` are two transforms over it
 
 Source: [`src/cli/rewrite.mach`](../../../src/cli/rewrite.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.cli.diagnostic`](diagnostic.md), [`mach.manifest.load`](../manifest/load.md), [`mach.report.layout`](../report/layout.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.cli.diagnostic`](diagnostic.md), [`mach.manifest.load`](../manifest/load.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -16,23 +16,34 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Heading`](#heading) | `def` | the offset of the line that heads a change at the offset `at` of a source's text, such as the table a manifest line stands in, which a diff names beside the change |
 | [`Report`](#report-1) | `rec` | one command's pass over its inputs |
 | [`Sink`](#sink) | `def` | where the transformed text of one input goes |
+| [`Project`](#project) | `rec` | what a rewrite reads of a manifest: only its `[project]` table, so it never needs a build profile |
 
 | On `Transform` | |
 | :--- | :--- |
-| [`report`](#report) | a pass with nothing read yet |
+| [`report`](#report) | a pass with nothing read yet, which begins now: the live line shows its stage from here |
+
+| On `Report` | |
+| :--- | :--- |
+| [`close`](#close) | the pass is over: the live line goes, under -v its log lines say what the transform and the writes took, then each file it rewrote or found differing has its result line |
+| [`result`](#result) | the pass's closing line on stdout, which a stream operand's text never shares |
 
 | On `Sink` | |
 | :--- | :--- |
 | [`SINK_FILE`](#sink), [`SINK_STREAM`](#sink), [`SINK_NAME`](#sink), [`SINK_DIFF`](#sink) | |
-| [`project`](#project) | rewrite or check one project's source: the manifest names the source directory, the dependency tree is identified so it can never be selected, and the walk visits only the source tree's `.mach` files |
-| [`tree`](#tree) | `project` over the source directory `rel`, cleaned and relative to the root |
+| [`tree`](#tree) | rewrite or check one project's source directory `rel`, cleaned and relative to the root: the dependency tree is identified so it can never be selected, and the walk visits only the source tree's `.mach` files |
 | [`file`](#file) | rewrite one file named directly, with no manifest read: the file's own directory is opened so the leaf is handled exactly as the project walk handles it |
 | [`stream`](#stream) | rewrite the source arriving on one descriptor onto another; nothing on disk is read or written, so no manifest is involved at any point |
+
+| On `Project` | |
+| :--- | :--- |
+| [`project_none`](#project_none) | a project not read yet, which project_dnit leaves alone |
+| [`project_dnit`](#project_dnit) | |
+| [`project_read`](#project_read) | the `[project]` table of the manifest at `manifest_path` |
+| [`project_of`](#project_of) | `project_read` of a manifest already read |
 
 | Functions | |
 | :--- | :--- |
 | [`text_of`](#text_of) | the text of the file at `path`, none when it cannot be read as one |
-| [`source_dir_of`](#source_dir_of) | `source_dir` of a manifest already read |
 
 | Constants | |
 | :--- | :--- |
@@ -56,10 +67,10 @@ it. the last argument is the pass's `context`
 ### report
 
 ```mach
-pub fun report(diagnostics: *mach.cli.diagnostic.Report, sources: *mach.base.source.SourceMap, transform: Transform) Report
+pub fun report(a: *std.allocator.Allocator, diagnostics: *mach.cli.diagnostic.Report, sources: *mach.base.source.SourceMap, transform: Transform, stage: str) Report
 ```
 
-a pass with nothing read yet
+a pass with nothing read yet, which begins now: the live line shows its stage from here
 
 ## Heading
 
@@ -85,6 +96,14 @@ pub rec Report {
     context:     ptr;
     heading:     Heading;
     verb:        mach.report.layout.Verb;
+    stage:       str;
+    subject:     str;
+    started:     mach.report.readout.Instant;
+    changing:    std.chrono.duration.Duration;
+    writing:     std.chrono.duration.Duration;
+    written:     usize;
+    said:        Vector[Said];
+    a:           *std.allocator.Allocator;
 }
 ```
 
@@ -101,7 +120,42 @@ one command's pass over its inputs
 | `transform` | `Transform` | the text each source becomes |
 | `context` | `ptr` | what the command hands its transform |
 | `heading` | `Heading` | what heads each change a diff prints, nil for none |
-| `verb` | `mach.report.layout.Verb` | what the progress line of a rewritten file says was done to it |
+| `verb` | `mach.report.layout.Verb` | what the result line of a rewritten file says was done to it |
+| `stage` | `str` | what the log line and the live line call the transform, as `format` |
+| `subject` | `str` | what the closing line names, the project's id or the operand, which outlives the pass |
+| `started` | `mach.report.readout.Instant` | when the pass began |
+| `changing` | `std.chrono.duration.Duration` | the time the transform took over every file |
+| `writing` | `std.chrono.duration.Duration` | the time the rewritten files took to write |
+| `written` | `usize` | files rewritten in place |
+| `said` | `Vector[Said]` | each file the pass rewrote or found differing, said once it closes |
+| `a` | `*std.allocator.Allocator` | what holds `said` |
+
+### close
+
+```mach
+pub fun close(report: *Report)
+```
+
+the pass is over: the live line goes, under -v its log lines say what the transform and the
+writes took, then each file it rewrote or found differing has its result line
+
+### result
+
+```mach
+pub fun result(report: *Report, check: bool, faulted: bool, sink: Sink)
+```
+
+the pass's closing line on stdout, which a stream operand's text never shares. it fails for a
+malformed file, a file --check found the transform would change, or a fault the command found
+beside, passes under --check, and says unchanged when no file differed. a pass that rewrote files
+said so file by file and closes on nothing more
+
+| Parameter | |
+| :--- | :--- |
+| `report` | the closed pass |
+| `check` | whether --check ran it |
+| `faulted` | whether the command found a fault beside the pass's files |
+| `sink` | the sink the pass wrote through |
 
 ## Sink
 
@@ -125,24 +179,16 @@ where the transformed text of one input goes
 | `SINK_NAME` | `2` |  |
 | `SINK_DIFF` | `3` |  |
 
-### project
-
-```mach
-pub fun project(a: *std.allocator.Allocator, backing: *std.allocator.Allocator, project_root: str, manifest_path: str, sink: Sink, report: *Report) err[mach.base.fail.Fail]
-```
-
-rewrite or check one project's source: the manifest names the source
-directory, the dependency tree is identified so it can never be selected, and
-the walk visits only the source tree's `.mach` files
-
 ### tree
 
 ```mach
 pub fun tree(a: *std.allocator.Allocator, backing: *std.allocator.Allocator, project_root: str, rel: str, sink: Sink, report: *Report) err[mach.base.fail.Fail]
 ```
 
-`project` over the source directory `rel`, cleaned and relative to the root. each source is
-named from the root as given, as the manifest is, so a diff applies from where the command ran
+rewrite or check one project's source directory `rel`, cleaned and relative to the root: the
+dependency tree is identified so it can never be selected, and the walk visits only the source
+tree's `.mach` files. each source is named from the root as given, as the manifest is, so a diff
+applies from where the command ran
 
 ### file
 
@@ -163,6 +209,52 @@ rewrite the source arriving on one descriptor onto another; nothing on disk
 is read or written, so no manifest is involved at any point. the descriptors
 are parameters rather than the process streams so the caller owns that binding
 
+## Project
+
+```mach
+pub rec Project {
+    id:  str;
+    src: str;
+}
+```
+
+what a rewrite reads of a manifest: only its `[project]` table, so it never needs a build profile
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `id` | `str` | `project.id`, which a pass's closing line names |
+| `src` | `str` | `project.src`, cleaned, relative to the project root |
+
+### project_none
+
+```mach
+pub fun project_none() Project
+```
+
+a project not read yet, which project_dnit leaves alone
+
+### project_dnit
+
+```mach
+pub fun project_dnit(a: *std.allocator.Allocator, p: *Project)
+```
+
+### project_read
+
+```mach
+pub fun project_read(a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, manifest_path: str) res[Project, mach.base.fail.Fail]
+```
+
+the `[project]` table of the manifest at `manifest_path`
+
+### project_of
+
+```mach
+pub fun project_of(a: *std.allocator.Allocator, doc: *mach.manifest.load.Doc) res[Project, mach.base.fail.Fail]
+```
+
+`project_read` of a manifest already read
+
 ## Functions
 
 ### text_of
@@ -172,14 +264,6 @@ pub fun text_of(a: *std.allocator.Allocator, path: str) opt[str]
 ```
 
 the text of the file at `path`, none when it cannot be read as one
-
-### source_dir_of
-
-```mach
-pub fun source_dir_of(a: *std.allocator.Allocator, doc: *mach.manifest.load.Doc) res[str, mach.base.fail.Fail]
-```
-
-`source_dir` of a manifest already read
 
 ## Constants
 

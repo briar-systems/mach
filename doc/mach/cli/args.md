@@ -49,6 +49,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`serve`](#serve) | run a handler over a parsed line whatever it is refused for, reporting through one report in the format `--report` selects, as `--help` does in place of the command it follows |
 | [`collect_selectors`](#collect_selectors) | the `-a`, `-t` and `-p` patterns and `--all` an invocation was given |
 | [`selection_hint`](#selection_hint) | a selection refusal whose unknown value names a path in the working directory, restated as the shell's expansion of an unquoted wildcard it almost always is; any other failure is returned as given |
+| [`verbosity`](#verbosity) | the readout level `-v` and `-vv` ask for: 0 without them, 1 for one, 2 for more, and 0 for a command that takes no `-v` |
 
 | Constants | |
 | :--- | :--- |
@@ -428,6 +429,15 @@ any other failure is returned as given
 | `a` | owns the restated message |
 | `selectors` | the patterns the command was given |
 | `f` | the failure resolving them |
+
+### verbosity
+
+```mach
+pub fun verbosity(inv: *std.args.Parsed) u8
+```
+
+the readout level `-v` and `-vv` ask for: 0 without them, 1 for one, 2 for more, and 0 for a
+command that takes no `-v`
 
 ## Constants
 

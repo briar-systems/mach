@@ -20,6 +20,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | [`Selected`](#selected) | `rec` | a closed selection of masc's catalog of the target's architecture, held by value |
 | [`Target`](#target) | `rec` | a target mink resolved and masc checked |
 | [`Image`](#image) | `rec` | the image keys a manifest states of a target, 0 for each it leaves out |
+| [`Fact`](#fact) | `rec` | one part of a resolved target as a person reads it, `mach info` and the build's readout alike |
 | [`Refused`](#refused) | `rec` | a refusal of a target and the part of it refused |
 
 | On `Selected` | |
@@ -35,6 +36,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | [`abi`](#abi) | the calling convention row of the target, nil where its family names none |
 | [`abi_name`](#abi_name) | mink's psABI name of the target's calling convention, "" where its family names none |
 | [`isa`](#isa) | the instruction set the target stands on, in masc's spelling |
+| [`facts`](#facts) | the parts of a selected target in the order they are listed: its instruction set, system, environment (`none` for a host with none), calling convention, code model and linkage (`-` where it names none) and object format |
 | [`pie`](#pie) | whether the target's executable is position independent: the linkage the target resolved to |
 
 | On `Image` | |
@@ -51,6 +53,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | Constants | |
 | :--- | :--- |
 | [`MAX_ADDED`](#constants) | the most extensions a target adds over its baseline |
+| [`FACT_COUNT`](#constants) | the parts facts lists |
 
 ---
 
@@ -165,6 +168,21 @@ pub fun isa(t: *Target) str
 
 the instruction set the target stands on, in masc's spelling
 
+### facts
+
+```mach
+pub fun facts(t: *Target, out: *Fact)
+```
+
+the parts of a selected target in the order they are listed: its instruction set, system,
+environment (`none` for a host with none), calling convention, code model and linkage (`-`
+where it names none) and object format
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the target, selected |
+| `out` | FACT_COUNT facts, borrowing the target's names |
+
 ### pie
 
 ```mach
@@ -196,6 +214,17 @@ the target `s` narrowed by `n` resolves to, with the image keys `image` states. 
 resolves every part, the object format included, and masc checks the instruction set and
 the extensions the narrowing adds. the target holds the names of the extensions, and
 borrows the narrowing's other text
+
+## Fact
+
+```mach
+pub rec Fact {
+    key:   str;
+    value: str;
+}
+```
+
+one part of a resolved target as a person reads it, `mach info` and the build's readout alike
 
 ## Refused
 
@@ -256,4 +285,5 @@ refuses them, as a user failure of `kind`
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `MAX_ADDED` | `u32` | `64` | the most extensions a target adds over its baseline |
+| `FACT_COUNT` | `usize` | `7` | the parts facts lists |
 
