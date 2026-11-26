@@ -26,13 +26,17 @@ use std.types.string.str_starts_with;
 
 use A: std.allocator;
 use std.allocator.arena;
-use chrono_duration:    std.chrono.duration;
+use chrono_duration: std.chrono.duration;
+use std.chrono.time;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
 use std_format: std.format;
 use io_writer:  std.io.writer;
 use std.print;
 use std.process.env;
+use std.sync.condition;
+use std.sync.mutex;
+use sync_thread:  std.sync.thread;
 use types_string: std.types.string;
 
 use mach.base.diagnostic;
@@ -118,7 +122,7 @@ fun excerpt_of(b: base_source.Span, m: MarkRange) Excerpt {
 }
 
 # render every diagnostic of a store through a command's report: as text, counted into the
-# tally the report closes with, or a record each under json
+# report's errors and warnings, or a record each under json
 # ---
 # r:       the command's report
 # sources: the SourceMap that locates each diagnostic
@@ -131,16 +135,16 @@ pub fun report_store(r: *Report, sources: *base_source.SourceMap, list: *diagnos
     render_store_records(r, sources, list, report_paths(r));
 }
 
-# render every diagnostic of a store as text on the report's stream, a blank line between
-# them, counting each into the tally the report closes with
+# render every diagnostic of a store as text on the report's stream, a blank line owed after
+# each, counting each into the report's errors and warnings
 fun render_store(r: *Report, sources: *base_source.SourceMap, list: *diagnostic.DiagnosticStore) {
     val total: usize = diagnostic.len(list);
     var i:     usize = 0;
     for (i < total) {
         val d: *diagnostic.Diagnostic = ?list.items.data[i];
-        if (i > 0) { std_format.write_str(?r.w, "\n"); }
         render(?r.w, sources, d);
         count_record(r, d);
+        owe_blank(r);
         i = i + 1;
     }
 }
@@ -380,23 +384,24 @@ fun emit_gutter_bar(out: *io_writer.Writer, w: usize) {
     std_format.write_str(out, " | ");
 }
 
+# `note text` at `indent`, each further line of the text beneath its first
 fun emit_tagged(out: *io_writer.Writer, tag: str, text: str, indent: usize) {
     emit_spaces(out, indent);
     std_format.write_str(out, tag);
     std_format.write_str(out, " ");
-    std_format.write_str(out, text);
+    val n:   usize = str_len(text);
+    var seg: usize = 0;
+    var i:   usize = 0;
+    for (i < n) {
+        if (text[i] == '\n') {
+            std_format.write_bytes(out, ?text[seg], i - seg + 1);
+            emit_spaces(out, indent + str_len(tag) + 1);
+            seg = i + 1;
+        }
+        i = i + 1;
+    }
+    std_format.write_bytes(out, ?text[seg], n - seg);
     std_format.write_newline(out);
-}
-
-fun emit_summary(out: *io_writer.Writer, errors: usize, warnings: usize) {
-    std_format.write_u64(out, errors::u64);
-    if (errors == 1) { std_format.write_str(out, " error"); }
-    or               { std_format.write_str(out, " errors"); }
-    std_format.write_str(out, " / ");
-    std_format.write_u64(out, warnings::u64);
-    if (warnings == 1) { std_format.write_str(out, " warning"); }
-    or                 { std_format.write_str(out, " warnings"); }
-    std_format.write_str(out, "\n");
 }
 
 # the kind's severity, then its key where it names one: `warning[vector.scalarize] `
@@ -496,15 +501,9 @@ pub fun refuse(sources: *base_source.SourceMap, f: fail.Fail) i64 {
     ret render_fail(sources, ?f);
 }
 
-fun package_said(ctx: ptr, v: layout.Verb, texts: *str, n: usize) {
-    said_row(out(ctx::*Report), v, texts, n);
-}
-
-# a remark of the dependency work, beneath the progress lines it belongs to
-fun package_line(ctx: ptr, text: str) {
-    val w: *io_writer.Writer = out(ctx::*Report);
-    layout.beneath(w);
-    std_format.format(w, "{}\n", text);
+fun package_said(ctx: ptr, v: layout.Verb, subject: str, fields: *layout.Field, n: usize) {
+    val r: *Report = ctx::*Report;
+    if (results_shown(r)) { layout.result(out(r), v, subject, fields, n); }
 }
 
 fun package_note(ctx: ptr, text: str) {
@@ -515,14 +514,38 @@ fun package_fault(ctx: ptr, f: fail.Fail) {
     val code: i64 = report_fail(ctx::*Report, f, diagnostic.ORIGIN_NONE);
 }
 
-# where a dependency command reports: progress on standard output, and notes and failures,
-# the ones the command goes on past too, through the command's report
+# what the dependency work calls a fetch from a remote, on the live line and in the log
+pub val FETCH_LABEL: str = "fetch";
+
+# a fetch began: the live line names its remote, under the stage the command opened over its
+# fetches, and under a stage of the fetch's own when it opened none
+fun package_fetching(ctx: ptr, url: str, done: u32, total: u32, staged: bool) {
+    val r: *Report = ctx::*Report;
+    if (!staged) { live_begin(r, FETCH_LABEL); }
+    live_reached(r, done, total, url);
+}
+
+# a fetch ended: under -vv an item line of the command's stage when it opened one, and under -v
+# a stage line of its own when it opened none
+fun package_fetched(ctx: ptr, url: str, d: chrono_duration.Duration, staged: bool) {
+    val r: *Report = ctx::*Report;
+    if (staged) {
+        log_item(r, FETCH_LABEL, d, url);
+        ret;
+    }
+    live_end(r);
+    log_stage(r, FETCH_LABEL, d, url);
+}
+
+# where a dependency command reports: results on standard output, notes and failures, the
+# ones the command goes on past too, through the command's report, and each fetch on the live
+# line and in the log
 # ---
 # a:   owns the report's effect notes
 # r:   the command's report, in the format `--report` selected
 # ret: the report, released with `report.dnit`
 pub fun dependency_report(a: *A.Allocator, r: *Report) report.Report {
-    ret report.init(a, r::ptr, package_said, package_line, package_note, package_fault);
+    ret report.init(a, r::ptr, report.Sink{said: package_said, note: package_note, fault: package_fault, fetching: package_fetching, fetched: package_fetched});
 }
 
 # show how a dependency command ended: its failure, then a note for each change it made
@@ -565,76 +588,154 @@ pub fun outcome_code(bo: *outcome.BuildOutcome) i64 {
     ret outcome_code_w(?w, bo);
 }
 
-# the -v table's number columns: a row's count and its time
-val COUNT_W: usize = 5;
-val TIME_W:  usize = 6;
+# a log line's label column, a time column, and the lead of a fact beneath a log line
+val LABEL_W:    usize = 11;
+val TIME_W:     usize = 6;
+val FACT_LEAD:  usize = 28;
+val FACT_KEY_W: usize = 12;
+# the lead of a log line in place of its stamp, as the live line carries it
+val STAMP_W: usize = 9;
 
-# the row labels the renderer adds to the phase table's: the header's, the unit's unaccounted
-# time, its wall time, and a growing cycle's line
-val STAGE_LABEL:  str = "stage";
-val OTHER_LABEL:  str = "other";
-val TOTAL_LABEL:  str = "total";
-val GROWTH_LABEL: str = "instantiate";
+# the recap's columns: its label, count and time, and the bar it scales to the largest row
+val RECAP_LABEL_W: usize = 12;
+val RECAP_COUNT_W: usize = 6;
+val RECAP_TIME_W:  usize = 8;
+# a cell of the module time table
+val CELL_W: usize = 8;
 
-# the mark of a row whose time is summed over worker threads, explained once beneath the table
+# the mark of a recap row whose time is summed over worker threads, explained once beneath it
 val SUMMED_MARK: str = "*";
 
-# the lead of a line under a test failure, past its `FAIL  `
-val DETAIL: str = "      ";
+# the label a growing cycle's line carries
+val GROWTH_LABEL: str = "instantiate";
 
-# the widest line a live progress line takes, so a terminal never wraps it
-val LIVE_WIDTH: usize = 79;
-
-# a row of the -v table, held until the unit closes so its bars scale to the largest: a phase
-# row, or with `item` an item of the phase that processed it, `name` naming the item or the
-# row's slowest item
-rec StageRow {
-    item:    bool;
-    shown:   bool;
-    phase:   readout.Phase;
-    count:   u32;
-    noun:    readout.Noun;
-    elapsed: chrono_duration.Duration;
-    threads: u32;
-    dropped: u32;
-    name:    str;
-    slowest: chrono_duration.Duration;
+# one recap row, gathered over every close of its phase: its count, time, the most threads its
+# time is summed over and its slowest item
+rec Row {
+    seen:            bool;
+    count:           u32;
+    elapsed:         chrono_duration.Duration;
+    threads:         u32;
+    slowest:         str;
+    slowest_elapsed: chrono_duration.Duration;
 }
 
-# one module's counters under -vv, those it posted `has`
+# one module under -vv: the time each part of its codegen took, and its counters, those it posted `has`
 rec ModuleRow {
     name:   str;
+    times:  [readout.PHASE_COUNT]chrono_duration.Duration;
     values: [readout.COUNTER_COUNT]u64;
     has:    [readout.COUNTER_COUNT]bool;
 }
 
-# a unit's summary held for the one table that closes a selection of several units: what it
-# closed, whether it found everything current, and the text of each column, by UnitColumn
-rec UnitRow {
-    closed:    readout.Closed;
-    unchanged: bool;
-    cells:     [UNIT_COLUMNS]str;
+# every command's build and test events rendered the moment each arrives: the renderer of the
+# readout contract (doc/language/readout.md). results go to stdout, the same at every
+# level; log lines, items, facts and diagnostics go to stderr as they happen, and a terminal
+# shows the live line beneath them. the records modes write each diagnostic and failure as a
+# record, and under -v each unit, phase row, item, fact and counter
+# ---
+# sink:     what the engine and the test runner are given; its ctx is this record, which must not move
+# r:        the command's report
+# quiet:    `--quiet`, which leaves out the results
+# unit:     the unit the events now arriving belong to
+# errors:   the errors the unit reported, its warnings in `warnings`
+# rows:     the unit's recap, by phase
+# a:        the arena what is held lives in, nil until something is
+# modules:  each module's codegen times and counters under -vv, the last one met at `last`
+# counts:   the unit's counter totals, those `held`
+# run:      the running test run's results, from its run_start to its run_end, `count` of them
+# finished: how many of them have finished
+pub rec Readout {
+    sink:     readout.Sink;
+    r:        *Report;
+    quiet:    bool;
+    unit:     readout.Unit;
+    errors:   u32;
+    warnings: u32;
+    rows:     [readout.PHASE_COUNT]Row;
+    a:        *A.Allocator;
+    modules:  Vector[ModuleRow];
+    last:     usize;
+    counts:   [readout.COUNTER_COUNT]u64;
+    held:     [readout.COUNTER_COUNT]bool;
+    run:      *readout.TestResult;
+    count:    u32;
+    finished: u32;
 }
 
-# a column of the units table, and its header
-def UnitColumn: usize;
+# start rendering a command's events to r, at the level and quietness its command line set
+# ---
+# rd: the renderer, initialised in place since its sink points at it
+# r:  the command's report
+pub fun readout_begin(rd: *Readout, r: *Report) {
+    rd.sink.ctx      = rd::ptr;
+    rd.sink.on_event = readout_on_event;
+    rd.sink.level    = r.level;
+    rd.sink.live     = nil;
+    rd.r             = r;
+    rd.quiet         = r.quiet;
+    rd.unit          = readout.Unit{artifact: nil, target: nil, profile: nil, verb: nil};
+    rd.a             = nil;
+    rd.modules       = collections_vector.init[ModuleRow](nil);
+    rd.run           = nil;
+    rd.count         = 0;
+    rd.finished      = 0;
+    unit_reset(rd);
+    if (r.format == FORMAT_HUMAN && !r.quiet && live_start(r)) { rd.sink.live = ?r.live; }
+}
 
-val UNIT_TARGET:   UnitColumn = 0;
-val UNIT_ARTIFACT: UnitColumn = 1;
-val UNIT_PROFILE:  UnitColumn = 2;
-val UNIT_MODULES:  UnitColumn = 3;
-val UNIT_SIZE:     UnitColumn = 4;
-val UNIT_TIME:     UnitColumn = 5;
-val UNIT_COLUMNS:  usize      = 6;
+# the unit a test run that follows belongs to, which its results name; each name borrowed
+# until the run ends
+pub fun readout_unit(rd: *Readout, artifact: str, target: str, profile: str) {
+    rd.unit = readout.Unit{artifact: artifact, target: target, profile: profile, verb: nil};
+}
 
-val UNIT_HEADS: [UNIT_COLUMNS]str = [UNIT_COLUMNS]str{"target", "artifact", "profile", "modules", "size", "time"};
+# close a plan's rendering: the live line goes
+pub fun readout_end(rd: *Readout) {
+    live_stop(rd.r);
+}
 
-fun unit_banner_w(w: *io_writer.Writer, ev: *readout.Unit) {
-    var texts: [3]str           = [3]str{ev.target, ev.artifact, ev.profile};
-    var cols:  [3]layout.Column = [3]layout.Column{layout.Column{width: 0, align: layout.LEFT, gap: 0}, layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP},
-        layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP}};
-    std_format.write_newline(w);
-    layout.row(w, ?cols[0], ?texts[0], 3);
+# forget what the last unit held
+fun unit_reset(rd: *Readout) {
+    rd.errors   = 0;
+    rd.warnings = 0;
+    var p: usize = 0;
+    for (p < readout.PHASE_COUNT) {
+        rd.rows[p] = Row{seen: false, count: 0, elapsed: 0, threads: 0, slowest: nil, slowest_elapsed: 0};
+        p          = p + 1;
+    }
+    var c: usize = 0;
+    for (c < readout.COUNTER_COUNT) {
+        rd.counts[c] = 0;
+        rd.held[c]   = false;
+        c            = c + 1;
+    }
+    rd.modules.len = 0;
+    rd.last        = 0;
+}
+
+fun readout_on_event(ctx: ptr, ev: *readout.Event) {
+    val rd: *Readout = ctx::*Readout;
+    if (rd.r.format != FORMAT_HUMAN) { readout_records(rd, ev); }
+    or                               { readout_human(rd, ev); }
+}
+
+fun readout_human(rd: *Readout, ev: *readout.Event) {
+    if (sel ev.unit) {
+        unit_reset(rd);
+        rd.unit = ev.unit;
+    }
+    or (sel ev.phase)     { phase_shown(rd, ?ev.phase); }
+    or (sel ev.item)      { item_shown(rd, ?ev.item); }
+    or (sel ev.tally)     { tally_held(rd, ?ev.tally); }
+    or (sel ev.fact)      { fact_w(?rd.r.w, ev.fact.key, ev.fact.value); }
+    or (sel ev.growth)    { growth_w(rd, ?ev.growth); }
+    or (sel ev.summary)   { summary_shown(rd, ?ev.summary); }
+    or (sel ev.reported)  { reported_shown(rd, ?ev.reported); }
+    or (sel ev.failure)   { failure_shown(rd, ?ev.failure); }
+    or (sel ev.run_start) { run_begin(rd, ?ev.run_start); }
+    or (sel ev.test_end)  { test_shown(rd, ev.test_end.at); }
+    or (sel ev.run_end)   { run_close(rd, ?ev.run_end); }
 }
 
 # the arena the renderer keeps what it holds in, the report's, armed on first use; nil, with
@@ -643,15 +744,14 @@ fun held_alloc(rd: *Readout) *A.Allocator {
     if (rd.a != nil)               { ret rd.a; }
     if (report_paths(rd.r) == nil) { ret nil; }
     rd.a       = ?rd.r.a;
-    rd.rows    = collections_vector.init[StageRow](rd.a);
     rd.modules = collections_vector.init[ModuleRow](rd.a);
-    rd.done    = collections_vector.init[UnitRow](rd.a);
     ret rd.a;
 }
 
 # a copy of s in the renderer's arena, s itself when it cannot be kept
 fun kept(rd: *Readout, s: str) str {
-    if (s == nil) { ret nil; }
+    if (s == nil)              { ret nil; }
+    if (held_alloc(rd) == nil) { ret s; }
     val res_copy: res[str, A.Error] = str_dup(rd.a, s);
     if (sel res_copy.err) {
         refused(rd.r, fail.refused(res_copy.err));
@@ -660,21 +760,320 @@ fun kept(rd: *Readout, s: str) str {
     ret res_copy.ok;
 }
 
-fun hold_row(rd: *Readout, row: StageRow) {
-    if (held_alloc(rd) == nil) { ret; }
-    var r: StageRow = row;
-    r.name = kept(rd, row.name);
-    val res_pushed: res[usize, A.Error] = collections_vector.push[StageRow](?rd.rows, r);
-    if (sel res_pushed.err) { refused(rd.r, fail.refused(res_pushed.err)); }
+# a log line's lead: the time since the command began, the label, under an item indented, and
+# the time, each in its column; what follows is the caller's
+fun log_head(rd: *Readout, item: bool, label: str, time: str) {
+    log_lead(rd.r, item, label, time);
 }
 
-fun phase_held(rd: *Readout, ev: *readout.PhaseEnd) {
-    hold_row(rd, StageRow{item: false, shown: false, phase: ev.phase, count: ev.count, noun: ev.noun, elapsed: ev.elapsed, threads: ev.threads,
-        dropped: ev.dropped, name: ev.slowest, slowest: ev.slowest_elapsed});
+# a log line's lead on the report's stream: the time since the command began, the label, under an
+# item indented, and the time, each in its column
+fun log_lead(r: *Report, item: bool, label: str, time: str) {
+    val w: *io_writer.Writer = ?r.w;
+    stamp_w(w, readout.elapsed(r.origin));
+    var used: usize = str_len(label);
+    if (item) {
+        std_format.write_str(w, "  ");
+        used = used + 2;
+    }
+    std_format.write_str(w, label);
+    if (used < LABEL_W) { layout.spaces(w, LABEL_W - used); }
+    right_w(w, time, TIME_W);
 }
 
-fun item_held(rd: *Readout, ev: *readout.Item) {
-    hold_row(rd, StageRow{item: true, shown: false, phase: ev.phase, count: 0, noun: 0, elapsed: ev.elapsed, threads: 0, dropped: 0, name: ev.name, slowest: 0});
+# `[  0.07] `: a duration in seconds to two places, right-aligned in its brackets
+fun stamp_w(w: *io_writer.Writer, d: chrono_duration.Duration) {
+    var cs: u64 = 0;
+    if (d > 0) { cs = (d::u64 + 5000000) / 10000000; }
+    var t:  layout.Text;
+    var tw: io_writer.Writer = layout.text_writer(?t);
+    std_format.format(?tw, "{}.", cs / 100);
+    if (cs % 100 < 10) { std_format.write_str(?tw, "0"); }
+    std_format.format(?tw, "{}", cs % 100);
+    val s: str = layout.text_end(?t);
+    std_format.write_str(w, "[");
+    right_w(w, s, STAMP_W - 3);
+    std_format.write_str(w, "] ");
+}
+
+# s right-aligned in `width`, spaces alone for nil
+fun right_w(w: *io_writer.Writer, s: str, width: usize) {
+    var l: usize = 0;
+    if (s != nil)  { l = str_len(s); }
+    if (l < width) { layout.spaces(w, width - l); }
+    if (s != nil)  { std_format.write_str(w, s); }
+}
+
+# s left-aligned in `width`; the padding is written only for a cell that has text after it
+fun left_w(w: *io_writer.Writer, s: str, width: usize) {
+    std_format.write_str(w, s);
+    val l: usize = str_len(s);
+    if (l < width) { layout.spaces(w, width - l); }
+}
+
+# `  N noun` after a line's columns, nothing for a count of zero
+fun counted_w(w: *io_writer.Writer, n: u64, one: str, many: str) {
+    if (n == 0) { ret; }
+    std_format.format(w, "  {} {}", n, layout.noun(n, one, many));
+}
+
+# a phase row closed: its time joins the recap, and a phase with a row of its own gets its log
+# line under -v, one that processed nothing only where its detail says so
+fun phase_shown(rd: *Readout, ev: *readout.PhaseEnd) {
+    val row: *Row = ?rd.rows[ev.phase];
+    row.seen    = true;
+    row.count   = row.count + ev.count;
+    row.elapsed = row.elapsed + ev.elapsed;
+    if (ev.threads > row.threads) { row.threads = ev.threads; }
+    if (ev.slowest != nil && (row.slowest == nil || ev.slowest_elapsed > row.slowest_elapsed)) {
+        row.slowest         = kept(rd, ev.slowest);
+        row.slowest_elapsed = ev.slowest_elapsed;
+    }
+    if (rd.sink.level < readout.LEVEL_PHASES)              { ret; }
+    if (readout.parent_of(ev.phase) != readout.PHASE_NONE) { ret; }
+    if (ev.count == 0 && !readout.shows_zero(ev.phase))    { ret; }
+    val w:  *io_writer.Writer = ?rd.r.w;
+    var dt: layout.Text;
+    log_head(rd, false, readout.label_of(ev.phase), layout.duration(?dt, ev.elapsed));
+    val detail: readout.Detail = readout.detail_of(ev.phase);
+    if (detail == readout.DETAIL_TARGET) {
+        var tv: layout.Value;
+        std_format.format(w, "  {}", layout.target(?tv, rd.unit.target, rd.unit.profile));
+    }
+    or (detail == readout.DETAIL_REUSED) {
+        if (ev.count == 0) { std_format.write_str(w, "  none reused"); }
+        or                 { std_format.format(w, "  {} reused", ev.count::u64); }
+    }
+    or (detail == readout.DETAIL_SIZE && ev.sized) {
+        var st: layout.Text;
+        std_format.format(w, "  {}", layout.size(?st, ev.bytes));
+    }
+    or (detail == readout.DETAIL_SIZE && ev.count == 0) { std_format.write_str(w, "  up to date"); }
+    or                                                  { std_format.format(w, "  {} {}", ev.count::u64, readout.noun_of(ev.noun, ev.count::u64)); }
+    counted_w(w, ev.errors::u64, "error", "errors");
+    counted_w(w, ev.warnings::u64, "warning", "warnings");
+    counted_w(w, ev.dropped::u64, "target-gated", "target-gated");
+    std_format.write_newline(w);
+}
+
+# an item: under -vv a phase with a row of its own shows it as its own line; a part of codegen
+# adds its time to its module's, and the module's write, its last part, shows the module's codegen
+# time on one line
+fun item_shown(rd: *Readout, ev: *readout.Item) {
+    if (readout.parent_of(ev.phase) == readout.PHASE_NONE) {
+        var dt: layout.Text;
+        log_head(rd, true, readout.label_of(ev.phase), layout.duration(?dt, ev.elapsed));
+        if (ev.name != nil) { std_format.format(?rd.r.w, "  {}", ev.name); }
+        std_format.write_newline(?rd.r.w);
+        ret;
+    }
+    val m: *ModuleRow = module_row(rd, ev.name);
+    if (m == nil) { ret; }
+    m.times[ev.phase] = m.times[ev.phase] + ev.elapsed;
+    if (ev.phase != readout.WRITE) { ret; }
+    var total: chrono_duration.Duration = 0;
+    var p:     usize                    = 0;
+    for (p < readout.PHASE_COUNT) {
+        total = total + m.times[p];
+        p     = p + 1;
+    }
+    var dt: layout.Text;
+    log_head(rd, true, readout.label_of(readout.parent_of(ev.phase)), layout.duration(?dt, total));
+    std_format.format(?rd.r.w, "  {}\n", m.name);
+}
+
+# the row of module `name`, made on first sight; nil when it cannot be kept
+fun module_row(rd: *Readout, name: str) *ModuleRow {
+    if (name == nil || held_alloc(rd) == nil) { ret nil; }
+    # a module's parts arrive together, so the last row met is most often the one asked for
+    if (rd.last < rd.modules.len && str_equals(rd.modules.data[rd.last].name, name)) { ret ?rd.modules.data[rd.last]; }
+    var i: usize = 0;
+    for (i < rd.modules.len && !str_equals(rd.modules.data[i].name, name)) { i = i + 1; }
+    if (i == rd.modules.len) {
+        var m: ModuleRow;
+        m.name = kept(rd, name);
+        var p: usize = 0;
+        for (p < readout.PHASE_COUNT) {
+            m.times[p] = 0;
+            p          = p + 1;
+        }
+        var c: usize = 0;
+        for (c < readout.COUNTER_COUNT) {
+            m.values[c] = 0;
+            m.has[c]    = false;
+            c           = c + 1;
+        }
+        val res_pushed: res[usize, A.Error] = collections_vector.push[ModuleRow](?rd.modules, m);
+        if (sel res_pushed.err) {
+            refused(rd.r, fail.refused(res_pushed.err));
+            ret nil;
+        }
+    }
+    rd.last = i;
+    ret ?rd.modules.data[i];
+}
+
+# a counter's value: the unit's total, held for the code and memory lines, or one module's, held
+# for the counter table under -vv
+fun tally_held(rd: *Readout, ev: *readout.Tally) {
+    if (ev.name == nil) {
+        rd.counts[ev.counter] = ev.value;
+        rd.held[ev.counter]   = true;
+        ret;
+    }
+    val m: *ModuleRow = module_row(rd, ev.name);
+    if (m == nil) { ret; }
+    m.values[ev.counter] = ev.value;
+    m.has[ev.counter]    = true;
+}
+
+# one of the target's facts beneath its log line: its key in a column, then its value
+fun fact_w(w: *io_writer.Writer, key: str, value: str) {
+    layout.spaces(w, FACT_LEAD);
+    left_w(w, key, FACT_KEY_W);
+    std_format.format(w, "{}\n", value);
+}
+
+# a growing cycle of instances as it expands, written at once so a runaway expansion shows
+# while it runs
+fun growth_w(rd: *Readout, ev: *readout.Growth) {
+    log_head(rd, false, GROWTH_LABEL, nil);
+    std_format.format(?rd.r.w, "  growing cycle {} in {}: {} {} so far\n", ev.members, ev.module, ev.instances::u64, layout.noun(ev.instances::u64, "instance", "instances"));
+}
+
+# a diagnostic, rendered the moment the unit settled it, a blank line owed after it
+fun reported_shown(rd: *Readout, ev: *readout.Reported) {
+    render(?rd.r.w, ev.sources, ev.diag);
+    count_record(rd.r, ev.diag);
+    if (diagnostic.is_error(ev.diag))           { rd.errors = rd.errors + 1; }
+    or (!diagnostic_kind.is_note(ev.diag.kind)) { rd.warnings = rd.warnings + 1; }
+    owe_blank(rd.r);
+}
+
+# a failure that reached no store, rendered as the diagnostic it reads as
+fun failure_shown(rd: *Readout, ev: *readout.Failure) {
+    if (sel ev.fail.reported) { ret; }
+    val code: i64 = report_failure(rd.r, ev.fail, ev.origin);
+    rd.errors = rd.errors + 1;
+    owe_blank(rd.r);
+}
+
+# whether a unit found everything current: it compiled nothing and wrote nothing
+fun unchanged(ev: *readout.Summary) bool {
+    ret ev.closed == readout.CLOSED_BUILT && ev.compiled == 0 && !ev.written;
+}
+
+# a unit's close: under -vv its recap, then its result. a test build's dispatcher has none,
+# the run that follows closing it
+fun summary_shown(rd: *Readout, ev: *readout.Summary) {
+    if (ev.closed == readout.CLOSED_TESTS)               { ret; }
+    if (ev.rows && rd.sink.level >= readout.LEVEL_ITEMS) { recap_w(rd, ?rd.r.w, ev); }
+    if (rd.quiet)                                        { ret; }
+    var verb: layout.Verb = layout.BUILT;
+    if (ev.closed == readout.CLOSED_FAILED)  { verb = layout.FAILED; }
+    or (ev.closed == readout.CLOSED_CHECKED) { verb = layout.CHECKED; }
+    or (unchanged(ev))                       { verb = layout.UNCHANGED; }
+    var output: str = nil;
+    if (verb != layout.FAILED && verb != layout.CHECKED && ev.out != nil) { output = shown_path(ev.out); }
+    var tv:     layout.Value;
+    var et:     layout.Text;
+    var wt:     layout.Text;
+    var dt:     layout.Text;
+    var fields: [5]layout.Field = [5]layout.Field{
+        layout.Field{key: "target", value: layout.target(?tv, rd.unit.target, rd.unit.profile)},
+        layout.Field{key: "errors", value: layout.nonzero(?et, rd.errors::u64)},
+        layout.Field{key: "warnings", value: layout.nonzero(?wt, rd.warnings::u64)},
+        layout.Field{key: "time", value: layout.duration(?dt, ev.total)},
+        layout.Field{key: "output", value: output},
+    };
+    layout.result(out(rd.r), verb, rd.unit.artifact, ?fields[0], 5);
+}
+
+# a path as a result shows it, without a leading `./`
+pub fun shown_path(p: str) str {
+    if (str_starts_with(p, "./")) { ret (p::usize + 2)::str; }
+    ret p;
+}
+
+# the unit's recap under -vv, each block after a blank line: a row a phase with its count, time
+# and bar, the parts of a phase indented beneath it, then `other` and `total` and the legend of
+# the summed mark; the code and memory lines; each module's codegen times; each module's counters
+fun recap_w(rd: *Readout, w: *io_writer.Writer, sum: *readout.Summary) {
+    var most:    chrono_duration.Duration = sum.other;
+    var threads: u32                      = 0;
+    var mixed:   bool                     = false;
+    var p:       usize                    = 0;
+    for (p < readout.PHASE_COUNT) {
+        val row: *Row = ?rd.rows[p];
+        p = p + 1;
+        if (!row.seen || row.elapsed <= 0) { cnt; }
+        if (row.elapsed > most)            { most = row.elapsed; }
+        if (row.threads > 1) {
+            if (threads != 0 && threads != row.threads) { mixed = true; }
+            if (row.threads > threads)                  { threads = row.threads; }
+        }
+    }
+    std_format.write_newline(w);
+    left_w(w, "stage", RECAP_LABEL_W);
+    right_w(w, "count", RECAP_COUNT_W);
+    layout.spaces(w, 2);
+    right_w(w, "time", RECAP_TIME_W + 1);
+    std_format.write_newline(w);
+    p = 0;
+    for (p < readout.PHASE_COUNT) {
+        val row: *Row = ?rd.rows[p];
+        if (row.seen && row.elapsed > 0) { recap_row_w(w, p::readout.Phase, row, most); }
+        p = p + 1;
+    }
+    recap_total_w(w, "other", sum.other);
+    recap_total_w(w, "total", sum.total);
+    if (threads > 0) {
+        if (mixed) { std_format.format(w, "{} summed over up to {} threads\n", SUMMED_MARK, threads::u64); }
+        or         { std_format.format(w, "{} summed over {} threads\n", SUMMED_MARK, threads::u64); }
+    }
+    counter_lines(rd, w);
+    module_times(rd, w);
+    module_counters(rd, w);
+    std_format.write_newline(w);
+}
+
+# one recap row: its label, its count, blank when zero or for a row whose count is not a count
+# of what it processed, its time and mark, its bar, and its slowest item when it had several
+fun recap_row_w(w: *io_writer.Writer, ph: readout.Phase, row: *Row, most: chrono_duration.Duration) {
+    var label: usize = str_len(readout.label_of(ph));
+    if (readout.parent_of(ph) != readout.PHASE_NONE) {
+        std_format.write_str(w, "  ");
+        label = label + 2;
+    }
+    std_format.write_str(w, readout.label_of(ph));
+    if (label < RECAP_LABEL_W) { layout.spaces(w, RECAP_LABEL_W - label); }
+    var ct:    layout.Text;
+    var count: str = nil;
+    if (row.count > 0 && readout.detail_of(ph) != readout.DETAIL_REUSED) { count = layout.count(?ct, row.count::u64); }
+    right_w(w, count, RECAP_COUNT_W);
+    layout.spaces(w, 2);
+    var dt: layout.Text;
+    right_w(w, layout.duration(?dt, row.elapsed), RECAP_TIME_W);
+    if (row.threads > 1) { std_format.write_str(w, SUMMED_MARK); }
+    or                   { std_format.write_str(w, " "); }
+    layout.spaces(w, 2);
+    var bt:  layout.Text;
+    val bar: str = layout.bar_text(?bt, layout.bar_length(row.elapsed::u64, most::u64));
+    if (row.count > 1 && row.slowest != nil) {
+        left_w(w, bar, layout.BAR);
+        var st: layout.Text;
+        std_format.format(w, "  slowest {} {}", row.slowest, layout.duration(?st, row.slowest_elapsed));
+    }
+    or { std_format.write_str(w, bar); }
+    std_format.write_newline(w);
+}
+
+fun recap_total_w(w: *io_writer.Writer, label: str, d: chrono_duration.Duration) {
+    left_w(w, label, RECAP_LABEL_W);
+    layout.spaces(w, RECAP_COUNT_W + 2);
+    var dt: layout.Text;
+    right_w(w, layout.duration(?dt, d), RECAP_TIME_W);
+    std_format.write_newline(w);
 }
 
 # a counter's value as a person reads it: a size for a count of bytes, else grouped digits
@@ -683,148 +1082,25 @@ fun counter_text(t: *layout.Text, c: readout.Counter, value: u64) str {
     ret layout.grouped(t, value);
 }
 
-# a counter's value: the unit's total, held for the counter lines, or one module's, held for
-# the module table under -vv
-fun tally_held(rd: *Readout, ev: *readout.Tally) {
-    if (ev.name == nil) {
-        rd.counts[ev.counter] = ev.value;
-        rd.held[ev.counter]   = true;
-        rd.holding            = true;
-        ret;
-    }
-    if (held_alloc(rd) == nil) { ret; }
-    var i: usize = 0;
-    for (i < rd.modules.len && !str_equals(rd.modules.data[i].name, ev.name)) { i = i + 1; }
-    if (i == rd.modules.len) {
-        var m: ModuleRow;
-        m.name = kept(rd, ev.name);
-        var c: usize = 0;
-        for (c < readout.COUNTER_COUNT) {
-            m.has[c] = false;
-            c        = c + 1;
-        }
-        val res_pushed: res[usize, A.Error] = collections_vector.push[ModuleRow](?rd.modules, m);
-        if (sel res_pushed.err) {
-            refused(rd.r, fail.refused(res_pushed.err));
-            ret;
-        }
-    }
-    rd.modules.data[i].values[ev.counter] = ev.value;
-    rd.modules.data[i].has[ev.counter]    = true;
-}
-
-# the -v table of a unit: a header, each phase row with its bar and, under -vv, its items, the
-# `other` and `total` rows when the unit closed, the legend of the summed mark, then the
-# counter lines and under -vv the module table. what it held is let go
-fun stage_table(rd: *Readout, w: *io_writer.Writer, sum: *readout.Summary) {
-    val closing: bool = sum != nil && sum.rows;
-    if (rd.rows.len == 0 && !closing && !rd.holding) { ret; }
-    var label_w: usize = readout.label_width();
-    if (str_len(GROWTH_LABEL) > label_w) { label_w = str_len(GROWTH_LABEL); }
-    var cols: [6]layout.Column = [6]layout.Column{
-        layout.Column{width: label_w, align: layout.LEFT, gap: 0},
-        layout.Column{width: COUNT_W, align: layout.RIGHT, gap: layout.GAP},
-        layout.Column{width: readout.noun_width(), align: layout.LEFT, gap: 1},
-        layout.Column{width: TIME_W, align: layout.RIGHT, gap: layout.GAP},
-        layout.Column{width: 1, align: layout.LEFT, gap: 1},
-        layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP},
-    };
-    var most:    u64   = 0;
-    var threads: u32   = 0;
-    var mixed:   bool  = false;
-    var i:       usize = 0;
-    for (i < rd.rows.len) {
-        val row: *StageRow = ?rd.rows.data[i];
-        i = i + 1;
-        if (row.item)                { cnt; }
-        if (row.elapsed::u64 > most) { most = row.elapsed::u64; }
-        if (row.threads > 1) {
-            if (threads != 0 && threads != row.threads) { mixed = true; }
-            if (row.threads > threads)                  { threads = row.threads; }
-        }
-    }
-    if (closing && sum.other::u64 > most) { most = sum.other::u64; }
-    if (rd.rows.len > 0 || closing) {
-        var head: [4]str = [4]str{STAGE_LABEL, "count", nil, "time"};
-        layout.row(w, ?cols[0], ?head[0], 4);
-    }
-    i = 0;
-    for (i < rd.rows.len) {
-        val row: *StageRow = ?rd.rows.data[i];
-        i = i + 1;
-        if (row.item) { cnt; }
-        stage_row_w(w, ?cols[0], row, most);
-        items_w(rd, w, ?cols[0], row.phase);
-    }
-    items_w(rd, w, ?cols[0], readout.PHASE_NONE);
-    if (closing) {
-        var ot:    layout.Text;
-        var bt:    layout.Text;
-        var other: [6]str = [6]str{OTHER_LABEL, nil, nil, layout.duration(?ot, sum.other), nil, layout.bar_text(?bt, layout.bar_length(sum.other::u64, most))};
-        layout.row(w, ?cols[0], ?other[0], 6);
-        var tt:    layout.Text;
-        var total: [4]str = [4]str{TOTAL_LABEL, nil, nil, layout.duration(?tt, sum.total)};
-        layout.row(w, ?cols[0], ?total[0], 4);
-    }
-    if (threads > 0) {
-        if (mixed) { std_format.format(w, "{} summed over up to {} threads\n", SUMMED_MARK, threads::u64); }
-        or         { std_format.format(w, "{} summed over {} threads\n", SUMMED_MARK, threads::u64); }
-    }
-    counter_lines(rd, w);
-    module_table(rd, w);
-    rd.rows.len    = 0;
-    rd.modules.len = 0;
-}
-
-fun stage_row_w(w: *io_writer.Writer, cols: *layout.Column, row: *StageRow, most: u64) {
-    var nt:   layout.Text;
-    var dt:   layout.Text;
-    var bt:   layout.Text;
-    var mark: str = nil;
-    if (row.threads > 1) { mark = SUMMED_MARK; }
-    var texts: [6]str = [6]str{readout.label_of(row.phase), layout.count(?nt, row.count::u64), readout.noun_of(row.noun, row.count::u64),
-        layout.duration(?dt, row.elapsed), mark, layout.bar_text(?bt, layout.bar_length(row.elapsed::u64, most))};
-    layout.cells(w, cols, ?texts[0], 6);
-    if (row.dropped > 0) { std_format.format(w, "  ({} target-gated, not carried forward)", row.dropped::i64); }
-    if (row.name != nil) {
-        var st: layout.Text;
-        std_format.format(w, "  (slowest {} {})", row.name, layout.duration(?st, row.slowest));
-    }
-    std_format.write_newline(w);
-}
-
-# the items held of `phase`, each its time in the time column and its name after, then marked
-# shown; PHASE_NONE shows every item no row took
-fun items_w(rd: *Readout, w: *io_writer.Writer, cols: *layout.Column, phase: readout.Phase) {
-    var i: usize = 0;
-    for (i < rd.rows.len) {
-        val it: *StageRow = ?rd.rows.data[i];
-        i = i + 1;
-        if (!it.item || it.shown)                             { cnt; }
-        if (phase != readout.PHASE_NONE && it.phase != phase) { cnt; }
-        it.shown = true;
-        var dt:    layout.Text;
-        var texts: [4]str = [4]str{nil, nil, nil, layout.duration(?dt, it.elapsed)};
-        layout.cells(w, cols, ?texts[0], 4);
-        layout.aside(w, it.name);
-        std_format.write_newline(w);
-    }
-}
-
-# the counter totals as two lines: what the code came to, and what building it took of memory
+# the counter totals as two lines, after a blank line: what the code came to, and what building
+# it took of memory. a total of zero is not shown
 fun counter_lines(rd: *Readout, w: *io_writer.Writer) {
-    if (!rd.holding) { ret; }
     var code: bool  = false;
     var c:    usize = 0;
     for (c < readout.COUNTER_COUNT) {
-        if (rd.held[c] && readout.counter_group(c::readout.Counter) == readout.GROUP_CODE) { code = true; }
+        if (rd.held[c] && rd.counts[c] > 0 && readout.counter_group(c::readout.Counter) == readout.GROUP_CODE) { code = true; }
         c = c + 1;
     }
+    val peak:   bool = rd.held[readout.HEAP_PEAK] && rd.counts[readout.HEAP_PEAK] > 0;
+    val bytes:  bool = rd.held[readout.ALLOCATED_BYTES] && rd.counts[readout.ALLOCATED_BYTES] > 0;
+    val blocks: bool = rd.held[readout.ALLOCATED_BLOCKS] && rd.counts[readout.ALLOCATED_BLOCKS] > 0;
+    if (!code && !peak && !bytes && !blocks) { ret; }
+    std_format.write_newline(w);
     if (code) {
         std_format.write_str(w, "code  ");
         c = 0;
         for (c < readout.COUNTER_COUNT) {
-            if (rd.held[c] && readout.counter_group(c::readout.Counter) == readout.GROUP_CODE) {
+            if (rd.held[c] && rd.counts[c] > 0 && readout.counter_group(c::readout.Counter) == readout.GROUP_CODE) {
                 var t: layout.Text;
                 std_format.format(w, "  {} {}", counter_text(?t, c::readout.Counter, rd.counts[c]), readout.counter_word(c::readout.Counter, rd.counts[c]));
             }
@@ -832,9 +1108,6 @@ fun counter_lines(rd: *Readout, w: *io_writer.Writer) {
         }
         std_format.write_newline(w);
     }
-    val peak:   bool = rd.held[readout.HEAP_PEAK];
-    val bytes:  bool = rd.held[readout.ALLOCATED_BYTES];
-    val blocks: bool = rd.held[readout.ALLOCATED_BLOCKS];
     if (peak || bytes || blocks) {
         std_format.write_str(w, "memory");
         var pt: layout.Text;
@@ -848,409 +1121,137 @@ fun counter_lines(rd: *Readout, w: *io_writer.Writer) {
         or (blocks)          { std_format.format(w, "  {} {}", layout.grouped(?kt, nblocks), wblocks); }
         std_format.write_newline(w);
     }
-    c = 0;
-    for (c < readout.COUNTER_COUNT) {
-        rd.held[c] = false;
-        c          = c + 1;
-    }
-    rd.holding = false;
 }
 
-# each module's counters under -vv, a row a module and a column a counter any module posted,
-# headed by the counters' labels
-fun module_table(rd: *Readout, w: *io_writer.Writer) {
-    if (rd.modules.len == 0) { ret; }
-    var shown: [readout.COUNTER_COUNT]bool;
-    var cols:  [readout.COUNTER_COUNT + 1]layout.Column;
-    var texts: [readout.COUNTER_COUNT + 1]str;
-    cols[0] = layout.Column{width: str_len("module"), align: layout.LEFT, gap: 0};
-    var c: usize = 0;
-    for (c < readout.COUNTER_COUNT) {
-        shown[c]    = false;
-        cols[c + 1] = layout.Column{width: str_len(readout.counter_label(c::readout.Counter)), align: layout.RIGHT, gap: layout.GAP};
-        c           = c + 1;
+# the module column of the -vv tables: wide enough for the longest module and two spaces
+fun module_width(rd: *Readout) usize {
+    var w: usize = str_len("module");
+    var i: usize = 0;
+    for (i < rd.modules.len) {
+        val l: usize = str_len(rd.modules.data[i].name);
+        if (l > w) { w = l; }
+        i = i + 1;
     }
+    ret w + 2;
+}
+
+# whether the module row's time of phase p is shown: a part of codegen some module spent time in
+fun times_shown(rd: *Readout, p: usize) bool {
+    if (readout.parent_of(p::readout.Phase) == readout.PHASE_NONE) { ret false; }
+    var i: usize = 0;
+    for (i < rd.modules.len) {
+        if (rd.modules.data[i].times[p] > 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# each module's codegen under -vv, after a blank line: a row a module in the order codegen wrote
+# them, a column a part of codegen any module spent time in, and the module's total
+fun module_times(rd: *Readout, w: *io_writer.Writer) {
+    var any: bool  = false;
+    var p:   usize = 0;
+    for (p < readout.PHASE_COUNT) {
+        if (times_shown(rd, p)) { any = true; }
+        p = p + 1;
+    }
+    if (!any) { ret; }
+    val mw: usize = module_width(rd);
+    std_format.write_newline(w);
+    left_w(w, "module", mw);
+    p = 0;
+    for (p < readout.PHASE_COUNT) {
+        if (times_shown(rd, p)) { right_w(w, readout.label_of(p::readout.Phase), CELL_W); }
+        p = p + 1;
+    }
+    right_w(w, "total", CELL_W);
+    std_format.write_newline(w);
     var i: usize = 0;
     for (i < rd.modules.len) {
         val m: *ModuleRow = ?rd.modules.data[i];
-        layout.fit(?cols[0], m.name);
+        i = i + 1;
+        left_w(w, m.name, mw);
+        var total: chrono_duration.Duration = 0;
+        var owed:  usize                    = 0;
+        p = 0;
+        for (p < readout.PHASE_COUNT) {
+            if (times_shown(rd, p)) {
+                total = total + m.times[p];
+                if (m.times[p] > 0) {
+                    var dt: layout.Text;
+                    layout.spaces(w, owed);
+                    owed = 0;
+                    right_w(w, layout.duration(?dt, m.times[p]), CELL_W);
+                }
+                or { owed = owed + CELL_W; }
+            }
+            p = p + 1;
+        }
+        if (total > 0) {
+            var tt: layout.Text;
+            layout.spaces(w, owed);
+            right_w(w, layout.duration(?tt, total), CELL_W);
+        }
+        std_format.write_newline(w);
+    }
+}
+
+# each module's counters under -vv, after a blank line: a row a module, a column a counter any
+# module posted a value other than zero for, headed by the counter's head
+fun module_counters(rd: *Readout, w: *io_writer.Writer) {
+    var widths: [readout.COUNTER_COUNT]usize;
+    var any:    bool  = false;
+    var c:      usize = 0;
+    for (c < readout.COUNTER_COUNT) {
+        widths[c] = 0;
+        var i: usize = 0;
+        for (i < rd.modules.len) {
+            val m: *ModuleRow = ?rd.modules.data[i];
+            i = i + 1;
+            if (!m.has[c] || m.values[c] == 0) { cnt; }
+            var t: layout.Text;
+            val l: usize = str_len(counter_text(?t, c::readout.Counter, m.values[c]));
+            if (widths[c] == 0) { widths[c] = str_len(readout.counter_head(c::readout.Counter)); }
+            if (l > widths[c])  { widths[c] = l; }
+        }
+        if (widths[c] > 0) {
+            widths[c] = widths[c] + 2;
+            any       = true;
+        }
+        c = c + 1;
+    }
+    if (!any) { ret; }
+    val mw: usize = module_width(rd);
+    std_format.write_newline(w);
+    left_w(w, "module", mw);
+    c = 0;
+    for (c < readout.COUNTER_COUNT) {
+        if (widths[c] > 0) { right_w(w, readout.counter_head(c::readout.Counter), widths[c]); }
+        c = c + 1;
+    }
+    std_format.write_newline(w);
+    var i: usize = 0;
+    for (i < rd.modules.len) {
+        val m: *ModuleRow = ?rd.modules.data[i];
+        i = i + 1;
+        std_format.write_str(w, m.name);
+        var owed: usize = 0;
+        if (str_len(m.name) < mw) { owed = mw - str_len(m.name); }
         c = 0;
         for (c < readout.COUNTER_COUNT) {
-            if (m.has[c]) {
-                var t: layout.Text;
-                shown[c] = true;
-                layout.fit(?cols[c + 1], counter_text(?t, c::readout.Counter, m.values[c]));
+            if (widths[c] > 0) {
+                if (m.has[c] && m.values[c] > 0) {
+                    var t: layout.Text;
+                    layout.spaces(w, owed);
+                    owed = 0;
+                    right_w(w, counter_text(?t, c::readout.Counter, m.values[c]), widths[c]);
+                }
+                or { owed = owed + widths[c]; }
             }
             c = c + 1;
         }
-        i = i + 1;
+        std_format.write_newline(w);
     }
-    c = 0;
-    for (c < readout.COUNTER_COUNT) {
-        if (!shown[c]) { cols[c + 1] = layout.Column{width: 0, align: layout.RIGHT, gap: 0}; }
-        c = c + 1;
-    }
-    texts[0] = "module";
-    c        = 0;
-    for (c < readout.COUNTER_COUNT) {
-        texts[c + 1] = nil;
-        if (shown[c]) { texts[c + 1] = readout.counter_label(c::readout.Counter); }
-        c = c + 1;
-    }
-    layout.row(w, ?cols[0], ?texts[0], readout.COUNTER_COUNT + 1);
-    var vt: [readout.COUNTER_COUNT]layout.Text;
-    i = 0;
-    for (i < rd.modules.len) {
-        val m: *ModuleRow = ?rd.modules.data[i];
-        texts[0] = m.name;
-        c        = 0;
-        for (c < readout.COUNTER_COUNT) {
-            texts[c + 1] = nil;
-            if (m.has[c]) { texts[c + 1] = counter_text(?vt[c], c::readout.Counter, m.values[c]); }
-            c = c + 1;
-        }
-        layout.row(w, ?cols[0], ?texts[0], readout.COUNTER_COUNT + 1);
-        i = i + 1;
-    }
-}
-
-# a growing cycle of instances as it expands, written at once so a runaway expansion shows
-# while it runs
-fun growth_row_w(w: *io_writer.Writer, ev: *readout.Growth) {
-    std_format.format(w, "{}  growing cycle {} in {}: {} {} so far\n", GROWTH_LABEL, ev.members, ev.module, ev.instances::usize, layout.noun(ev.instances::u64, "instance", "instances"));
-}
-
-# whether a unit found everything current: it compiled nothing and wrote nothing
-fun unchanged(ev: *readout.Summary) bool {
-    ret ev.closed != readout.CLOSED_CHECKED && ev.compiled == 0 && !ev.written;
-}
-
-# what a summary says of its modules: all of them when the build compiled every unit, else how
-# many of its units it rebuilt
-fun modules_text(t: *layout.Text, ev: *readout.Summary) str {
-    var noun: str = layout.noun(ev.units::u64, "module", "modules");
-    if (ev.units != ev.modules) { noun = layout.noun(ev.units::u64, "object", "objects"); }
-    var w: io_writer.Writer = layout.text_writer(t);
-    if (ev.compiled == ev.units) { std_format.format(?w, "{} {}", ev.modules::u64, layout.noun(ev.modules::u64, "module", "modules")); }
-    or                           { std_format.format(?w, "{} of {} {} rebuilt", ev.compiled::u64, ev.units::u64, noun); }
-    ret layout.text_end(t);
-}
-
-# a unit's close: under -v its table first; then, alone in its plan, its own progress line, or
-# among several, its row of the table the plan closes with. a test build's dispatcher is shown
-# only under -v
-fun summary_w(rd: *Readout, w: *io_writer.Writer, ev: *readout.Summary) {
-    if (ev.rows)                                                                   { stage_table(rd, w, ev); }
-    if (rd.quiet)                                                                  { ret; }
-    if (ev.closed == readout.CLOSED_TESTS && rd.sink.level < readout.LEVEL_PHASES) { ret; }
-    if (rd.units > 1) {
-        unit_held(rd, ev);
-        ret;
-    }
-    var dt:   layout.Text;
-    val time: str              = layout.duration(?dt, ev.total);
-    var line: [3]str           = [3]str{ev.artifact, ev.target, ev.profile};
-    var cols: [4]layout.Column = [4]layout.Column{layout.Column{width: 0, align: layout.LEFT, gap: 0}, layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP},
-        layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP}, layout.Column{width: 0, align: layout.LEFT, gap: 3}};
-    if (ev.closed == readout.CLOSED_CHECKED || unchanged(ev)) {
-        if (ev.closed == readout.CLOSED_CHECKED) { layout.said(w, layout.CHECKED); }
-        or                                       { layout.said(w, layout.UNCHANGED); }
-        var said: [4]str = [4]str{ev.artifact, ev.target, ev.profile, time};
-        layout.row(w, ?cols[0], ?said[0], 4);
-        ret;
-    }
-    layout.said(w, layout.BUILT);
-    layout.row(w, ?cols[0], ?line[0], 3);
-    layout.beneath(w);
-    var mt:   layout.Text;
-    var st:   layout.Text;
-    var size: str = nil;
-    if (ev.has_size) { size = layout.size(?st, ev.bytes::u64); }
-    var detail: [4]str           = [4]str{ev.out, size, modules_text(?mt, ev), time};
-    var dcols:  [4]layout.Column = [4]layout.Column{layout.Column{width: 0, align: layout.LEFT, gap: 0}, layout.Column{width: 0, align: layout.LEFT, gap: 3},
-        layout.Column{width: 0, align: layout.LEFT, gap: 3}, layout.Column{width: 0, align: layout.LEFT, gap: 3}};
-    layout.row(w, ?dcols[0], ?detail[0], 4);
-}
-
-fun unit_held(rd: *Readout, ev: *readout.Summary) {
-    if (held_alloc(rd) == nil) { ret; }
-    var mt:  layout.Text;
-    var st:  layout.Text;
-    var dt:  layout.Text;
-    var row: UnitRow;
-    row.closed               = ev.closed;
-    row.unchanged            = unchanged(ev);
-    row.cells[UNIT_TARGET]   = kept(rd, ev.target);
-    row.cells[UNIT_ARTIFACT] = kept(rd, ev.artifact);
-    row.cells[UNIT_PROFILE]  = kept(rd, ev.profile);
-    row.cells[UNIT_MODULES]  = nil;
-    row.cells[UNIT_SIZE]     = nil;
-    row.cells[UNIT_TIME]     = kept(rd, layout.duration(?dt, ev.total));
-    if (ev.closed != readout.CLOSED_CHECKED) { row.cells[UNIT_MODULES] = kept(rd, modules_text(?mt, ev)); }
-    if (ev.has_size)                         { row.cells[UNIT_SIZE] = kept(rd, layout.size(?st, ev.bytes::u64)); }
-    val res_pushed: res[usize, A.Error] = collections_vector.push[UnitRow](?rd.done, row);
-    if (sel res_pushed.err) { refused(rd.r, fail.refused(res_pushed.err)); }
-}
-
-# the one table a selection of several units closes with, under one verb: checked when every
-# unit was a check, unchanged when every unit found everything current, built otherwise. a
-# column shows when any unit has text for it, and the profile only when the units differ in it
-fun units_table(rd: *Readout, w: *io_writer.Writer) {
-    if (rd.a == nil || rd.done.len == 0) { ret; }
-    var checked: bool  = true;
-    var same:    bool  = true;
-    var shown:   [UNIT_COLUMNS]bool;
-    var c:       usize = 0;
-    for (c < UNIT_COLUMNS) {
-        shown[c] = false;
-        c        = c + 1;
-    }
-    var i: usize = 0;
-    for (i < rd.done.len) {
-        val u: *UnitRow = ?rd.done.data[i];
-        if (u.closed != readout.CLOSED_CHECKED) { checked = false; }
-        if (!u.unchanged)                       { same = false; }
-        c = 0;
-        for (c < UNIT_COLUMNS) {
-            if (u.cells[c] != nil) { shown[c] = true; }
-            c = c + 1;
-        }
-        i = i + 1;
-    }
-    shown[UNIT_PROFILE] = false;
-    i                   = 1;
-    for (i < rd.done.len) {
-        if (!str_equals(rd.done.data[i].cells[UNIT_PROFILE], rd.done.data[0].cells[UNIT_PROFILE])) { shown[UNIT_PROFILE] = true; }
-        i = i + 1;
-    }
-    var picked: [UNIT_COLUMNS]UnitColumn;
-    var cols:   [UNIT_COLUMNS]layout.Column;
-    var texts:  [UNIT_COLUMNS]str;
-    var n:      usize = 0;
-    c = 0;
-    for (c < UNIT_COLUMNS) {
-        if (shown[c]) {
-            picked[n] = c;
-            cols[n]   = layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP};
-            if (c == UNIT_SIZE || c == UNIT_TIME) { cols[n].align = layout.RIGHT; }
-            layout.fit(?cols[n], UNIT_HEADS[c]);
-            texts[n] = UNIT_HEADS[c];
-            n        = n + 1;
-        }
-        c = c + 1;
-    }
-    cols[0].gap = 0;
-    i           = 0;
-    for (i < rd.done.len) {
-        var k: usize = 0;
-        for (k < n) {
-            layout.fit(?cols[k], rd.done.data[i].cells[picked[k]]);
-            k = k + 1;
-        }
-        i = i + 1;
-    }
-    if (checked) { layout.said(w, layout.CHECKED); }
-    or (same)    { layout.said(w, layout.UNCHANGED); }
-    or           { layout.said(w, layout.BUILT); }
-    layout.row(w, ?cols[0], ?texts[0], n);
-    i = 0;
-    for (i < rd.done.len) {
-        var k: usize = 0;
-        for (k < n) {
-            texts[k] = rd.done.data[i].cells[picked[k]];
-            k        = k + 1;
-        }
-        layout.beneath(w);
-        layout.row(w, ?cols[0], ?texts[0], n);
-        i = i + 1;
-    }
-    rd.done.len = 0;
-}
-
-# the live progress line, rewritten in place: what the compile has done of its units and the
-# last it finished, cut to fit LIVE_WIDTH
-fun live_w(rd: *Readout, ev: *readout.Advance) {
-    val w: *io_writer.Writer = ?rd.r.w;
-    std_format.write_str(w, "\r\x1b[2K");
-    layout.said(w, layout.COMPILING);
-    var t:  layout.Text;
-    var tw: io_writer.Writer = layout.text_writer(?t);
-    std_format.format(?tw, "{} of {}", ev.done::u64, ev.total::u64);
-    val counted: str = layout.text_end(?t);
-    std_format.write_str(w, counted);
-    val used: usize = layout.GUTTER + layout.GAP + str_len(counted) + 3;
-    if (ev.name != nil && used < LIVE_WIDTH) {
-        layout.spaces(w, 3);
-        val room: usize = LIVE_WIDTH - used;
-        var l:    usize = str_len(ev.name);
-        if (l > room) { l = room; }
-        std_format.write_bytes(w, ev.name, l);
-    }
-    rd.shown = true;
-}
-
-# clear the live progress line before anything else is written
-fun live_clear(rd: *Readout) {
-    if (!rd.shown) { ret; }
-    std_format.write_str(?rd.r.w, "\r\x1b[2K");
-    rd.shown = false;
-}
-
-# whether stderr is a terminal that can rewrite a line: a terminal whose TERM is set and not dumb
-fun live_capable() bool {
-    if (!terminal.is_terminal(2)) { ret false; }
-    var buf:     [64]u8;
-    val res_get: res[opt[usize], env.EnvError] = env.get("TERM", ?buf[0], 64);
-    if (sel res_get.err) { ret false; }
-    val opt_len: opt[usize] = res_get.ok;
-    if (sel opt_len.none)   { ret false; }
-    if (opt_len.some >= 64) { ret true; }
-    ret opt_len.some > 0 && !str_equals((?buf[0])::str, "dumb");
-}
-
-# every command's events rendered the moment each arrives: the renderer of the
-# readout contract (doc/language/readout.md). the report's stream, stderr,
-# carries the build: human text renders a unit's progress line or, among several units, the
-# table their plan closes with, under -v each unit's table, failures and diagnostics, and
-# among several units each unit's first diagnostic or failure follows a line naming the unit,
-# and the report counts what is rendered for its closing tally; the records modes write each diagnostic and failure as
-# a record, and under -v each unit, phase row, item and counter. stdout carries a test run in
-# human text: a module's row once its last test has finished, or each test under -v, then each
-# failure once and the verdict. under the records modes the run is also records on the
-# report's stream: run_start, a test record per finished test, and run_end
-# ---
-# sink:    what the engine and the test runner are given; its ctx is this record, which must not move
-# r:       the command's report
-# units:   the plan's unit count; one table closes a plan of more than one
-# quiet:   `--quiet`, which suppresses the progress lines and banners
-# cell:    the unit the events now arriving belong to, when `in_cell`
-# named:   whether a line naming `cell` has been written
-# live:    whether a live progress line is shown, and `shown` whether one is on the terminal now
-# a:       the arena what is held lives in, nil until something is
-# rows:    the -v table's rows, held until the unit closes
-# modules: each module's counters under -vv
-# done:    the summaries of a plan of several units
-# run:     the running test run's results, from its run_start to its run_end
-# count:   how many results run holds
-# roll:    a module row's columns: module, time, then the ok, skip and FAIL counts
-# line:    a test line's columns under -v: outcome, test, time
-# counts:  the counter totals held until the unit's rows close, those `held`
-# holding: whether any total is held
-pub rec Readout {
-    sink:    readout.Sink;
-    r:       *Report;
-    units:   usize;
-    quiet:   bool;
-    cell:    readout.Unit;
-    in_cell: bool;
-    named:   bool;
-    live:    bool;
-    shown:   bool;
-    a:       *A.Allocator;
-    rows:    Vector[StageRow];
-    modules: Vector[ModuleRow];
-    done:    Vector[UnitRow];
-    run:     *readout.TestResult;
-    count:   u32;
-    roll:    [ROLL_COLS]layout.Column;
-    line:    [3]layout.Column;
-    counts:  [readout.COUNTER_COUNT]u64;
-    held:    [readout.COUNTER_COUNT]bool;
-    holding: bool;
-}
-
-# start rendering a command's events to r, a test run in human text to stdout
-# ---
-# rd:    the renderer, initialised in place since its sink points at it
-# r:     the command's report
-# units: the plan's unit count
-# quiet: `--quiet`
-# level: the readout level the command asked for, LEVEL_RESULTS to LEVEL_ITEMS
-pub fun readout_begin(rd: *Readout, r: *Report, units: usize, quiet: bool, level: u8) {
-    rd.sink.ctx      = rd::ptr;
-    rd.sink.on_event = readout_on_event;
-    rd.sink.level    = level;
-    rd.r             = r;
-    rd.units         = units;
-    rd.quiet         = quiet;
-    rd.in_cell       = false;
-    rd.named         = false;
-    rd.live          = r.format == FORMAT_HUMAN && !quiet && live_capable();
-    rd.sink.live     = rd.live;
-    rd.shown         = false;
-    rd.a             = nil;
-    rd.rows          = collections_vector.init[StageRow](nil);
-    rd.modules       = collections_vector.init[ModuleRow](nil);
-    rd.done          = collections_vector.init[UnitRow](nil);
-    rd.run           = nil;
-    rd.count         = 0;
-    rd.holding       = false;
-    var c: usize = 0;
-    for (c < readout.COUNTER_COUNT) {
-        rd.held[c] = false;
-        c          = c + 1;
-    }
-}
-
-fun readout_on_event(ctx: ptr, ev: *readout.Event) {
-    val rd: *Readout = ctx::*Readout;
-    if (sel ev.advance) {
-        if (rd.live) { live_w(rd, ?ev.advance); }
-        ret;
-    }
-    live_clear(rd);
-    if (sel ev.run_start) {
-        if (rd.r.format == FORMAT_HUMAN) { stage_table(rd, ?rd.r.w, nil); }
-        run_begin(rd, ?ev.run_start);
-        if (rd.r.format != FORMAT_HUMAN) { run_start_record(rd.r, ?ev.run_start); }
-        ret;
-    }
-    if (sel ev.test_end) {
-        test_human(rd, ev.test_end.at);
-        report_test(rd.r, ?ev.test_end.tests[ev.test_end.at]);
-        ret;
-    }
-    if (sel ev.run_end) {
-        run_summary_w(rd, out(rd.r), ?ev.run_end);
-        if (rd.r.format != FORMAT_HUMAN) { run_end_record(rd.r, ?ev.run_end); }
-        rd.run   = nil;
-        rd.count = 0;
-        ret;
-    }
-    if (rd.r.format != FORMAT_HUMAN) { readout_records(rd, ev); }
-    or                               { readout_human(rd, ev); }
-}
-
-fun readout_human(rd: *Readout, ev: *readout.Event) {
-    val w: *io_writer.Writer = ?rd.r.w;
-    # a unit that ends without a summary shows the table it held before what follows
-    if (sel ev.unit || sel ev.failure || sel ev.diagnostics) { stage_table(rd, w, nil); }
-    if (sel ev.unit) {
-        rd.cell    = ev.unit;
-        rd.in_cell = true;
-        rd.named   = false;
-        if (!rd.quiet && rd.sink.level >= readout.LEVEL_PHASES) { cell_named(rd, w); }
-    }
-    or (sel ev.phase)   { phase_held(rd, ?ev.phase); }
-    or (sel ev.item)    { item_held(rd, ?ev.item); }
-    or (sel ev.tally)   { tally_held(rd, ?ev.tally); }
-    or (sel ev.growth)  { growth_row_w(w, ?ev.growth); }
-    or (sel ev.summary) { summary_w(rd, w, ?ev.summary); }
-    or (sel ev.failure) {
-        if (!sel ev.failure.fail.reported) { cell_named(rd, w); }
-        report_failure(rd.r, ev.failure.fail, ev.failure.origin);
-    }
-    or (sel ev.diagnostics) {
-        cell_named(rd, w);
-        render_store(rd.r, ev.diagnostics.sources, ev.diagnostics.diags);
-    }
-}
-
-# among several units, the line naming the unit the events belong to, written once a unit
-fun cell_named(rd: *Readout, w: *io_writer.Writer) {
-    if (rd.units < 2 || !rd.in_cell || rd.named) { ret; }
-    unit_banner_w(w, ?rd.cell);
-    rd.named = true;
 }
 
 # the records member: a record for each event, each written as its event arrives. under -v
@@ -1259,27 +1260,25 @@ fun cell_named(rd: *Readout, w: *io_writer.Writer) {
 # closing summary record
 fun readout_records(rd: *Readout, ev: *readout.Event) {
     val r: *Report = rd.r;
-    if (sel ev.failure) { report_failure(r, ev.failure.fail, ev.failure.origin); }
-    or (sel ev.diagnostics) {
-        render_store_records(r, ev.diagnostics.sources, ev.diagnostics.diags, report_paths(r));
+    if (sel ev.failure) {
+        if (!sel ev.failure.fail.reported) { val code: i64 = report_failure(r, ev.failure.fail, ev.failure.origin); }
+    }
+    or (sel ev.reported) {
+        render_record(r, ev.reported.sources, report_paths(r), ev.reported.diag);
+        count_record(r, ev.reported.diag);
     }
     or (sel ev.unit) {
         if (rd.sink.level >= readout.LEVEL_PHASES) { unit_record(r, ?ev.unit); }
     }
-    or (sel ev.phase)   { phase_record(r, ?ev.phase); }
-    or (sel ev.item)    { item_record(r, ?ev.item); }
-    or (sel ev.tally)   { tally_record(r, ?ev.tally); }
-    or (sel ev.growth)  { growth_record(r, ?ev.growth); }
-    or (sel ev.summary) { summary_record(r, ?ev.summary); }
-}
-
-# close a plan's rendering: under human text the table a plan of several units closes with.
-# the tally of what it rendered closes the report, in report_dnit
-pub fun readout_end(rd: *Readout) {
-    live_clear(rd);
-    if (rd.r.format != FORMAT_HUMAN) { ret; }
-    stage_table(rd, ?rd.r.w, nil);
-    units_table(rd, ?rd.r.w);
+    or (sel ev.phase)     { phase_record(r, ?ev.phase); }
+    or (sel ev.item)      { item_record(r, ?ev.item); }
+    or (sel ev.tally)     { tally_record(r, ?ev.tally); }
+    or (sel ev.fact)      { fact_record(r, ?ev.fact); }
+    or (sel ev.growth)    { growth_record(r, ?ev.growth); }
+    or (sel ev.summary)   { summary_record(r, ?ev.summary); }
+    or (sel ev.run_start) { run_start_record(r, ?ev.run_start); }
+    or (sel ev.test_end)  { report_test(r, ?ev.test_end.tests[ev.test_end.at]); }
+    or (sel ev.run_end)   { run_end_record(r, ?ev.run_end); }
 }
 
 # a duration as the integer microseconds a record carries
@@ -1302,11 +1301,14 @@ fun phase_record(r: *Report, ev: *readout.PhaseEnd) {
     var o:    record.Record;
     record.begin(?r.w, enc(r), ?o, "phase");
     record.text(?o, "name", readout.label_of(ev.phase));
+    val parent: readout.Phase = readout.parent_of(ev.phase);
+    if (parent != readout.PHASE_NONE) { record.text(?o, "parent", readout.label_of(parent)); }
     record.int(?o, "count", ev.count::i64);
     record.text(?o, "unit", noun);
     record.int(?o, "time_us", micros(ev.elapsed));
     if (ev.threads > 1) { record.int(?o, "threads", ev.threads::i64); }
     if (ev.dropped > 0) { record.int(?o, "dropped", ev.dropped::i64); }
+    if (ev.sized)       { record.int(?o, "bytes", ev.bytes::i64); }
     if (ev.slowest != nil) {
         record.text(?o, "slowest", ev.slowest);
         record.int(?o, "slowest_us", micros(ev.slowest_elapsed));
@@ -1333,6 +1335,15 @@ fun tally_record(r: *Report, ev: *readout.Tally) {
     record.end(?o);
 }
 
+# one fact of the unit's target, by its key
+fun fact_record(r: *Report, ev: *readout.Fact) {
+    var o: record.Record;
+    record.begin(?r.w, enc(r), ?o, "fact");
+    record.text(?o, "key", ev.key);
+    record.text(?o, "value", ev.value);
+    record.end(?o);
+}
+
 fun growth_record(r: *Report, ev: *readout.Growth) {
     var o: record.Record;
     record.begin(?r.w, enc(r), ?o, "growth");
@@ -1352,199 +1363,280 @@ fun summary_record(r: *Report, ev: *readout.Summary) {
         record.int(?o, "time_us", micros(ev.other));
         record.end(?o);
     }
-    if (ev.closed != readout.CLOSED_CHECKED) { report_built(r, ev); }
+    if (ev.closed == readout.CLOSED_BUILT || ev.closed == readout.CLOSED_TESTS) { report_built(r, ev); }
 }
 
-# a module roll-up's columns: module, time, and the ok, skip and FAIL counts, each a number and its word
-val ROLL_COLS: usize = 8;
-
-# the columns of a run's human rendering, from its tests' names
+# a test run starts, and the live line shows it
 fun run_begin(rd: *Readout, ev: *readout.RunStart) {
-    rd.run   = ev.tests;
-    rd.count = ev.count;
-    var mod_w:  usize = 0;
-    var name_w: usize = 0;
-    var i:      u32   = 0;
-    for (i < ev.count) {
-        val ml: usize = str_len(ev.tests[i].art.module);
-        val nl: usize = str_len(ev.tests[i].art.name);
-        if (ml > mod_w)  { mod_w = ml; }
-        if (nl > name_w) { name_w = nl; }
-        i = i + 1;
-    }
-    rd.roll[0] = layout.Column{width: clamp_width(mod_w, 16, 48), align: layout.LEFT, gap: 0};
-    rd.roll[1] = layout.Column{width: TIME_W, align: layout.RIGHT, gap: layout.GAP};
-    rd.roll[2] = layout.Column{width: 4, align: layout.RIGHT, gap: layout.GAP};
-    rd.roll[3] = layout.Column{width: 2, align: layout.LEFT, gap: 1};
-    rd.roll[4] = layout.Column{width: 4, align: layout.RIGHT, gap: layout.GAP};
-    rd.roll[5] = layout.Column{width: 4, align: layout.LEFT, gap: 1};
-    rd.roll[6] = layout.Column{width: 4, align: layout.RIGHT, gap: layout.GAP};
-    rd.roll[7] = layout.Column{width: 4, align: layout.LEFT, gap: 1};
-    rd.line[0] = layout.Column{width: 4, align: layout.LEFT, gap: 0};
-    rd.line[1] = layout.Column{width: clamp_width(name_w, 24, 72), align: layout.LEFT, gap: layout.GAP};
-    rd.line[2] = layout.Column{width: TIME_W, align: layout.RIGHT, gap: layout.GAP};
+    rd.run      = ev.tests;
+    rd.count    = ev.count;
+    rd.finished = 0;
+    readout.live_stage(rd.sink.live, RUN_LABEL, readout.sample());
+    readout.live_reach(rd.sink.live, 0, ev.count, nil);
 }
 
-# a column width held between `least` and `most`
-fun clamp_width(w: usize, least: usize, most: usize) usize {
-    if (w < least) { ret least; }
-    if (w > most)  { ret most; }
-    ret w;
+val RUN_LABEL: str = "run";
+
+# the last test of the module whose tests start at `first`, its tests running together
+fun module_last(rd: *Readout, first: u32) u32 {
+    var last: u32 = first;
+    for (last + 1 < rd.count && str_equals(rd.run[last + 1].art.module, rd.run[first].art.module)) { last = last + 1; }
+    ret last;
 }
 
-# a finished test in human text, in the order the tests finish: under -v its own
-# line, otherwise its module's roll-up once every test of the module's run has
-# finished, so a slow test holds back only its own module
-fun test_human(rd: *Readout, at: u32) {
-    val w: *io_writer.Writer   = out(rd.r);
+# a finished test, in the order the tests finish: under -vv its own line, a failure as its
+# diagnostic at once, and its module's line once every test of the module has finished, so a
+# slow test holds back only its own module
+fun test_shown(rd: *Readout, at: u32) {
     val t: *readout.TestResult = ?rd.run[at];
-    if (rd.sink.level >= readout.LEVEL_PHASES) {
-        test_line_w(rd, w, t);
-        ret;
+    rd.finished = rd.finished + 1;
+    live_test(rd, t);
+    if (rd.sink.level >= readout.LEVEL_ITEMS) {
+        var dt: layout.Text;
+        log_head(rd, true, RUN_LABEL, layout.duration(?dt, t.elapsed));
+        std_format.format(?rd.r.w, "  {}", t.art.name);
+        if (failure(?t.result))                   { std_format.write_str(?rd.r.w, "  failed"); }
+        or (t.result.kind == testrun.RESULT_SKIP) { std_format.write_str(?rd.r.w, "  skipped"); }
+        std_format.write_newline(?rd.r.w);
+        if (!failure(?t.result)) { captured_w(?rd.r.w, t, FACT_LEAD); }
     }
-    val mod_name: str = t.art.module;
-    var first:    u32 = at;
-    for (first > 0 && str_equals(rd.run[first - 1].art.module, mod_name)) { first = first - 1; }
-    var last: u32 = at;
-    for (last + 1 < rd.count && str_equals(rd.run[last + 1].art.module, mod_name)) { last = last + 1; }
-    var j: u32 = first;
+    if (failure(?t.result)) { test_failed_w(rd, t); }
+    var first: u32 = at;
+    for (first > 0 && str_equals(rd.run[first - 1].art.module, t.art.module)) { first = first - 1; }
+    val last: u32 = module_last(rd, first);
+    var j:    u32 = first;
     for (j <= last) {
         if (!rd.run[j].done) { ret; }
         j = j + 1;
     }
-    module_run_w(rd, w, first, last);
+    module_line_w(rd, first, last);
 }
 
-# a module's row: its time, then its counts, a skip or FAIL count only when nonzero. its
-# failures are shown once, when the run ends
-fun module_run_w(rd: *Readout, w: *io_writer.Writer, first: u32, last: u32) {
-    val tests:   *readout.TestResult = rd.run;
-    var ok:      u32                 = 0;
-    var skipped: u32                 = 0;
-    var failed:  u32                 = 0;
-    var j:       u32                 = first;
+# a test as the live line names it, `module#test`
+fun live_test(rd: *Readout, t: *readout.TestResult) {
+    readout.live_reach(rd.sink.live, rd.finished, rd.count, t.art.name::str);
+}
+
+# a module's result: passed, failed when any of its tests failed, skipped when every test was;
+# its count, how many failed, timed out and were skipped, and its slowest test's time, the tests
+# having run side by side
+fun module_line_w(rd: *Readout, first: u32, last: u32) {
+    if (rd.quiet) { ret; }
+    val tests:     *readout.TestResult      = rd.run;
+    var failed:    u32                      = 0;
+    var skipped:   u32                      = 0;
+    var timed_out: u32                      = 0;
+    var slowest:   chrono_duration.Duration = 0;
+    var j:         u32                      = first;
     for (j <= last) {
-        if (tests[j].result.kind == testrun.RESULT_PASS) { ok = ok + 1; }
+        if (failure(?tests[j].result))                   { failed = failed + 1; }
         or (tests[j].result.kind == testrun.RESULT_SKIP) { skipped = skipped + 1; }
-        or                                               { failed = failed + 1; }
+        if (timed_out_result(?tests[j].result))          { timed_out = timed_out + 1; }
+        if (tests[j].elapsed > slowest)                  { slowest = tests[j].elapsed; }
         j = j + 1;
     }
-    var dt:    layout.Text;
-    var ot:    layout.Text;
-    var st:    layout.Text;
-    var ft:    layout.Text;
-    var texts: [ROLL_COLS]str = [ROLL_COLS]str{tests[first].art.module, layout.duration(?dt, readout.span(tests, first, last)), layout.count(?ot, ok::u64), "ok", nil, nil, nil, nil};
-    if (skipped > 0) {
-        texts[4] = layout.count(?st, skipped::u64);
-        texts[5] = "skip";
-    }
-    if (failed > 0) {
-        texts[6] = layout.count(?ft, failed::u64);
-        texts[7] = "FAIL";
-    }
-    layout.row(w, ?rd.roll[0], ?texts[0], ROLL_COLS);
+    val n:    u32         = last - first + 1;
+    var verb: layout.Verb = layout.PASSED;
+    if (failed > 0)   { verb = layout.FAILED; }
+    or (skipped == n) { verb = layout.SKIPPED; }
+    var texts:  [TEST_FIELDS]layout.Text;
+    var fields: [TEST_FIELDS]layout.Field;
+    test_fields(?fields[0], ?texts[0], n, failed, timed_out, skipped, slowest);
+    layout.result(out(rd.r), verb, tests[first].art.module, ?fields[0], TEST_FIELDS);
 }
 
-# one test under -v: its outcome, name and time, a passing test's captured output beneath it.
-# a failure is shown once, when the run ends
-fun test_line_w(rd: *Readout, w: *io_writer.Writer, t: *readout.TestResult) {
-    var said: str = "ok";
-    if (t.result.kind == testrun.RESULT_SKIP) { said = "skip"; }
-    if (failure(?t.result))                   { said = "FAIL"; }
-    var dt:    layout.Text;
-    var texts: [3]str = [3]str{said, t.art.name, layout.duration(?dt, t.elapsed)};
-    layout.row(w, ?rd.line[0], ?texts[0], 3);
-    if (!failure(?t.result)) { captured_w(w, t); }
+# the fields of a test result after its target, and the storage their values are written in
+val TEST_FIELDS: usize = 5;
+val RUN_FIELDS:  usize = 6;
+
+# a test result's fields: its count, how many failed, timed out and were skipped, each only when
+# nonzero, and its time, written into `fields` from their values' storage `texts`, TEST_FIELDS of each
+fun test_fields(fields: *layout.Field, texts: *layout.Text, count: u32, failed: u32, timed_out: u32, skipped: u32, took: chrono_duration.Duration) {
+    fields[0] = layout.Field{key: "tests", value: layout.count(?texts[0], count::u64)};
+    fields[1] = layout.Field{key: "failed", value: layout.nonzero(?texts[1], failed::u64)};
+    fields[2] = layout.Field{key: "timed out", value: layout.nonzero(?texts[2], timed_out::u64)};
+    fields[3] = layout.Field{key: "skipped", value: layout.nonzero(?texts[3], skipped::u64)};
+    fields[4] = layout.Field{key: "time", value: layout.duration(?texts[4], took)};
 }
 
-# a failed test, once: its name, where it is declared and why, its captured output, where its
-# full output is and how to rerun it alone
-fun failure_w(w: *io_writer.Writer, t: *readout.TestResult) {
-    std_format.format(w, "FAIL  {}  {}:{}  ", t.art.name, t.art.file, t.art.line::i64);
-    reason_w(w, t);
-    std_format.write_newline(w);
-    captured_w(w, t);
-    if (t.truncated && t.log != nil) { std_format.format(w, "{}full output: {}\n", DETAIL, t.log); }
-    std_format.format(w, "{}rerun: ", DETAIL);
-    if (t.launch != nil) { std_format.format(w, "{} {}\n", t.launch, t.art.idx::i64); }
-    or                   { std_format.format(w, "{} {}\n", t.art.exe::str, t.art.idx::i64); }
+# `  N failed  N timed out  N skipped`, each only when nonzero
+fun tests_counted_w(w: *io_writer.Writer, failed: u32, timed_out: u32, skipped: u32) {
+    if (failed > 0)    { std_format.format(w, "  {} failed", failed::u64); }
+    if (timed_out > 0) { std_format.format(w, "  {} timed out", timed_out::u64); }
+    if (skipped > 0)   { std_format.format(w, "  {} skipped", skipped::u64); }
 }
 
-fun reason_w(w: *io_writer.Writer, t: *readout.TestResult) {
-    val r: *testrun.GateResult = ?t.result;
-    if (r.kind == testrun.RESULT_RESOURCE_EXHAUSTION && r.cause == testrun.CAUSE_ORACLE_TIMEOUT) {
-        val d: duration.Text = duration.text(t.bound);
-        std_format.format(w, "(timed out after {}{})", d.n, d.unit);
-    }
-    or (r.kind == testrun.RESULT_SEMANTIC_MISMATCH && r.cause == testrun.CAUSE_ORACLE_EXIT) {
-        std_format.format(w, "(exit {})", t.code::i64);
-    }
-    or (r.kind == testrun.RESULT_SEMANTIC_MISMATCH && r.cause == testrun.CAUSE_ORACLE_SIGNAL) {
-        std_format.format(w, "(signal {})", t.code::i64);
-    }
-    or (r.kind == testrun.RESULT_INFRASTRUCTURE_FAILURE && r.cause == testrun.CAUSE_ORACLE_SPAWN_FAILURE) {
-        std_format.write_str(w, "(spawn failed)");
-    }
-    or (r.kind == testrun.RESULT_INFRASTRUCTURE_FAILURE && r.cause == testrun.CAUSE_ORACLE_CAPTURE) {
-        std_format.write_str(w, "(capture failed)");
-    }
-    or (r.kind == testrun.RESULT_INFRASTRUCTURE_FAILURE && r.cause == testrun.CAUSE_INVALID_TERMINAL) {
-        std_format.write_str(w, "(runner failed)");
-    }
-    or { std_format.write_str(w, "(failed)"); }
+fun timed_out_result(r: *testrun.GateResult) bool {
+    ret r.kind == testrun.RESULT_RESOURCE_EXHAUSTION && r.cause == testrun.CAUSE_ORACLE_TIMEOUT;
 }
 
-# a test's captured output, each line indented under it
-fun captured_w(w: *io_writer.Writer, t: *readout.TestResult) {
-    if (t.out == nil || t.out_len == 0) {
-        if (t.truncated) { std_format.format(w, "{}... (output truncated)\n", DETAIL); }
+# a failed test as the diagnostic it is: what it did, at its declaration, its captured output and
+# how to rerun it alone, a blank line owed after it
+fun test_failed_w(rd: *Readout, t: *readout.TestResult) {
+    val a: *A.Allocator = held_alloc(rd);
+    if (a == nil) { ret; }
+    var reason:      layout.Text;
+    val res_message: res[str, std_format.FormatError] = std_format.sprint(a, "test {} {}", own_name(t.art), reason_text(?reason, t));
+    if (sel res_message.err) {
+        refused(rd.r, fail.format_refused(res_message.err));
         ret;
     }
+    var map: base_source.SourceMap = base_source.init(a);
+    fin { base_source.dnit(?map); }
+    var d: diagnostic.Diagnostic;
+    d.kind     = diagnostic_kind.TEST_FAILED;
+    d.origin   = diagnostic.ORIGIN_TEST;
+    d.loc      = declared_at(a, ?map, t.art);
+    d.message  = res_message.ok;
+    d.children = collections_vector.init[diagnostic.Child](a);
+    d.related  = collections_vector.init[annotation.Related](nil);
+    d.fixes    = collections_vector.init[annotation.Fix](nil);
+    val output: str = output_text(a, t);
+    if (output != nil) { note_child(rd, ?d, output); }
+    if (t.truncated && t.log != nil) {
+        val res_whole: res[str, std_format.FormatError] = std_format.sprint(a, "the whole output is in {}", t.log);
+        if (sel res_whole.ok) { note_child(rd, ?d, res_whole.ok); }
+    }
+    var exe: str = t.art.exe::str;
+    if (t.launch != nil) { exe = t.launch; }
+    val res_rerun: res[str, std_format.FormatError] = std_format.sprint(a, "rerun it alone with {} {}", exe, t.art.idx::u64);
+    if (sel res_rerun.ok) { note_child(rd, ?d, res_rerun.ok); }
+    render(?rd.r.w, ?map, ?d);
+    owe_blank(rd.r);
+}
+
+# a test's own name, its qualified name past the module and `#`
+fun own_name(art: *testrun.TestArtifact) str {
+    val name: str   = art.name::str;
+    val n:    usize = str_len(name);
+    var i:    usize = n;
+    for (i > 0 && name[i - 1] != '#') { i = i - 1; }
+    ret (?name[i])::str;
+}
+
+fun note_child(rd: *Readout, d: *diagnostic.Diagnostic, text: str) {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[diagnostic.Child](?d.children, diagnostic.Child{kind: diagnostic.CHILD_NOTE, text: text});
+    if (sel res_pushed.err) { refused(rd.r, fail.refused(res_pushed.err)); }
+}
+
+# what a failed test did, as its diagnostic says it
+fun reason_text(t: *layout.Text, r: *readout.TestResult) str {
+    var w:  io_writer.Writer    = layout.text_writer(t);
+    val gr: *testrun.GateResult = ?r.result;
+    if (timed_out_result(gr)) {
+        val d: duration.Text = duration.text(r.bound);
+        std_format.format(?w, "timed out after {}{}", d.n, d.unit);
+    }
+    or (gr.kind == testrun.RESULT_SEMANTIC_MISMATCH && gr.cause == testrun.CAUSE_ORACLE_EXIT)               { std_format.format(?w, "exited with {}", r.code::i64); }
+    or (gr.kind == testrun.RESULT_SEMANTIC_MISMATCH && gr.cause == testrun.CAUSE_ORACLE_SIGNAL)             { std_format.format(?w, "was stopped by signal {}", r.code::i64); }
+    or (gr.kind == testrun.RESULT_INFRASTRUCTURE_FAILURE && gr.cause == testrun.CAUSE_ORACLE_SPAWN_FAILURE) { std_format.write_str(?w, "could not be launched"); }
+    or (gr.kind == testrun.RESULT_INFRASTRUCTURE_FAILURE && gr.cause == testrun.CAUSE_ORACLE_CAPTURE)       { std_format.write_str(?w, "ran, and its output could not be captured"); }
+    or (gr.kind == testrun.RESULT_INFRASTRUCTURE_FAILURE && gr.cause == testrun.CAUSE_INVALID_TERMINAL)     { std_format.write_str(?w, "could not be judged, its runner failed"); }
+    or                                                                                                      { std_format.write_str(?w, "failed"); }
+    ret layout.text_end(t);
+}
+
+# where a test is declared: its `test` and name on its line, read from its file; nil where the
+# file cannot be read or holds no such line, and the diagnostic then names no place
+fun declared_at(a: *A.Allocator, map: *base_source.SourceMap, art: *testrun.TestArtifact) base_source.Location {
+    val none: base_source.Location = base_source.location_nil();
+    if (art.file == nil || art.line == 0) { ret none; }
+    val res_text: res[str, fs.FsError] = fs.read_string(a, art.file::types_path.Path);
+    if (sel res_text.err) { ret none; }
+    val res_added: res[base_source.FileId, base_source.Error] = base_source.add(map, art.file::str, res_text.ok);
+    if (sel res_added.err) { ret none; }
+    val opt_file: opt[*base_source.SourceFile] = base_source.get(map, res_added.ok);
+    if (sel opt_file.none) { ret none; }
+    val sf:        *base_source.SourceFile = opt_file.some;
+    val opt_start: opt[usize]              = base_source.line_start(sf, art.line::usize);
+    if (sel opt_start.none) { ret none; }
+    val text: str   = sf.text;
+    val len:  usize = str_len(text);
+    var from: usize = opt_start.some;
+    for (from < len && (text[from] == ' ' || text[from] == '\t')) { from = from + 1; }
+    var end: usize = from;
+    for (end < len && text[end] != ' ' && text[end] != '\t' && text[end] != '\n') { end = end + 1; }
+    for (end < len && (text[end] == ' ' || text[end] == '\t')) { end = end + 1; }
+    for (end < len && name_byte(text[end])) { end = end + 1; }
+    if (end == from) { ret none; }
+    ret base_source.location(res_added.ok, base_source.span_between(from, end));
+}
+
+fun name_byte(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+# a failed test's captured output as its note says it, `output:` and each line beneath; nil
+# when it printed nothing
+fun output_text(a: *A.Allocator, t: *readout.TestResult) str {
+    if (t.out == nil || t.out_len == 0) { ret nil; }
+    var n: usize = t.out_len;
+    for (n > 0 && (t.out[n - 1] == '\n' || t.out[n - 1] == '\r')) { n = n - 1; }
+    if (n == 0) { ret nil; }
+    val lead:     str               = "output:\n";
+    val res_text: res[*u8, A.Error] = A.allocate[u8](a, str_len(lead) + n + 1);
+    if (sel res_text.err) { ret nil; }
+    val buf: *u8   = res_text.ok;
+    var at:  usize = 0;
+    var i:   usize = 0;
+    for (lead[i] != 0) {
+        buf[at] = lead[i];
+        at      = at + 1;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        buf[at] = t.out[i];
+        at      = at + 1;
+        i       = i + 1;
+    }
+    buf[at] = 0;
+    ret buf::str;
+}
+
+# a passing test's captured output under -vv, each line indented by `indent`
+fun captured_w(w: *io_writer.Writer, t: *readout.TestResult, indent: usize) {
+    if (t.out == nil || t.out_len == 0) { ret; }
     var i:   usize = 0;
     var seg: usize = 0;
     for (i < t.out_len) {
         if (t.out[i] == '\n') {
-            std_format.write_str(w, DETAIL);
+            layout.spaces(w, indent);
             std_format.write_bytes(w, (t.out::usize + seg)::*u8, i - seg + 1);
             seg = i + 1;
         }
         i = i + 1;
     }
     if (seg < t.out_len) {
-        std_format.write_str(w, DETAIL);
+        layout.spaces(w, indent);
         std_format.write_bytes(w, (t.out::usize + seg)::*u8, t.out_len - seg);
         std_format.write_newline(w);
     }
-    if (t.truncated) { std_format.format(w, "{}... (output truncated)\n", DETAIL); }
 }
 
-# the run's close: each failure once, in collection order whatever order the tests finished
-# in, then the verdict in the gutter: passed with the count, or failed with how many of the
-# count, those that timed out and those skipped, and the run's wall time
-fun run_summary_w(rd: *Readout, w: *io_writer.Writer, ev: *readout.RunEnd) {
-    if (ev.failed > 0) {
-        std_format.write_newline(w);
-        var i: u32 = 0;
-        for (i < ev.count) {
-            val t: *readout.TestResult = ?ev.tests[i];
-            if (failure(?t.result)) { failure_w(w, t); }
-            i = i + 1;
-        }
+# the run's close: the live line goes, under -v its log line, then its result: passed or failed
+# with its target, the count, how many failed, timed out and were skipped, and the time since
+# the command began
+fun run_close(rd: *Readout, ev: *readout.RunEnd) {
+    readout.live_close(rd.sink.live);
+    if (rd.sink.level >= readout.LEVEL_PHASES) {
+        var dt: layout.Text;
+        log_head(rd, false, RUN_LABEL, layout.duration(?dt, ev.wall));
+        std_format.format(?rd.r.w, "  {} {}", ev.count::u64, layout.noun(ev.count::u64, "test", "tests"));
+        tests_counted_w(?rd.r.w, ev.failed, ev.timed_out, ev.skipped);
+        std_format.write_newline(?rd.r.w);
     }
-    if (ev.count > 0) { std_format.write_newline(w); }
-    val tests: str = layout.noun(ev.count::u64, "test", "tests");
-    if (ev.failed > 0) {
-        layout.said(w, layout.FAILED);
-        std_format.format(w, "{} of {} {}", ev.failed::u64, ev.count::u64, tests);
-    }
-    or {
-        layout.said(w, layout.PASSED);
-        std_format.format(w, "{} {}", ev.count::u64, tests);
-    }
-    if (ev.timed_out > 0) { std_format.format(w, " ({} timed out)", ev.timed_out::u64); }
-    if (ev.skipped > 0)   { std_format.format(w, ", {} skipped", ev.skipped::u64); }
-    var dt: layout.Text;
-    std_format.format(w, "   {}\n", layout.duration(?dt, ev.wall));
+    rd.run   = nil;
+    rd.count = 0;
+    if (rd.quiet) { ret; }
+    var verb: layout.Verb = layout.PASSED;
+    if (ev.failed > 0) { verb = layout.FAILED; }
+    var tv:     layout.Value;
+    var texts:  [TEST_FIELDS]layout.Text;
+    var fields: [RUN_FIELDS]layout.Field;
+    fields[0] = layout.Field{key: "target", value: layout.target(?tv, rd.unit.target, rd.unit.profile)};
+    test_fields(?fields[1], ?texts[0], ev.count, ev.failed, ev.timed_out, ev.skipped, readout.elapsed(rd.r.origin));
+    layout.result(out(rd.r), verb, rd.unit.artifact, ?fields[0], RUN_FIELDS);
 }
 
 fun run_start_record(r: *Report, ev: *readout.RunStart) {
@@ -1569,6 +1661,268 @@ fun run_end_record(r: *Report, ev: *readout.RunEnd) {
     val opt_origin: opt[str] = diagnostic.origin_name(diagnostic.ORIGIN_TEST);
     if (sel opt_origin.some) { record.text(?o, "origin", opt_origin.some); }
     record.end(?o);
+}
+
+# the live line's period: how often the drawer redraws it, which is also how long a stage runs
+# before it shows
+val LIVE_PERIOD: chrono_duration.Duration = 50000000;
+
+# the most bytes of the live line kept
+val LIVE_LINE: usize = 320;
+
+# the width a terminal is taken to have when COLUMNS names none
+val LIVE_COLUMNS: usize = 80;
+
+# whether stderr is a terminal the live line can be drawn on, one whose TERM is set and not `dumb`
+fun live_capable() bool {
+    if (!terminal.is_terminal(2)) { ret false; }
+    var buf:     [64]u8;
+    val res_get: res[opt[usize], env.EnvError] = env.get("TERM", ?buf[0], 64);
+    if (sel res_get.err) { ret false; }
+    val opt_len: opt[usize] = res_get.ok;
+    if (sel opt_len.none)   { ret false; }
+    if (opt_len.some >= 64) { ret true; }
+    ret opt_len.some > 0 && !str_equals((?buf[0])::str, "dumb");
+}
+
+# the terminal's width as COLUMNS gives it, LIVE_COLUMNS when it gives none
+fun live_width() usize {
+    var buf:     [16]u8;
+    val res_get: res[opt[usize], env.EnvError] = env.get("COLUMNS", ?buf[0], 16);
+    if (sel res_get.err) { ret LIVE_COLUMNS; }
+    val opt_len: opt[usize] = res_get.ok;
+    if (sel opt_len.none)                        { ret LIVE_COLUMNS; }
+    if (opt_len.some == 0 || opt_len.some >= 16) { ret LIVE_COLUMNS; }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < opt_len.some) {
+        if (buf[i] < '0' || buf[i] > '9') { ret LIVE_COLUMNS; }
+        n = n * 10 + (buf[i] - '0')::usize;
+        i = i + 1;
+    }
+    if (n < 2) { ret LIVE_COLUMNS; }
+    ret n;
+}
+
+# start drawing the live line from the report's slot, on a thread of its own; a report already
+# drawing goes on
+# ---
+# r:   the command's report
+# ret: whether the live line is drawn, false where stderr is no terminal or the thread is refused
+fun live_start(r: *Report) bool {
+    if (r.drawing)       { ret true; }
+    if (!live_capable()) { ret false; }
+    readout.live_init(?r.live);
+    r.stop      = false;
+    r.width     = live_width();
+    r.out_tty   = terminal.is_terminal(1);
+    r.shown_len = 0;
+    val err_spawned: sync_thread.Operation = sync_thread.spawn_with(drawer_main, r::*u8, ?r.drawer);
+    if (sel err_spawned.err) { ret false; }
+    r.drawing = true;
+    ret true;
+}
+
+# stop drawing the live line and erase it
+fun live_stop(r: *Report) {
+    if (!r.drawing) { ret; }
+    mutex.lock(?r.lock);
+    r.stop = true;
+    condition.signal(?r.wake);
+    mutex.unlock(?r.lock);
+    val err_joined: sync_thread.Operation = sync_thread.join(?r.drawer);
+    mutex.lock(?r.lock);
+    live_erase(r);
+    mutex.unlock(?r.lock);
+    readout.live_close(?r.live);
+    r.drawing = false;
+}
+
+# the readout level and quietness the command line asked for
+# ---
+# r:     the command's report
+# level: LEVEL_RESULTS to LEVEL_ITEMS, as `-v` and `-vv` set it
+# quiet: `--quiet`
+pub fun report_level(r: *Report, level: u8, quiet: bool) {
+    r.level = level;
+    r.quiet = quiet;
+}
+
+# whether a command's results are written: human text without `--quiet`
+pub fun results_shown(r: *Report) bool {
+    ret r.format == FORMAT_HUMAN && !r.quiet;
+}
+
+# a stage of a command that is not a build closed: under -v its log line, `[t] label  time  detail`
+# ---
+# r:      the command's report
+# label:  the stage, a word of at most LABEL_W bytes
+# d:      the time it took
+# detail: what it did, as `2 files`
+pub fun log_stage(r: *Report, label: str, d: chrono_duration.Duration, detail: str) {
+    if (r.format != FORMAT_HUMAN || r.level < readout.LEVEL_PHASES) { ret; }
+    var dt: layout.Text;
+    log_lead(r, false, label, layout.duration(?dt, d));
+    if (detail != nil) { std_format.format(?r.w, "  {}", detail); }
+    std_format.write_newline(?r.w);
+}
+
+# one item of a stage finished: under -vv its line, `[t]   label  time  name`
+# ---
+# r:     the command's report
+# label: the stage it belongs to
+# d:     the time it took
+# name:  what it was
+pub fun log_item(r: *Report, label: str, d: chrono_duration.Duration, name: str) {
+    if (r.format != FORMAT_HUMAN || r.level < readout.LEVEL_ITEMS) { ret; }
+    var dt: layout.Text;
+    log_lead(r, true, label, layout.duration(?dt, d));
+    if (name != nil) { std_format.format(?r.w, "  {}", name); }
+    std_format.write_newline(?r.w);
+}
+
+# the live line shows the stage `label` running from now, on a terminal and without `--quiet`
+# ---
+# r:     the command's report
+# label: the stage, which must outlive it
+pub fun live_begin(r: *Report, label: str) {
+    if (r.format != FORMAT_HUMAN || r.quiet || !live_start(r)) { ret; }
+    readout.live_stage(?r.live, label, readout.sample());
+}
+
+# the running stage has done `done` of `total` and reached `name`, 0 of 0 for a stage that
+# counts nothing
+pub fun live_reached(r: *Report, done: u32, total: u32, name: str) {
+    if (!r.drawing) { ret; }
+    readout.live_reach(?r.live, done, total, name);
+}
+
+# nothing runs now, and the live line goes
+pub fun live_end(r: *Report) {
+    if (!r.drawing) { ret; }
+    readout.live_close(?r.live);
+    mutex.lock(?r.lock);
+    live_erase(r);
+    mutex.unlock(?r.lock);
+}
+
+# a blank line is owed after a block: written before whatever is written next on either stream,
+# dropped when nothing is
+fun owe_blank(r: *Report) {
+    mutex.lock(?r.lock);
+    r.owed = true;
+    mutex.unlock(?r.lock);
+}
+
+# the drawer: every LIVE_PERIOD, the live line as the slot stands, until the report stops it
+fun drawer_main(arg: *u8) {
+    val r: *Report = arg::*Report;
+    mutex.lock(?r.lock);
+    for (!r.stop) {
+        val res_now: time.InstantClock = time.instant();
+        if (sel res_now.err) { brk; }
+        val status: condition.WaitStatus = condition.wait_until(?r.wake, ?r.lock, time.instant_add(res_now.ok, LIVE_PERIOD));
+        if (sel status.invalid || sel status.failed) { brk; }
+        if (!r.stop)                                 { live_draw(r); }
+    }
+    mutex.unlock(?r.lock);
+}
+
+# draw the live line where the cursor stands at the start of a line, the report's lock held: the
+# stage, its time so far, its count and what it reached last, in a log line's columns with the
+# stamp left blank, cut to the terminal's width
+fun live_draw(r: *Report) {
+    if (interrupt.taken()) {
+        live_erase(r);
+        ret;
+    }
+    if (!r.err_bare || (r.out_tty && !r.out_bare)) { ret; }
+    var v: readout.LiveView;
+    if (!readout.live_view(?r.live, ?v)) {
+        live_erase(r);
+        ret;
+    }
+    var l:  Line;
+    var lw: io_writer.Writer = line_writer(?l);
+    layout.spaces(?lw, STAMP_W);
+    left_w(?lw, v.label, LABEL_W);
+    var dt: layout.Text;
+    right_w(?lw, layout.duration(?dt, v.elapsed), TIME_W);
+    if (v.total > 0) { std_format.format(?lw, "  {}/{}", v.done::u64, v.total::u64); }
+    # a path drops its leading `./`, as a result's does
+    var from: usize = 0;
+    if (v.name_len > 2 && v.name[0] == '.' && v.name[1] == '/') { from = 2; }
+    if (v.name_len > from) {
+        std_format.write_str(?lw, "  ");
+        std_format.write_bytes(?lw, ?v.name[from], v.name_len - from);
+    }
+    var n: usize = l.len;
+    if (n > r.width - 1)                                             { n = r.width - 1; }
+    if (n == r.shown_len && bytes_same(?r.shown[0], ?l.bytes[0], n)) { ret; }
+    var host: io_writer.Writer = stderr_writer();
+    std_format.write_str(?host, "\r");
+    std_format.write_bytes(?host, ?l.bytes[0], n);
+    if (r.shown_len > n) { layout.spaces(?host, r.shown_len - n); }
+    std_format.write_str(?host, "\r");
+    var i: usize = 0;
+    for (i < n) {
+        r.shown[i] = l.bytes[i];
+        i          = i + 1;
+    }
+    r.shown_len = n;
+}
+
+fun bytes_same(a: *u8, b: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# erase the live line where one is drawn, the report's lock held
+fun live_erase(r: *Report) {
+    if (r.shown_len == 0) { ret; }
+    var host: io_writer.Writer = stderr_writer();
+    std_format.write_str(?host, "\r");
+    layout.spaces(?host, r.shown_len);
+    std_format.write_str(?host, "\r");
+    r.shown_len = 0;
+}
+
+# make way for a write, the report's lock held: the live line erased, then a blank line owed
+# written
+fun make_way(r: *Report) {
+    live_erase(r);
+    if (!r.owed) { ret; }
+    r.owed = false;
+    var host: io_writer.Writer = stderr_writer();
+    std_format.write_str(?host, "\n");
+    r.err_bare = true;
+}
+
+# a line built in place, cut at LIVE_LINE bytes
+rec Line {
+    bytes: [LIVE_LINE]u8;
+    len:   usize;
+}
+
+# a writer appending to l, which starts empty
+fun line_writer(l: *Line) io_writer.Writer {
+    l.len = 0;
+    ret io_writer.Writer{ctx: l::ptr, fn_write: line_write};
+}
+
+fun line_write(ctx: ptr, buf: *u8, len: usize) res[usize, io_writer.WriteError] {
+    val l: *Line = ctx::*Line;
+    var i: usize = 0;
+    for (i < len && l.len < LIVE_LINE) {
+        l.bytes[l.len] = buf[i];
+        l.len          = l.len + 1;
+        i              = i + 1;
+    }
+    ret res[usize, io_writer.WriteError].ok{len};
 }
 
 # whether a result is a failure: anything but a pass or a skip
@@ -1658,6 +2012,29 @@ pub rec Report {
     # the first refusal met while writing, which fails the report at its close
     refusal: opt[fail.Fail];
     out:     io_writer.Writer;
+    # when the command began, which a log line's stamp and a run's time count from
+    origin: readout.Instant;
+    # the readout level `-v` and `-vv` set, and `--quiet`, which leaves out the results
+    level: u8;
+    quiet: bool;
+    # the console both streams share with the live line: `lock` serialises their writes and the
+    # drawer, `err_bare` and `out_bare` say the last byte written to stderr, and to stdout where
+    # it is the terminal, ended a line, and `owed` that a blank line is owed before the next write
+    lock:     mutex.Mutex;
+    err_bare: bool;
+    out_bare: bool;
+    out_tty:  bool;
+    owed:     bool;
+    # the live line: the slot the engine writes, whether the drawer runs and is told to stop,
+    # what wakes it, its thread, the terminal's width and the line on screen, none when shown_len is 0
+    live:      readout.Live;
+    drawing:   bool;
+    stop:      bool;
+    wake:      condition.Condition;
+    drawer:    sync_thread.Thread;
+    width:     usize;
+    shown:     [LIVE_LINE]u8;
+    shown_len: usize;
 }
 
 # a unit's `built` line as the summary record keeps it: the output, nil when it wrote none, its modules,
@@ -1677,17 +2054,31 @@ rec Built {
 # r:      the report
 # format: the format the command writes
 pub fun report_init(r: *Report, format: Format) {
-    r.format   = format;
-    r.w        = io_writer.Writer{ctx: r::ptr, fn_write: stderr_write};
-    r.root     = nil;
-    r.errors   = 0;
-    r.warnings = 0;
-    r.notes    = 0;
-    r.made     = false;
-    r.built    = collections_vector.init[Built](nil);
-    r.refusal  = opt[fail.Fail].none{};
-    r.sources  = nil;
-    r.out      = io_writer.Writer{ctx: r::ptr, fn_write: stdout_write};
+    r.format    = format;
+    r.w         = io_writer.Writer{ctx: r::ptr, fn_write: stderr_write};
+    r.root      = nil;
+    r.errors    = 0;
+    r.warnings  = 0;
+    r.notes     = 0;
+    r.made      = false;
+    r.built     = collections_vector.init[Built](nil);
+    r.refusal   = opt[fail.Fail].none{};
+    r.sources   = nil;
+    r.out       = io_writer.Writer{ctx: r::ptr, fn_write: stdout_write};
+    r.origin    = readout.sample();
+    r.level     = readout.LEVEL_RESULTS;
+    r.quiet     = false;
+    r.lock      = mutex.make();
+    r.err_bare  = true;
+    r.out_bare  = true;
+    r.out_tty   = false;
+    r.owed      = false;
+    r.drawing   = false;
+    r.stop      = false;
+    r.wake      = condition.make();
+    r.width     = LIVE_COLUMNS;
+    r.shown_len = 0;
+    readout.live_init(?r.live);
 }
 
 # what a refused write to stdout is reported as
@@ -1697,17 +2088,27 @@ val STDOUT_OP: fail.Op = fail.Op{verb: "write", role: "standard output"};
 # reports that and nothing else: what its operations make of being stopped is not written
 fun stderr_write(ctx: ptr, buf: *u8, len: usize) res[usize, io_writer.WriteError] {
     if (interrupt.taken()) { ret res[usize, io_writer.WriteError].ok{len}; }
-    var host: io_writer.Writer = stderr_writer();
-    ret io_writer.write(?host, buf, len);
+    val r: *Report = ctx::*Report;
+    mutex.lock(?r.lock);
+    make_way(r);
+    var host:        io_writer.Writer                 = stderr_writer();
+    val res_written: res[usize, io_writer.WriteError] = io_writer.write(?host, buf, len);
+    if (len > 0) { r.err_bare = buf[len - 1] == '\n'; }
+    mutex.unlock(?r.lock);
+    ret res_written;
 }
 
 # a command's write to stdout: a refusal is kept as the report's, which fails it at its close.
 # nothing more is written once an interrupt stopped the command
 fun stdout_write(ctx: ptr, buf: *u8, len: usize) res[usize, io_writer.WriteError] {
     if (interrupt.taken()) { ret res[usize, io_writer.WriteError].ok{len}; }
-    val r:           *Report                          = ctx::*Report;
+    val r: *Report = ctx::*Report;
+    mutex.lock(?r.lock);
+    make_way(r);
     var host:        io_writer.Writer                 = fs.writer(fs.STDOUT);
     val res_written: res[usize, io_writer.WriteError] = io_writer.write(?host, buf, len);
+    if (len > 0) { r.out_bare = buf[len - 1] == '\n'; }
+    mutex.unlock(?r.lock);
     if (sel res_written.err) {
         if (sel r.refusal.none && report_paths(r) != nil) { refused(r, fail.refusal(?r.a, diagnostic_kind.OUTPUT_WRITE, STDOUT_OP, fail.Cause.write{res_written.err})); }
     }
@@ -1797,40 +2198,23 @@ pub fun report_note(r: *Report, k: diagnostic_kind.Kind, text: str) {
     note_record(r, k, text);
 }
 
-# report what a command did as a progress line in human text, and as the note record of kind
-# `k` saying `text` under the records modes
+# report what a command did as a result in human text, and as the note record of kind `k`
+# saying `text` under the records modes
 # ---
-# r:      the command's report
-# k:      the note's kind, a row of note level
-# v:      the verb of the progress line
-# texts:  what it acted on, then its detail on the line, `n` of them
-# n:      how many texts
-# detail: a line beneath it, nil for none
-# text:   the note record's message
-pub fun report_said(r: *Report, k: diagnostic_kind.Kind, v: layout.Verb, texts: *str, n: usize, detail: str, text: str) {
+# r:       the command's report
+# k:       the note's kind, a row of note level
+# v:       the result's verb
+# subject: what it acted on
+# fields:  the result's fields, `n` of them
+# detail:  a note after it, nil for none
+# text:    the note record's message
+pub fun report_said(r: *Report, k: diagnostic_kind.Kind, v: layout.Verb, subject: str, fields: *layout.Field, n: usize, detail: str, text: str) {
     if (r.format == FORMAT_HUMAN) {
-        said_row(?r.w, v, texts, n);
-        if (detail != nil) {
-            layout.beneath(?r.w);
-            std_format.write_str(?r.w, detail);
-            std_format.write_newline(?r.w);
-        }
+        if (!r.quiet)      { layout.result(out(r), v, subject, fields, n); }
+        if (detail != nil) { report_note(r, k, detail); }
         ret;
     }
     note_record(r, k, text);
-}
-
-# a progress line on w: its verb in the gutter, then `n` texts parted by GAP
-pub fun said_row(w: *io_writer.Writer, v: layout.Verb, texts: *str, n: usize) {
-    var cols: [8]layout.Column;
-    var i:    usize = 0;
-    for (i < n && i < 8) {
-        cols[i] = layout.Column{width: 0, align: layout.LEFT, gap: layout.GAP};
-        i       = i + 1;
-    }
-    cols[0].gap = 0;
-    layout.said(w, v);
-    layout.row(w, ?cols[0], texts, n);
 }
 
 fun note_record(r: *Report, k: diagnostic_kind.Kind, text: str) {
@@ -1943,6 +2327,7 @@ pub fun report_skip(r: *Report, target: str, profile: str, reason: str) {
 # code: the exit code the command returns
 # ret:  the worse of code and the kept refusal's
 pub fun report_dnit(r: *Report, code: i64) i64 {
+    live_stop(r);
     if (interrupt.taken()) {
         report_interrupted(r, code);
         report_release(r);
@@ -1953,12 +2338,6 @@ pub fun report_dnit(r: *Report, code: i64) i64 {
         if (sel r.pb.refusal.some) { refused(r, r.pb.refusal.some); }
     }
     if (sel r.refusal.some) { closing = exit.worst(closing, report_fail(r, r.refusal.some, diagnostic.ORIGIN_NONE)); }
-    # one tally closes every error and warning the command rendered, whichever store, failure
-    # or phase it came from, so it never reads `0 errors` above a nonzero exit
-    if (r.format == FORMAT_HUMAN && r.errors + r.warnings > 0) {
-        std_format.write_str(?r.w, "\n");
-        emit_summary(?r.w, r.errors, r.warnings);
-    }
     if (r.format != FORMAT_HUMAN) {
         var o: record.Record;
         record.begin(?r.w, enc(r), ?o, "summary");

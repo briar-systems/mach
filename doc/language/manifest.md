@@ -69,8 +69,9 @@ boundary.
 ### Dependency manifests
 
 A dependency's `mach.toml` is held to exactly the rules of the project being
-built. It is read once, and an unknown, removed, mistyped or missing key in it
-fails the consumer's build pointing into the dependency's own file:
+built, once its identity and [compiler range](#compiler-range) admit it. It is
+read once, and an unknown, removed, mistyped or missing key in it fails the
+consumer's build pointing into the dependency's own file:
 
 ```
 error[manifest.unknown_key] dependency 'gfx' cannot be read (mach.toml: unknown key 'bogus' in [project])
@@ -212,6 +213,12 @@ error[mach.version_unaccepted] this is mach 7.0.0, and the dependency closure do
 4 | mach = ">=7.1"
   |        ^^^^^^^
 ```
+
+A dependency's `[project].id` and `mach` are read before the rest of its
+manifest, so one written for another compiler is refused by its range, never by
+a key this compiler does not know, and nothing under it is read. Where a newer
+selection has moved past the realized commit, `mach dep pull` and `mach dep
+verify` refuse the stale checkout instead, naming `mach dep update`.
 
 Every manifest must state `mach`, a dependency's included. One without it is
 refused like any missing required key (`mach.toml: [project] is missing required
@@ -729,20 +736,41 @@ the conventions it declares per instruction set (`linux` and `darwin` refuse
 and `freestanding` accepts every convention the instruction set covers.
 
 `mach info targets` prints every target a build can be made for, the rows of mink's
-catalog whose architecture mirl carries under a convention the row accepts, one per line as
-`-t` takes it (`<sys>-<arch>`), then the environments, calling conventions, code
-models and executable linkages it accepts as `env=`, `abi=`, `code_model=` and
-`linkage=` lists, the default first and marked `*`. Linkages depend on the
-environment, so where they differ the list repeats per environment, as
-`linkage=*static gnu:*pie,dynamic,static` on `linux-x86_64` says that a target with
-no `env` links static only and one with `env = "gnu"` defaults to `pie`. A target
-that runs no executable, such as `vulkan-spirv`, lists `linkage=-`. `none` is the environment of a host that states none,
-such as bare `linux`, and `-` stands for a part the target has no choices of.
-It marks `needs --isa` beside each whose system bounds the machine not at all,
-such as `freestanding-riscv32`, so a target spelled that way names its
-instruction set. The list is read from the catalog and mirl's carried conventions, so
-mach holds no table of its own. `mach info` alone prints the tuple the host
-resolves to.
+catalog whose architecture mirl carries under a convention the row accepts. A header row
+names the columns, then each target is one line as `-t` takes it (`<sys>-<arch>`),
+followed by the environments, calling conventions, code models and executable linkages it
+accepts in the `env`, `abi`, `code_model` and `linkage` columns, the default first and
+marked `*`. Linkages depend on the environment, so where they differ the list repeats per
+environment, as `*static gnu:*pie,dynamic,static` on `linux-x86_64` says that a target
+with no `env` links static only and one with `env = "gnu"` defaults to `pie`. A target
+that runs no executable, such as `vulkan-spirv`, lists `-` for its linkage. `none` is the
+environment of a host that states none, such as bare `linux`, and `-` stands for a part
+the target has no choices of. The `note` column says `needs --isa` beside each whose
+system bounds the machine not at all, such as `freestanding-riscv32`, so a target spelled
+that way names its instruction set. The list is read from the catalog and mirl's carried
+conventions, so mach holds no table of its own.
+
+```
+target                 env                                            abi                            code_model      linkage                                            note
+linux-x86_64           *none,gnu                                      *sysv64                        *small          *static gnu:*pie,dynamic,static
+linux-riscv32          *none,gnu                                      ilp32,ilp32f,ilp32d            *medany         *static gnu:*pie,dynamic,static                    needs --isa
+vulkan-spirv           *none,vulkan1.0,vulkan1.1,vulkan1.2,vulkan1.3  *shader                        -               - vulkan1.0:- vulkan1.1:- vulkan1.2:- vulkan1.3:-
+```
+
+`mach info` alone prints the version and the tuple the host resolves to, a key and its
+value a line, the keys in a column of their own:
+
+```
+mach        7.2.0
+host        linux-x86_64
+isa         cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2
+sys         linux
+env         none
+abi         sysv64
+code_model  small
+linkage     static
+object      elf
+```
 
 A value outside its axis's set is refused when the target resolves, so a typo is
 caught rather than silently never matching.
@@ -1041,7 +1069,8 @@ A `wasi` target builds a wasm32 module that a host runtime instantiates, so its
 programs run under a command the manifest declares as the target's `runner`, since
 a wasm module is not a program the host runs itself. mach knows no runtime by name. The one `sys` is
 `wasi` under the one environment, `preview1`: the module imports its system
-interface from `wasi_snapshot_preview1`, starts at `_start`, and runs one thread.
+interface from `wasi_snapshot_preview1` and runs one thread. A `bin` starts at
+`_start`, and a `module` is a module of its exports with none.
 
 ```toml
 [target.wasi-wasm32]
@@ -1058,10 +1087,19 @@ runner = ["wasmtime", "{artifact.out}"]
   `wasm`. Name `isa` and `ext` as on any target: with no `isa` the target stands on
   `wasm1`, WebAssembly's core 1.0, and `ext` adds features from masc's wasm set (see
   [Instruction-set extensions](#instruction-set-extensions)).
-- **Artifacts.** A `bin` artifact is a `.wasm` module and a `static` one a `.a`
-  archive of objects whose relocation records mink links. The module has no loader
-  to map it, so it is never position-independent and no `shared` artifact exists:
-  a `shared` artifact is refused with mink's reason, naming the system.
+- **Artifacts.** A `bin` artifact is a `.wasm` module a runtime runs as a command,
+  through its `_start`, which `use std.runtime;` defines to call `main`. A `module`
+  artifact is a `.wasm` module of its exports, a reactor its host calls through
+  what it marks `#[export]`, and it needs no `main`. A `bin` that defines no
+  `_start` is refused, saying a module of exports states `kind = "module"`. A
+  `static` artifact is a `.a` archive of objects whose relocation records mink
+  links. The module has no loader to map it, so it is never position-independent
+  and no `shared` artifact exists: a `shared` artifact is refused with mink's
+  reason, naming the system.
+- **A module's start.** Nothing runs before the host calls a `module`'s first
+  export, and mach exports no `_initialize`: a mach global's initializer is
+  constant, so the module's data segments already hold every global's value when
+  the host instantiates it.
 - **No linker-side image options.** A wasm module has no PE subsystem, so
   `subsystem` and `--set subsystem` are refused as on any format without one. Its data
   starts in linear memory past the stack, which grows down from there, so a stack
@@ -1111,7 +1149,7 @@ arch   = ["wasm32"]
 abi    = ["*"]
 
 [artifact.counter]
-kind    = "bin"
+kind    = "module"
 entry   = "main.mach"
 out     = "{project.work}/bin/counter{artifact.suffix}"
 targets = ["web"]
@@ -1142,11 +1180,14 @@ pub fun add(a: i32, b: i32) i32 {
 - **Exports.** Every `#[export]` declaration, under its symbol name, and the linear
   memory as `memory`. A `#[export]` variable is exported as an immutable global holding
   its address.
-- **The entry.** A `bin` needs none: a program that defines `_start` has it exported
-  as `_start`, and one that does not is a module of its exports. Other freestanding
-  targets still need `_start`. `use std.runtime;` defines one that calls
-  `main(0, nil)` and returns, and traps when main returns anything but 0, since a
-  module has no process to exit. A program that wants no entry leaves std.runtime out.
+- **The entry.** A module its host calls through its exports is a `module`
+  artifact, with no entry, as on `wasi`. A `bin` has `_start` exported as `_start`:
+  `use std.runtime;` defines one that calls `main(0, nil)` and returns, and traps
+  when main returns anything but 0, since a module has no process to exit. Other
+  freestanding targets need `_start` too.
+- **A `bin` with no `_start`** is still a module of its exports, as it was before
+  `kind = "module"` built one on wasm. That form is deprecated and mach 8 refuses
+  it: state `kind = "module"` for a module of exports.
 - **Memory.** As on `wasi`: the stack lies at the bottom of linear memory, from its
   base down to address zero, 64 KiB unless `stack_reserve` states its size, and the
   data starts at the base, so a stack overflow traps below address zero. The memory's
@@ -1493,7 +1534,10 @@ A build shows the warnings of the project being built and none of its
 dependencies'. A warning belongs to the package that owns the file it stands
 in, so a warning a dependency's source raises is the dependency's, whichever
 stage raises it: name resolution, type checking, the back end
-(`vector.scalarize`) or anything else that points into its files. A warning that
+(`vector.scalarize`) or anything else that points into its files. A back-end
+warning about a function as a whole, as `secret.target_unenforceable`, stands at
+the function's definition, an instance's at its generic's, whether or not the
+build records debug locations. A warning that
 stands in no file, as `link.report` or `target.skipped`, is the build's own and
 is shown. A hidden warning is not counted in the summary line, which counts
 what was printed. A check whose only product is warnings does not run on a
@@ -1670,7 +1714,7 @@ reads the selected artifact's name.
 
 | Key       | Required | Meaning |
 |-----------|----------|---------|
-| `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates, such as a SPIR-V module). Any other value is refused listing mink's products (see below). |
+| `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates: a SPIR-V module, or a WebAssembly module its host calls through its exports). Any other value is refused listing mink's products (see below). |
 | `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing those the target runs, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. v6 rooted it under the expanded `[project].out` without saying so, so `mach migrate` writes `{project.work}/` before each `out` of a manifest that still writes `[project].out`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
@@ -1701,7 +1745,11 @@ any of them (see [test.md](test.md#which-tests-run)).
   such as a finished-module `spirv` target, refuses it in mink's words.
 - **`module`** is a module a runtime instantiates. On a finished-module target
   such as `spirv` it is the module mink's link joins from the build's objects,
-  written at `out`. A format
+  written at `out`. On a `wasm32` target, `wasi` or freestanding, it is a module of
+  the declarations marked `#[export]`, linked as a `bin` is, from the artifact's
+  link entries and every input the link takes, but rooted at its exports: it has
+  no `_start`, runs nothing before its host calls an export, and imports only what
+  its exports reach (see [WebAssembly targets](#webassembly-targets)). A format
   mink builds no module in, such as ELF, refuses it.
 - **`object`** is each module's object, written under `obj/` for a later link,
   as `--emit obj` writes them. A target whose back end compiles an artifact whole,
@@ -1996,7 +2044,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `arch`     | yes | Filter axis over `arch`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
-| `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
+| `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. A PE image loads no DLL it imports nothing from, so a windows link refuses an `"always"` entry nothing imports from, pointing at the entry, and an entry the program may not reference states `"referenced"`. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
 | `current_version`, `compatibility_version` | absent: `0.0.0` | The versions a Mach-O load command records for this library, each `X`, `X.Y` or `X.Y.Z` with `X` below 65536 and `Y` and `Z` below 256. Both or neither, and only on a `source = "system"` entry of the shared kind. dyld compares the compatibility version against the loaded library's current version. Other formats ignore them. |
 | `kind`    | absent: `"shared"` | What a `source = "system"` library named by a bare name must be: `"shared"` or `"static"`, with no fallback in either direction (see below), or `"module"`, an import module a wasm module's host supplies (see [Import modules](#import-modules)). Any other value is a manifest error (`[link.k].kind must be "shared", "static" or "module"`). Refused on any other source, and on a `name` that names a file, whose contents state its kind. |
 | `library` | removed | Refused as a removed key. The table key is the library's identity, and `#[library]` names the entry by that key. |

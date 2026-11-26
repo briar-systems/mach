@@ -13,7 +13,7 @@ so a new source is a new member and not a new engine:
 
 - source.mach: where a dependency's releases and content come from
 - pin.mach: where a project records the revision each dependency is held at
-- report.mach: where progress, notes and failures go while it works
+- report.mach: where results, notes, fetches and failures go while it works
 
 git, under package/git, is the member of the first two and the one outside tool mach
 runs; path.mach realizes a dependency declared by a local path, and scratch.mach makes the
@@ -31,7 +31,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.manifest.model`](manife
 | [`git_source`](#git_source) | the source a manifest's `git` value names, as every git command and record reads it: a relative local path is resolved against the directory of the manifest that declares it, as a `path` is, and made absolute, since git runs in other directories than that one |
 | [`ref_of`](#ref_of) | the ref a git line names, empty when it names none |
 | [`refuse_nested_realization`](#refuse_nested_realization) | a realized nested dependency (`dep/<id>/dep/<x>/mach.toml`) is refused: the root owns the flat closure and a dependency's own dep/ is never realized |
-| [`verify_dep_manifest_id`](#verify_dep_manifest_id) | check that the manifest of a realized dependency declares the id it is realized under |
+| [`verify_dep_manifest_id`](#verify_dep_manifest_id) | check that the manifest of a realized dependency declares the id it is realized under, read from its text, and holds to the schema |
 | [`dep_rel_of`](#dep_rel_of) | the path of a dependency's slot relative to the project root, `dep/<id>` |
 | [`dep_full_of`](#dep_full_of) | the path of a dependency's slot under a project root, `<root>/dep/<id>` |
 | [`realized_ids`](#realized_ids) | a dependency slot is a directory under dep/ named by a valid project id |
@@ -113,14 +113,17 @@ a realization and passes
 pub fun verify_dep_manifest_id(s: *mach.session.Session, dep_full: str, id: str) err[mach.base.fail.Fail]
 ```
 
-check that the manifest of a realized dependency declares the id it is realized under
+check that the manifest of a realized dependency declares the id it is realized under, read
+from its text, and holds to the schema. a manifest stating a compiler range the running
+compiler is outside of is not held to the schema here: the closure walk refuses it by that
+range, with every chain that reaches it
 
 | Parameter | |
 | :--- | :--- |
 | `s` | the session whose allocator, interner and source map read the manifest |
 | `dep_full` | the dependency's root directory |
 | `id` | the identity it is realized under, its directory name under dep/ |
-| **returns** | ok when the declared id matches, err when the manifest cannot be read, declares no readable id or declares a different one |
+| **returns** | ok when the declared id matches, err when the manifest cannot be read, declares another id or fails the schema, which refuses one declaring none |
 
 ### dep_rel_of
 

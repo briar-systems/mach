@@ -33,7 +33,7 @@ dependency is realized at
 | Parameter | |
 | :--- | :--- |
 | `s` | the session |
-| `gi` | the inspector whose git runs the checks |
+| `gi` | the inspector whose git runs the checks, started here when still pending |
 | `alias` | the dependency identity |
 | `chain` | the requiring chain, as a refusal names it |
 | `project_root` | the root project |

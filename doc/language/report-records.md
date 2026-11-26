@@ -26,18 +26,19 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 ## The stream
 
 - Records go to stderr, one per line, in the order the human rendering shows
-  the same reports. Stdout keeps what the command writes there, such as a test
-  run's human readout, a build step's banner or the listing `mach check
-  --declassified` writes, which stays plain lines.
+  the same reports. The results the human rendering writes to stdout are not
+  written. Stdout keeps the listings a command writes, such as `mach test
+  --list`, `mach dep list` or the listing `mach check --declassified` writes,
+  which stay plain lines.
 - Every line mach writes to stderr is a record, a JSON object on a line of its
   own, and the last one is the [summary](#the-summary-record). Output a build
   step or a test writes itself is not mach's and is not a record.
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
   written as a `\u` escape, and a byte that is not valid UTF-8 as `\ufffd`,
   the escape of U+FFFD, so every line is valid UTF-8 and valid JSON.
-- Under `json` and `lines` the human tally (`N errors / M warnings`) is not written, and
-  neither are the banners `-v` writes above each unit's table nor the line naming a unit
-  that reports a diagnostic. Under `-v` a `unit` record opens every unit instead.
+- Under `json` and `lines` the live line is not drawn, and the counts a `failed`
+  result gives are the summary's. Under `-v` a `unit` record opens every unit,
+  as the text names the unit's target and profile on its result.
 
 ## A record
 
@@ -190,7 +191,7 @@ the manifest does not declare (`selection.unknown`).
 A note says what a command did or found, without failing it, and is a diagnostic
 record with `severity` `"note"`, its `code` the note's key, a `null`
 `primary` and no `origin`. The human rendering writes a note that reports what a
-command did as that command's progress line, as `mach init` writes `created` for
+command did as that command's result, as `mach init` writes `created` for
 `project.created` and `realized` for `dep.realized`, and any other note as
 `note <message>`.
 
@@ -208,7 +209,8 @@ command did as that command's progress line, as `mach init` writes `created` for
 
 ## Test records
 
-Under `mach test` a run is records too, beside the human readout on stdout.
+Under `mach test` a run is records too, in place of its results and its
+`test.failed` diagnostics.
 Each (target, profile) whose tests run opens with a `run_start` record, writes
 a `test` record per test in the order the tests finish, and closes with a
 `run_end` record. A (target, profile) whose tests were built and not run is a
@@ -266,21 +268,23 @@ summary's `outcome` and `exit_code` say whether a test failed.
 
 ## Readout records
 
-Under `-v` every line of the [readout](readout.md) the human text writes to
-stderr is a record, written when the line would be and in the same order. Times
-are integer microseconds.
+Under `-v` the [readout](readout.md) is written as records, each when its event
+arrives: a `phase` record for each log line the human text writes, and for each
+part of code generation, which the human text shows only in the `-vv` recap, and
+a `counter` record for each of the unit's totals. Under `-vv` the records of the
+items, the target's facts and each module's counters are added. Times are
+integer microseconds.
 
 ```json
 {"schema":3,"record":"unit","verb":"building","artifact":"demo","target":"linux-x86_64","profile":"debug"}
 {"schema":3,"record":"phase","name":"target","count":1,"unit":"target","time_us":14936}
 {"schema":3,"record":"phase","name":"load","count":55,"unit":"modules","time_us":55735,"slowest":"std.types.string","slowest_us":1374}
-{"schema":3,"record":"phase","name":"lower","count":1,"unit":"object","time_us":266,"threads":16}
+{"schema":3,"record":"phase","name":"lower","parent":"codegen","count":1,"unit":"object","time_us":266,"threads":16}
 {"schema":3,"record":"phase","name":"other","time_us":4347}
 ```
 
 A **unit** record opens each unit, before its rows. It is written for every
-unit, where the text shows a banner naming the unit's target, artifact and profile
-only when the plan has several units. It names the target the unit resolved to
+unit, as the text names every unit's target and profile on its result. It names the target the unit resolved to
 whether `-t` selected it or the host's default did, here a project with no
 `[target]` table, whose one target is `native`:
 
@@ -299,14 +303,16 @@ unit	schema=3	verb=building	artifact=records	target=native	profile=debug
 | `target` | string | the target the unit builds for, by its declared name |
 | `profile` | string | the profile, absent when the unit names none |
 
-A **phase** record is a phase row:
+A **phase** record is a phase, or a part of one, closing:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `name` | string | the row's label: `steps`, `target`, `load`, `resolve`, `sema`, `lower`, `verify`, `codegen`, `passes`, `select`, `alloc`, `frame`, `mirl emit`, `layout`, `encode`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
+| `name` | string | the phase's label: `steps`, `target`, `load`, `cache`, `resolve`, `sema`, `codegen`, its parts `prepare`, `lower`, `verify`, `passes`, `select`, `alloc`, `frame`, `emit`, `layout`, `encode` and `write`, `link`, or `other` for the time no row accounts for |
+| `parent` | string | the phase this one is a part of, `"codegen"` for its parts; absent for a phase of its own |
 | `count` | integer | what the phase processed; absent for `other` |
-| `unit` | string | the noun the count is in, singular for a count of one: `"steps"` for the `steps` row, `"modules"` for the front end's rows and `cache`, `"objects"` from `lower` to `emit`, `"target"` for the `target` row, and for the `link` row `"binary"` for an executable, `"archive"` for a static library and `"library"` for a shared one |
+| `unit` | string | the noun the count is in, singular for a count of one: `"steps"` for the `steps` row, `"modules"` for the front end's rows and `cache`, `"objects"` for `codegen` and its parts, `"target"` for the `target` row, and for the `link` row `"binary"` for an executable, `"archive"` for a static library and `"library"` for a shared one |
 | `time_us` | integer | the phase's time |
+| `bytes` | integer | the size of the `link` row's output, present when it linked one |
 | `threads` | integer | the threads its time is added up over, present only when more than one; such a row is not part of the unit's wall time |
 | `dropped` | integer | the modules it dropped as target-gated, present only when any |
 | `slowest` | string | under `-vv`, the slowest of its items, present when it had two or more |
@@ -316,9 +322,10 @@ The slowest item is on the phase record rather than on an item, since it is
 only known when the phase closes.
 
 Under `-vv` a **phase_item** record is each item a phase processed, written as
-it finishes, before its phase's record: a module, a file such as the `link`
-row's output, a build step under `steps`, or a stage of the `cache` row such as
-`module keys`:
+it finishes, before its phase's record: a module, a build step under `steps`, or
+a stage of the `cache` row such as `module keys`. A module's code generation is
+an item of each part that timed it, which the human text adds up into one
+`codegen` line for the module:
 
 ```json
 {"schema":3,"record":"phase_item","phase":"load","name":"std.print","time_us":422}
@@ -326,7 +333,7 @@ row's output, a build step under `steps`, or a stage of the `cache` row such as
 
 | Member | Type | Meaning |
 |---|---|---|
-| `phase` | string | the label of the phase that processed it |
+| `phase` | string | the label of the phase, or the part of one, that processed it |
 | `name` | string | the module, file, step or stage |
 | `time_us` | integer | its time |
 
@@ -347,6 +354,18 @@ while a module's record is written with its value even when that is zero:
 | `counter` | string | the counter's label: `functions`, `ir instrs`, `verify runs`, `heap blocks`, `heap bytes`, `heap peak`, `selected instrs`, `allocated instrs`, `alloc rounds` |
 | `name` | string | the module, absent for the unit's total |
 | `value` | integer | its value; a total is the sum over modules, and for `heap peak` the most any module reached |
+
+Under `-vv` a **fact** record is a fact of the unit's target, written after the
+`target` phase's record, one per fact, as `-vv` lists them beneath its log line:
+
+```json
+{"schema":3,"record":"fact","key":"abi","value":"sysv64"}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `key` | string | the fact: `isa`, `sys`, `env`, `abi`, `code_model`, `linkage` or `object` |
+| `value` | string | its value, as the target resolved it |
 
 Under `-v` a **growth** record is a growing cycle of instances, written each time its
 instance count doubles:

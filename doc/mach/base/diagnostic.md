@@ -39,6 +39,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | On `Diagnostic` | |
 | :--- | :--- |
 | [`is_error`](#is_error) | the diagnostic is an error: its kind's row declares it one |
+| [`report_key`](#report_key) | what tells one report from another wherever it is held: the digest of everything it reports but its origin, so a store rebuilt from its sources gives a report it held before the same key |
 
 | On `DiagnosticStore` | |
 | :--- | :--- |
@@ -192,6 +193,15 @@ pub fun is_error(d: *Diagnostic) bool
 ```
 
 the diagnostic is an error: its kind's row declares it one
+
+### report_key
+
+```mach
+pub fun report_key(d: *Diagnostic) u64
+```
+
+what tells one report from another wherever it is held: the digest of everything it reports
+but its origin, so a store rebuilt from its sources gives a report it held before the same key
 
 ## DiagnosticStore
 

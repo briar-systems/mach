@@ -14,6 +14,7 @@ use std_format: std.format;
 use io_error:   std.io.error;
 use io_writer:  std.io.writer;
 use system_os:  std.system.os;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -23,6 +24,7 @@ use std.types.size.usize;
 use types_string: std.types.string;
 use std.types.string.str;
 use std.types.string.str_compare;
+use std.types.string.str_copy;
 use std.types.string.str_copy_slice;
 use std.types.string.str_equals;
 use std.types.string.str_is_empty;
@@ -33,8 +35,9 @@ use A: std.allocator;
 
 use mach.base.diagnostic;
 use diagnostic_kind: mach.base.diagnostic.kind;
-use base_source:     mach.base.source;
-use build_plan:      mach.build.plan;
+use mach.base.intern;
+use base_source: mach.base.source;
+use build_plan:  mach.build.plan;
 use mach.cli.args;
 use mach.cli.cmd.build;
 use cli_diagnostic: mach.cli.diagnostic;
@@ -49,6 +52,7 @@ use manifest_model:  mach.manifest.model;
 use manifest_schema: mach.manifest.schema;
 use manifest_select: mach.manifest.select;
 use report_layout:   mach.report.layout;
+use mach.report.readout;
 use mach.session;
 
 # what a clean entry names
@@ -63,16 +67,23 @@ val ENTRY_FILE: EntryKind = 1;
 # ---
 # rel:  the path relative to the project root, as the manifest templates expand it
 # kind: ENTRY_DIR or ENTRY_FILE
+# gone: whether the run removed it
 rec CleanEntry {
     rel:  str;
     kind: EntryKind;
+    gone: bool;
 }
 
+# length of FLAGS
+val FLAGS_N: usize = 4;
 # the flags mach clean takes
-val FLAGS: [2]*std_args.Flag = [2]*std_args.Flag{?args.HELP, ?args.REPORT};
+val FLAGS: [FLAGS_N]*std_args.Flag = [FLAGS_N]*std_args.Flag{?args.HELP, ?args.REPORT, ?args.VERBOSE, ?args.QUIET};
 
 # `mach clean`
-pub val COMMAND: std_args.Command = std_args.Command{name: "clean", aliases: args.NO_WORDS, help: "remove project build output", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: 2}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false};
+pub val COMMAND: std_args.Command = std_args.Command{name: "clean", aliases: args.NO_WORDS, help: "remove project build output", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false};
+
+# what the log line and the live line call removing
+val STAGE: str = "remove";
 # what mach holds `mach clean` to beyond the parse
 pub val POLICY: args.Policy = args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS};
 
@@ -82,7 +93,8 @@ pub val POLICY: args.Policy = args.Policy{refused: args.NO_FLAGS, refusal: "", c
 # requirement cells included; a dependency never realized was never built, so
 # it adds no cell. they are sorted, collapsed under their ancestors,
 # and removed inside the project root; a path that escapes the root or crosses a symlink is refused. a missing path is
-# not an error; "nothing to clean" prints when nothing was removed
+# not an error. each path removed has its result once all are tried, and a run that removed
+# nothing says the project is unchanged
 # ---
 # cx:  the call
 # ret: exit.OK, or the shared code of the failure: exit.USER for a manifest error or an escaping
@@ -96,19 +108,50 @@ pub fun run(cx: *args.Call) res[i64, fail.Fail] {
 }
 
 fun clean_project(r: *cli_diagnostic.Report, a: *A.Allocator, root: *u8) i64 {
-    val res_plan: res[Vector[CleanEntry], fail.Fail] = build_clean_plan(a, root::str, r.sources);
+    var id: str = nil;
+    fin {
+        if (id != nil) { str_free(a, id); }
+    }
+    val res_plan: res[Vector[CleanEntry], fail.Fail] = build_clean_plan(a, root::str, r.sources, ?id);
     if (sel res_plan.err) { ret cli_diagnostic.report_fail(r, res_plan.err, diagnostic.ORIGIN_NONE); }
     var plan: Vector[CleanEntry] = res_plan.ok;
-
-    var removed: usize = 0;
-    val code:    i64   = execute_plan(r, a, root::str, plan.data, plan.len, ?removed);
-    collections_vector.dnit[CleanEntry](?plan);
-
-    if (removed == 0 && code == exit.OK) {
-        var texts: [1]str = [1]str{"nothing to clean"};
-        cli_diagnostic.said_row(cli_diagnostic.out(r), report_layout.UNCHANGED, ?texts[0], 1);
+    fin { collections_vector.dnit[CleanEntry](?plan); }
+    cli_diagnostic.live_begin(r, STAGE);
+    val began:   readout.Instant = readout.sample();
+    var removed: usize           = 0;
+    var failed:  usize           = 0;
+    val code:    i64             = execute_plan(r, a, root::str, plan.data, plan.len, ?removed, ?failed);
+    cli_diagnostic.live_end(r);
+    var t: report_layout.Text;
+    cli_diagnostic.log_stage(r, STAGE, readout.elapsed(began), paths_text(?t, removed));
+    if (!cli_diagnostic.results_shown(r)) { ret code; }
+    val w: *io_writer.Writer = cli_diagnostic.out(r);
+    var i: usize             = 0;
+    for (i < plan.len) {
+        if (plan.data[i].gone) { report_layout.result(w, report_layout.REMOVED, plan.data[i].rel, nil, 0); }
+        i = i + 1;
+    }
+    if (code != exit.OK) {
+        var rt:     report_layout.Text;
+        var ft:     report_layout.Text;
+        var fields: [2]report_layout.Field = [2]report_layout.Field{report_layout.Field{key: "removed", value: report_layout.nonzero(?rt, removed::u64)},
+            report_layout.Field{key: "not removed", value: report_layout.nonzero(?ft, failed::u64)}};
+        report_layout.result(w, report_layout.FAILED, id, ?fields[0], 2);
+    }
+    or (removed == 0) {
+        var fields: [1]report_layout.Field = [1]report_layout.Field{report_layout.Field{key: "output", value: "none"}};
+        report_layout.result(w, report_layout.UNCHANGED, id, ?fields[0], 1);
     }
     ret code;
+}
+
+# `n path` or `n paths`, `none` for zero, in `t`
+fun paths_text(t: *report_layout.Text, n: usize) str {
+    var w: io_writer.Writer = report_layout.text_writer(t);
+    if (n == 0) { std_format.write_str(?w, "none"); }
+    or (n == 1) { std_format.write_str(?w, "1 path"); }
+    or          { std_format.format(?w, "{} paths", n::u64); }
+    ret report_layout.text_end(t);
 }
 
 # every path a build of the project writes, relative to `root`: each cell is
@@ -119,11 +162,11 @@ fun clean_project(r: *cli_diagnostic.Report, a: *A.Allocator, root: *u8) i64 {
 # a:   owns the entries and a refusal
 # ret: the entries, sorted and collapsed under their ancestors; err from
 #      loading the manifest or planning
-fun build_clean_plan(a: *A.Allocator, root: str, sources: *base_source.SourceMap) res[Vector[CleanEntry], fail.Fail] {
+fun build_clean_plan(a: *A.Allocator, root: str, sources: *base_source.SourceMap, id: *str) res[Vector[CleanEntry], fail.Fail] {
     val res_made: res[session.Session, fail.Fail] = session.init_in(a, sources);
     if (sel res_made.err) { ret res[Vector[CleanEntry], fail.Fail].err{res_made.err}; }
     var ps:          session.Session                    = res_made.ok;
-    val res_written: res[Vector[CleanEntry], fail.Fail] = planned_entries(a, ?ps, root);
+    val res_written: res[Vector[CleanEntry], fail.Fail] = planned_entries(a, ?ps, root, id);
     if (sel res_written.ok) {
         session.dnit(?ps);
         ret res_written;
@@ -135,10 +178,13 @@ fun build_clean_plan(a: *A.Allocator, root: str, sources: *base_source.SourceMap
     ret res[Vector[CleanEntry], fail.Fail].err{kept};
 }
 
-fun planned_entries(a: *A.Allocator, ps: *session.Session, root: str) res[Vector[CleanEntry], fail.Fail] {
+fun planned_entries(a: *A.Allocator, ps: *session.Session, root: str, id: *str) res[Vector[CleanEntry], fail.Fail] {
     val res_loaded: res[manifest_model.Manifest, fail.Fail] = compile.load_manifest(ps, root);
     if (sel res_loaded.err) { ret res[Vector[CleanEntry], fail.Fail].err{res_loaded.err}; }
-    var m:   manifest_model.Manifest = res_loaded.ok;
+    var m:      manifest_model.Manifest         = res_loaded.ok;
+    val res_id: res[str, types_string.StrError] = str_copy(a, intern.text(ps.interner, m.id));
+    if (sel res_id.err) { ret res[Vector[CleanEntry], fail.Fail].err{fail.message(fail.str_text(res_id.err))}; }
+    @id = res_id.ok;
     var cli: args.CliArgs;
     cli.verbosity     = 0;
     cli.quiet         = true;
@@ -202,6 +248,7 @@ fun push_entry(v: *Vector[CleanEntry], rel: str, kind: EntryKind) err[fail.Fail]
     var e: CleanEntry;
     e.rel  = rel;
     e.kind = kind;
+    e.gone = false;
     val res_collections_vector_pushed: res[usize, A.Error] = collections_vector.push[CleanEntry](v, e);
     if (sel res_collections_vector_pushed.err) { ret err[fail.Fail].err{fail.refused(res_collections_vector_pushed.err)}; }
     ret err[fail.Fail].ok{};
@@ -270,8 +317,9 @@ fun check_plan(entries: *CleanEntry, count: usize) err[fail.Fail] {
 # entries: the sorted, collapsed entries
 # count:   how many entries
 # removed: counts each path removed
+# failed:  counts each path a removal refused
 # ret:     exit.OK, or the worst code of the failures reported
-fun execute_plan(r: *cli_diagnostic.Report, a: *A.Allocator, root: str, entries: *CleanEntry, count: usize, removed: *usize) i64 {
+fun execute_plan(r: *cli_diagnostic.Report, a: *A.Allocator, root: str, entries: *CleanEntry, count: usize, removed: *usize, failed: *usize) i64 {
     val err_checked: err[fail.Fail] = check_plan(entries, count);
     if (sel err_checked.err) {
         val res_text: res[str, fail.Fail] = diagnostic.format(a, "cannot reserve the paths to clean ({})", fail.describe(err_checked.err));
@@ -286,19 +334,21 @@ fun execute_plan(r: *cli_diagnostic.Report, a: *A.Allocator, root: str, entries:
     var code: i64   = exit.OK;
     var i:    usize = 0;
     for (i < count) {
-        code = execute_entry(r, a, root_fd, ?entries[i], removed, code);
+        cli_diagnostic.live_reached(r, i::u32, count::u32, entries[i].rel);
+        code = execute_entry(r, a, root_fd, ?entries[i], removed, failed, code);
         i    = i + 1;
     }
     ret code;
 }
 
-# remove one entry under the open root, a missing one skipped and a failure reported
+# remove one entry under the open root, a missing one skipped and a failure reported and counted
 # ---
 # ret: `code`, or the worse of it and the code of the failure this entry reported
-fun execute_entry(r: *cli_diagnostic.Report, a: *A.Allocator, root_fd: usize, e: *CleanEntry, removed: *usize, code: i64) i64 {
+fun execute_entry(r: *cli_diagnostic.Report, a: *A.Allocator, root_fd: usize, e: *CleanEntry, removed: *usize, failed: *usize, code: i64) i64 {
     val rr: remove.Removal = remove.relative(root_fd, e.rel);
     if (rr.failed) {
         if (rr.kind == io_error.NOT_FOUND && !rr.containment) { ret code; }
+        @failed = @failed + 1;
         if (rr.containment) {
             val res_text: res[str, fail.Fail] = diagnostic.format(a, "cannot remove '{}' ({})", e.rel, remove.message(rr));
             ret exit.worst(code, cli_diagnostic.report_fail(r, remove.with_cleanup(a, fail.user_of(diagnostic_kind.FS_REMOVE, res_text), rr, e.rel), diagnostic.ORIGIN_NONE));
@@ -306,9 +356,7 @@ fun execute_entry(r: *cli_diagnostic.Report, a: *A.Allocator, root_fd: usize, e:
         ret exit.worst(code, cli_diagnostic.report_fail(r, remove.refusal(a, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: "the clean target", path: e.rel}, rr), diagnostic.ORIGIN_NONE));
     }
     if (rr.removed == 0) { ret code; }
-
-    var texts: [1]str = [1]str{e.rel};
-    cli_diagnostic.said_row(cli_diagnostic.out(r), report_layout.REMOVED, ?texts[0], 1);
+    e.gone   = true;
     @removed = @removed + 1;
     ret code;
 }

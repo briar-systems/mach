@@ -37,7 +37,8 @@ staging and dependency trees beneath each cell's work directory, dependency
 requirement cells included; a dependency never realized was never built, so
 it adds no cell. they are sorted, collapsed under their ancestors,
 and removed inside the project root; a path that escapes the root or crosses a symlink is refused. a missing path is
-not an error; "nothing to clean" prints when nothing was removed
+not an error. each path removed has its result once all are tried, and a run that removed
+nothing says the project is unchanged
 
 | Parameter | |
 | :--- | :--- |
@@ -48,6 +49,6 @@ not an error; "nothing to clean" prints when nothing was removed
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std.args.Command` | `std_args.Command{name: "clean", aliases: args.NO_WORDS, help: "remove project build output", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: 2}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach clean` |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "clean", aliases: args.NO_WORDS, help: "remove project build output", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach clean` |
 | `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach clean` to beyond the parse |
 

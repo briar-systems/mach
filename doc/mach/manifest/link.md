@@ -9,7 +9,7 @@ an entry applies to a target its `sys`, `arch` and `abi` filters all admit, and 
 
 Source: [`src/manifest/link.mach`](../../../src/manifest/link.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.manifest.template`](template.md), [`mach.target.input`](../target/input.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.manifest.template`](template.md), [`mach.target.input`](../target/input.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -38,6 +38,7 @@ pub rec LinkRequirement {
     source: LinkSource;
     text:   mach.base.intern.StrId;
     key:    mach.base.intern.StrId;
+    at:     mach.base.source.Location;
 
     symbols:            *mach.base.intern.StrId;
     symbol_count:       u32;
@@ -55,6 +56,7 @@ the symbol array is owned; release it with `link_claims_dnit`
 | `source` | `LinkSource` | copied from the link |
 | `text` | `mach.base.intern.StrId` | for a local source, the `path` expanded, anchored as an absolute path and interned; otherwise the link's `name` |
 | `key` | `mach.base.intern.StrId` | the link's table key, its identity |
+| `at` | `mach.base.source.Location` | where the link is stated, in the manifest that states it |
 | `symbols` | `*mach.base.intern.StrId` | an owned copy of the link's `symbols`, or nil when it has none |
 | `symbol_count` | `u32` | length of `symbols` |
 | `include_referenced` | `bool` | copied from the link |

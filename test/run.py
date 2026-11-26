@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# the compiler's test corpus: every file under run/ and gpu/ builds for every target that
-# takes it and exits 0 where the host can run it, every file under refuse/ is refused with
+# the compiler's test corpus: every file under run/, gpu/ and reactor/ builds for every target
+# that takes it and exits 0 where the host can run it, every file under refuse/ is refused with
 # the diagnostic it names, a manifest among them (a `mach.toml` whose header names it, checked
 # as a project manifest is and refused with exit 1), every artifact holds to its target's rules, every project under
 # project/ runs its steps on the host, and every project manifest of the tree (its own, each
@@ -16,7 +16,7 @@
 # is a multiple of n, as a symbol's address aligned to n. a block's addresses are a section's or a segment's, a PE section's
 # from the image base, or a PE function table entry's, from its start to its end.
 # a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
-# tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
+# tried on the host alone without one, and a run/, gpu/ or reactor/ file on every target taking its kind.
 # a `# flags:` line adds its words to the file's build after the target's, as `--set simd=require`.
 # a `# has:`, `# lacks:` or `# inside:` line is a rule of a target file's kind on the file's own
 # artifact, on every target that builds it, as a code shape that only one file's program has.
@@ -402,12 +402,12 @@ def main():
     tdir = os.path.join(HERE, 'target')
     targets = [Target(os.path.join(tdir, f)) for f in sorted(os.listdir(tdir)) if f.endswith('.target')]
     info = subprocess.run([cfg.mach, 'info'], capture_output=True, text=True).stdout
-    host = re.search(r'^host:\s*(\S+)', info, re.M).group(1)
+    host = re.search(r'^host\s+(\S+)', info, re.M).group(1)
     fails = []
 
     # every system the compiler lists is under test or declined with a reason
     declined = {l.split()[0] for l in open(os.path.join(tdir, 'declined'), encoding='utf-8') if l.strip() and not l.startswith('#')}
-    listed = [l.split()[0] for l in subprocess.run([cfg.mach, 'info', 'targets'], capture_output=True, text=True).stdout.splitlines() if l.strip()]
+    listed = [l.split()[0] for l in subprocess.run([cfg.mach, 'info', 'targets'], capture_output=True, text=True).stdout.splitlines()[1:] if l.strip()]
     for name in listed:
         if name not in declined and not any(t.system == name for t in targets):
             fails.append(f'{name}: the compiler lists it, and no file of test/target builds for it or declines it')

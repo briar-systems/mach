@@ -9,6 +9,27 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.2.0] - 2026-11-26
+
+### Added
+- `kind = "module"` builds a WebAssembly module of its exports on `wasi` and freestanding `wasm32`, a reactor its host calls only through what it marks `#[export]`. It links as a `bin` does, from its link entries and every input the link takes, the pins and `-l` inputs a `bin` checks included, but it is rooted at its exports: it needs no `main`, has no `_start` and no `_initialize`, and imports only what its exports reach. The corpus gains `reactor/` and a module target file for each system (#5007).
+
+### Changed
+- Every command reports in one output language, set out in `doc/language/readout.md`. A result says what the command did: its verb and what it acted on on one line, then one keyed field per line beneath it, as a build's `target`, `time` and `output`, with a count shown only when it is not zero. Results go to stdout and read the same at every level, a selection of several units writing one self-contained result per unit, and listings such as `mach dep list` and `mach info targets` keep their tables under one header row. `-v` adds a stamped log line on stderr as each stage closes, and `-vv` a line per module, file or test as it finishes and the unit's recap. A terminal shows a live line naming the running stage, its count and its current item. A failed test is a `test.failed` diagnostic at the test's declaration with the command that reruns it, `mach fmt`, `mach clean` and `mach doc` say `unchanged` when they change nothing, and the closing `N errors / M warnings` tally, the per-unit banners and the closing units table are gone. Records keep schema 3, phase records gaining `parent` and `bytes` beside a new `fact` record (#5001, #5013).
+- Builds against mink 0.1.2, whose refusal of a DLL a PE image loads and imports nothing from names the DLL by its loader name (#5005).
+- Builds against mirl 0.3.1, whose legalisation on SPIR-V takes out a pointer the optimizer merges where paths join (#5020).
+- A `bin` refused on a WebAssembly target for defining no `_start` says that a module of exports states `kind = "module"` (#5007).
+
+### Deprecated
+- A freestanding `wasm32` `bin` that defines no `_start`, which builds a module of its exports. State `kind = "module"` for one, since mach 8 refuses such a `bin` (#5007).
+
+### Fixed
+- An `ext` import attributed to the loader name of a link entry, as `#[library("kernel32.dll")]` is to std's `[link.kernel32]`, is refused at its declaration with the key to write, `#[library("kernel32")]`. It was refused as attributed to two libraries wherever std attributes the same import to the entry's key, and a refusal of two attributions now points at the second declaration (#5006).
+- A back-end warning about a function as a whole, as `secret.target_unenforceable`, stands at the function's definition, an instance's at its generic's, whether or not the build records debug locations. A dependency's is hidden without `--dep-warnings` and a declaration's `#[expect]` acknowledges its own, where a build without debug locations showed each unplaced as the root's (#5003).
+- A dependency written for another compiler is refused by its `[project].mach`, read with its `[project].id` before the rest of its manifest, where a key this compiler removed refused it as unreadable. Build, check, `mach dep pull` and `mach dep verify` name every unmet range once, `mach dep pull` and `mach dep verify` name `mach dep update` when a newer selection has moved past the realized commit, and resolution reports such a release as requiring that compiler, where it reported its `mach.toml` as not loading. `dep.no_project_id` is retired, since a missing `[project].id` is refused as any missing key (#5004).
+- A windows link refused for a DLL it loads and imports nothing from names the link entry that has it loaded, at the entry, and says that an entry the program may not reference states `include = "referenced"`, where it named mink's "library 0". `MIGRATION.md` gains the change from version 6, which linked such a DLL (#5005).
+- An optimized `vulkan-spirv` build without variable pointers builds a shader that stores past a loop to the element the loop stopped at, where it refused the pointer the optimizer merged at the loop's exit as one chosen at run time. A merge mirl cannot take out is a `target.unsupported_op` at the source location mirl states, as a slot promotion cannot take out is (#5020).
+
 ## [7.1.1] - 2026-11-25
 
 ### Changed

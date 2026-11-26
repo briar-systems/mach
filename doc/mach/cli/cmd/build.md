@@ -21,7 +21,6 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | :--- | :--- |
 | [`plan_invocation`](#plan_invocation) | initialise a session, load the manifest, resolve the selectors and plan a build of every resolved cell, one plan per profile |
 | [`plan_selection`](#plan_selection) | resolve the selectors against a loaded manifest and plan every resolved cell, one plan per profile |
-| [`unit_count`](#unit_count) | the units of every plan of a selection |
 
 | Functions | |
 | :--- | :--- |
@@ -98,14 +97,6 @@ each other: a caller that runs them all checks they write disjoint outputs
 | `m` | the root manifest |
 | `unrealized` | what a dependency nothing is realized for is |
 | **returns** | the plans; err from selection, a request, planning or dependency configuration |
-
-### unit_count
-
-```mach
-pub fun unit_count(planned: *Planned) usize
-```
-
-the units of every plan of a selection
 
 ## Functions
 

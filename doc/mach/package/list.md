@@ -3,7 +3,9 @@
 # mach.package.list
 
 list: what `mach dep list` shows: each root declaration with its winning selection, its
-pin and its state, and under it every requirement of the identity that selection overrides
+pin, its state and its source, and under it every requirement of the identity that selection
+overrides. why a pin or a state cannot be read goes to the report as a note, so the rows
+stay one table
 
 Source: [`src/package/list.mach`](../../../src/package/list.mach)
 
@@ -11,7 +13,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.closure`](cl
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Row`](#row) | `rec` | one row of `mach dep list`: a root declaration's name and what is listed of it, or under it, with no name, a requirement it overrides |
+| [`Row`](#row) | `rec` | one row of `mach dep list`: a root declaration's cells, or under it, with no name, a requirement it overrides |
 
 | On `Row` | |
 | :--- | :--- |
@@ -23,13 +25,26 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.closure`](cl
 
 ```mach
 pub rec Row {
-    name: str;
-    text: str;
+    name:    str;
+    version: str;
+    pin:     str;
+    state:   str;
+    source:  str;
+    text:    str;
 }
 ```
 
-one row of `mach dep list`: a root declaration's name and what is listed of it, or under it,
-with no name, a requirement it overrides
+one row of `mach dep list`: a root declaration's cells, or under it, with no name, a
+requirement it overrides
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `str` | the declared id, nil for an override |
+| `version` | `str` | the range or the ref it selects by, `-` for a path |
+| `pin` | `str` | the pinned commit, short, `-` for none, or `unreadable` |
+| `state` | `str` | realized, missing, out of range, release unknown, unreadable or invalid |
+| `source` | `str` | its git url or its path |
+| `text` | `str` | an override's line, nil for a declaration |
 
 ### lines
 

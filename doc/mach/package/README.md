@@ -13,7 +13,7 @@ so a new source is a new member and not a new engine:
 
 - source.mach: where a dependency's releases and content come from
 - pin.mach: where a project records the revision each dependency is held at
-- report.mach: where progress, notes and failures go while it works
+- report.mach: where results, notes, fetches and failures go while it works
 
 git, under package/git, is the member of the first two and the one outside tool mach
 runs; path.mach realizes a dependency declared by a local path, and scratch.mach makes the
@@ -28,7 +28,7 @@ The directory's root module is [`mach.package`](../package.md).
 | [`closure`](closure.md) | closure: the walk every dependency command shares |
 | [`edit`](edit.md) | edit: the commands that change a project's dependencies: add and remove edit the manifest's [dep] tables, update moves selectors and pins |
 | [`git`](git.md) | git: the one outside tool mach runs |
-| [`list`](list.md) | list: what `mach dep list` shows: each root declaration with its winning selection, its pin and its state, and under it every requirement of the identity that selection overrides |
+| [`list`](list.md) | list: what `mach dep list` shows: each root declaration with its winning selection, its pin, its state and its source, and under it every requirement of the identity that selection overrides |
 | [`path`](path.md) | path: the member that realizes a dependency declared by a local `path` |
 | [`pin`](pin.md) | the pin contract: where a project records the exact revision each dependency is held at, and how it reads one back |
 | [`pull`](pull.md) | pull: `mach dep pull`, which realizes a project's dependency closure and refuses one that pins a package at more than one commit |
