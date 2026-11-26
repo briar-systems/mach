@@ -71,6 +71,9 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`module_named`](#module_named) | the module loaded under `fqn`, nil when none is |
 | [`module_count`](#module_count) | the loaded module count; the next ModuleId to be issued |
 | [`module_at`](#module_at) | the entry behind a ModuleId the project has issued |
+| [`link_entry_count`](#link_entry_count) | how many link entries the build unit's link reads: the cell's own, then those the dependency closure exports to it |
+| [`link_entry_at`](#link_entry_at) | the `i`th link entry the build unit's link reads, in link_entry_count's order |
+| [`link_entry_loading`](#link_entry_loading) | the link entry whose loader name is `lib` when no entry is keyed `lib`, nil otherwise |
 | [`module_reserve`](#module_reserve) | make room for one more entry so the next module_append cannot fail |
 | [`module_append`](#module_append) | publish an entry under the next ModuleId into the slot module_reserve made |
 | [`dep_at`](#dep_at) | the module a loaded module imports at `i`, as its load record names it |
@@ -700,6 +703,32 @@ the store is a handle.StableChunks: an entry is written once into a fixed
 chunk and never moves, so the pointer stays valid until dnit_project however
 many modules load after it. total: an id the project never issued stops the
 compiler
+
+### link_entry_count
+
+```mach
+pub fun link_entry_count(p: *Project) u32
+```
+
+how many link entries the build unit's link reads: the cell's own, then those the dependency
+closure exports to it
+
+### link_entry_at
+
+```mach
+pub fun link_entry_at(p: *Project, i: u32) *mach.manifest.link.LinkRequirement
+```
+
+the `i`th link entry the build unit's link reads, in link_entry_count's order
+
+### link_entry_loading
+
+```mach
+pub fun link_entry_loading(p: *Project, lib: mach.base.intern.StrId) *mach.manifest.link.LinkRequirement
+```
+
+the link entry whose loader name is `lib` when no entry is keyed `lib`, nil otherwise. an entry
+is named by its key, so a library named this way names a loader, which binds nothing
 
 ### module_reserve
 
