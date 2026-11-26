@@ -18,6 +18,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Plan`](#plan) | `rec` | the layout an artifact states its image, which mink lays out as a linker script would |
 | [`Image`](#image) | `rec` | what the build states of the image it links, beyond its kind and format |
 | [`Stated`](#stated) | `rec` | where the build stated each option of the link it hands mink, a location of the source map its diagnostics read, so mink's refusal of an option points there |
+| [`Loaded`](#loaded) | `rec` | a dynamic library a link entry has the image load whether or not anything imports from it |
 | [`LinkRead`](#linkread) | `rec` | what a link read beyond the objects and the files it was handed by path |
 | [`Linked`](#linked) | `rec` | a linked image and what its link read |
 
@@ -391,6 +392,8 @@ pub rec Stated {
     entry:         mach.base.source.Location;
     sections:      *mach.base.source.Location;
     regions:       *mach.base.source.Location;
+    loaded:        *Loaded;
+    loaded_count:  usize;
 }
 ```
 
@@ -411,6 +414,26 @@ option was not written or names no place
 | `entry` | `mach.base.source.Location` | the artifact's entry, the module the image's entry symbol is reached from |
 | `sections` | `*mach.base.source.Location` | each section the plan places ahead of the rest, parallel to its sections |
 | `regions` | `*mach.base.source.Location` | each memory region, parallel to the plan's regions, which the plan's runs and loads name |
+| `loaded` | `*Loaded` | each dynamic library a link entry has the image load whether or not anything imports from it |
+| `loaded_count` | `usize` | how many `loaded` holds |
+
+## Loaded
+
+```mach
+pub rec Loaded {
+    loader: str;
+    key:    str;
+    at:     mach.base.source.Location;
+}
+```
+
+a dynamic library a link entry has the image load whether or not anything imports from it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `loader` | `str` | the library's loader name, as the entry writes it |
+| `key` | `str` | the entry's key |
+| `at` | `mach.base.source.Location` | where the entry is stated |
 
 ## LinkRead
 

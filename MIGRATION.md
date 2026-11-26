@@ -220,6 +220,33 @@ out = "{project.work}/lib/libvlib{artifact.suffix}"
 On linux this writes `libvlib.a`. Scripts that run a built file by path may need
 the new name.
 
+### A windows link entry nothing imports from states `include = "referenced"`
+
+Version 6 linked the DLL of a `[link.<key>]` entry whether or not the program
+imported anything from it. A version 7 PE image loads no DLL it imports nothing
+from, so an entry left at the default `include = "always"` whose DLL the program
+never calls is refused at the entry:
+
+```
+error[link.input_invalid] link entry 'ws2_32' has the image load ws2_32.dll whether or not anything imports from it, and nothing does. a PE image loads no DLL it imports nothing from, so an entry the program may not reference states `include = "referenced"`
+```
+
+After:
+
+```toml
+[link.ws2_32]
+source = "system"
+name = "ws2_32.dll"
+include = "referenced"
+sys = ["windows"]
+arch = ["*"]
+abi = ["*"]
+```
+
+`mach migrate` leaves `include` as it is. Whether a program references an entry
+is a property of the program, and on ELF and Mach-O `"always"` still names a
+library nothing imports from.
+
 ### Other manifest reports
 
 A spirv target listed beside other targets in one `bin` artifact, several
