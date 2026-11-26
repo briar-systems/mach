@@ -1493,7 +1493,10 @@ A build shows the warnings of the project being built and none of its
 dependencies'. A warning belongs to the package that owns the file it stands
 in, so a warning a dependency's source raises is the dependency's, whichever
 stage raises it: name resolution, type checking, the back end
-(`vector.scalarize`) or anything else that points into its files. A warning that
+(`vector.scalarize`) or anything else that points into its files. A back-end
+warning about a function as a whole, as `secret.target_unenforceable`, stands at
+the function's definition, an instance's at its generic's, whether or not the
+build records debug locations. A warning that
 stands in no file, as `link.report` or `target.skipped`, is the build's own and
 is shown. A hidden warning is not counted in the summary line, which counts
 what was printed. A check whose only product is warnings does not run on a

@@ -10,12 +10,12 @@ places it in the build's sources with `placed` and reports it
 
 Source: [`src/compile/backend/compile.mach`](../../../../src/compile/backend/compile.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.compile.view`](../view.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.compile.view`](../view.md), [`mach.lower.context`](../../lower/context.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`Compiled`](#compiled) | `rec` | a module's object and the warnings mirl gave compiling it, each a failure of its warning's kind with where mirl states it, both owned by the caller and given back with `dnit`, or the warnings alone with `warnings_dnit` once the object has moved on |
-| [`Unplaced`](#unplaced) | `rec` | a failure of the compile before it is placed in the build's sources: the failure, where mirl's debug table states it, and the places of the failures it names besides itself, each owned through the allocator the compile was given |
+| [`Unplaced`](#unplaced) | `rec` | a failure of the compile before it is placed in the build's sources: the failure, where mirl's debug table states it, the places of the failures it names besides itself, each owned through the allocator the compile was given, and the function of the module it is about as a whole when it is about one, whose definition is its place |
 | [`Spot`](#spot) | `rec` | a source position as mirl's debug table states it: the path of its file, its line and its column |
 
 | On `Compiled` | |
@@ -27,7 +27,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | On `Unplaced` | |
 | :--- | :--- |
 | [`unplaced_dnit`](#unplaced_dnit) | give back a failure of the compile, placed or not: its text and places, and the paths of the spots it still holds, all owned through `a`, the allocator the compile was given |
-| [`placed`](#placed) | the failure `u` placed in `sources`: at the byte of its spot, with the bytes of the spots it names besides as its related places, as `located` finds them |
+| [`placed`](#placed) | the failure `u` placed in `sources`: one about a function as a whole at the function's definition, as `defined`, the facts the module's lowering kept, states it, and any other at the byte of its spot, with the bytes of the spots it names besides as its related places, as `located` finds them |
 | [`bare`](#bare) | the failure `f` with no spot |
 
 ---
@@ -87,15 +87,17 @@ give back what `compile` made: its object and its warnings
 
 ```mach
 pub rec Unplaced {
-    fail: mach.base.fail.Fail;
-    at:   opt[Spot];
-    also: std.collections.vector.Vector[Spot];
+    fail:  mach.base.fail.Fail;
+    at:    opt[Spot];
+    also:  std.collections.vector.Vector[Spot];
+    whole: opt[Function];
 }
 ```
 
 a failure of the compile before it is placed in the build's sources: the failure, where mirl's
-debug table states it, and the places of the failures it names besides itself, each owned
-through the allocator the compile was given. `placed` puts it in the sources
+debug table states it, the places of the failures it names besides itself, each owned through
+the allocator the compile was given, and the function of the module it is about as a whole when
+it is about one, whose definition is its place. `placed` puts it in the sources
 
 ### unplaced_dnit
 
@@ -109,12 +111,15 @@ spots it still holds, all owned through `a`, the allocator the compile was given
 ### placed
 
 ```mach
-pub fun placed(a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, u: *Unplaced) mach.base.fail.Fail
+pub fun placed(a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, u: *Unplaced, defined: *mach.lower.context.Unit) mach.base.fail.Fail
 ```
 
-the failure `u` placed in `sources`: at the byte of its spot, with the bytes of the spots it
-names besides as its related places, as `located` finds them. `u` holds the placed failure from
-then on and no spot, its spots given back through `a`, the allocator the compile was given
+the failure `u` placed in `sources`: one about a function as a whole at the function's definition, as
+`defined`, the facts the module's lowering kept, states it, and any other at the byte of its spot, with
+the bytes of the spots it names besides as its related places, as `located` finds them. a module
+whose lowering kept no facts passes nil, and its failures stand at their spots. `u` holds the
+placed failure from then on and no spot, its spots given back through `a`, the allocator the
+compile was given
 
 ### bare
 

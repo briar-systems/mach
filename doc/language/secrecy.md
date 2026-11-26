@@ -1010,7 +1010,7 @@ timing, whether it cannot guarantee timing at all, or whether it classifies none
   walk of the encoded code validates the function.
 - **It cannot guarantee timing** (wasm, whose runtime decides the instructions that
   execute): the function compiles, with the warning `secret.target_unenforceable`
-  at the mark that the target cannot practically enforce constant-time execution.
+  at its name that the target cannot practically enforce constant-time execution.
 - **It classifies none** (SPIR-V, whose module a downstream compiler translates):
   the function is **refused** under `secret.target_unverifiable`, since neither
   that translation nor the device's timing behaviour is covered by the leakage

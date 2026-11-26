@@ -11,6 +11,7 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ### Fixed
 - An `ext` import attributed to the loader name of a link entry, as `#[library("kernel32.dll")]` is to std's `[link.kernel32]`, is refused at its declaration with the key to write, `#[library("kernel32")]`. It was refused as attributed to two libraries wherever std attributes the same import to the entry's key, and a refusal of two attributions now points at the second declaration (#5006).
+- A back-end warning about a function as a whole, as `secret.target_unenforceable`, stands at the function's definition, an instance's at its generic's, whether or not the build records debug locations. A dependency's is hidden without `--dep-warnings` and a declaration's `#[expect]` acknowledges its own, where a build without debug locations showed each unplaced as the root's (#5003).
 
 ## [7.1.1] - 2026-11-25
 
