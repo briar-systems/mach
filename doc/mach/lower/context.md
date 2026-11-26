@@ -164,7 +164,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`add_function`](#add_function) | add a function to the module with what mach declares of it |
 | [`function_named`](#function_named) | the function of the module named `name`, none when no function is |
 | [`global_named`](#global_named) | the global of the module named `name`, none when no global is |
-| [`define_function`](#define_function) | the module's definition of a function: a reference earlier in the module declared it, and the definition takes the declaration's place |
+| [`define_function`](#define_function) | the module's definition of a function, whose name the source in scope writes at `span`: a reference earlier in the module declared it, and the definition takes the declaration's place |
 | [`hold_signature`](#hold_signature) | the unit holds one function for a symbol, so the `ext fun`s and the definition its modules state the symbol `name` with, as the function `d` declared by `did` does, state one signature |
 | [`hold_definition`](#hold_definition) | the object defines the symbol `name` as `what`, from the declaration whose name the module or template in scope writes at `span` |
 | [`hold_reference`](#hold_reference) | the object refers, at the node the lowering stands on, to the declaration `decl` of the module `origin` by the symbol `name` |
@@ -314,6 +314,7 @@ pub rec FnInfo {
     test:     bool;
     noreturn: bool;
     defined:  bool;
+    at:       mach.base.source.Location;
 }
 ```
 
@@ -325,6 +326,7 @@ each function of the module by index, what mach declared it as
 | `test` | `bool` | a test, run by the dispatcher under `name` |
 | `noreturn` | `bool` | it never returns, so falling off its end is unreachable |
 | `defined` | `bool` | the module gives it a body |
+| `at` | `mach.base.source.Location` | where the module defines it, its name in the source declaring it, which an instance's generic is, nowhere for one the module only declares |
 
 ## Unit
 
@@ -1965,8 +1967,8 @@ the global of the module named `name`, none when no global is
 pub fun define_function(lc: *LowerContext, data: FunctionData, info: FnInfo, span: mach.base.source.Span, what: Defines) res[u32, mach.base.fail.Fail]
 ```
 
-the module's definition of a function: a reference earlier in the module declared it,
-and the definition takes the declaration's place
+the module's definition of a function, whose name the source in scope writes at `span`: a
+reference earlier in the module declared it, and the definition takes the declaration's place
 
 ### hold_signature
 
