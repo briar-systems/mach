@@ -736,20 +736,41 @@ the conventions it declares per instruction set (`linux` and `darwin` refuse
 and `freestanding` accepts every convention the instruction set covers.
 
 `mach info targets` prints every target a build can be made for, the rows of mink's
-catalog whose architecture mirl carries under a convention the row accepts, one per line as
-`-t` takes it (`<sys>-<arch>`), then the environments, calling conventions, code
-models and executable linkages it accepts as `env=`, `abi=`, `code_model=` and
-`linkage=` lists, the default first and marked `*`. Linkages depend on the
-environment, so where they differ the list repeats per environment, as
-`linkage=*static gnu:*pie,dynamic,static` on `linux-x86_64` says that a target with
-no `env` links static only and one with `env = "gnu"` defaults to `pie`. A target
-that runs no executable, such as `vulkan-spirv`, lists `linkage=-`. `none` is the environment of a host that states none,
-such as bare `linux`, and `-` stands for a part the target has no choices of.
-It marks `needs --isa` beside each whose system bounds the machine not at all,
-such as `freestanding-riscv32`, so a target spelled that way names its
-instruction set. The list is read from the catalog and mirl's carried conventions, so
-mach holds no table of its own. `mach info` alone prints the tuple the host
-resolves to.
+catalog whose architecture mirl carries under a convention the row accepts. A header row
+names the columns, then each target is one line as `-t` takes it (`<sys>-<arch>`),
+followed by the environments, calling conventions, code models and executable linkages it
+accepts in the `env`, `abi`, `code_model` and `linkage` columns, the default first and
+marked `*`. Linkages depend on the environment, so where they differ the list repeats per
+environment, as `*static gnu:*pie,dynamic,static` on `linux-x86_64` says that a target
+with no `env` links static only and one with `env = "gnu"` defaults to `pie`. A target
+that runs no executable, such as `vulkan-spirv`, lists `-` for its linkage. `none` is the
+environment of a host that states none, such as bare `linux`, and `-` stands for a part
+the target has no choices of. The `note` column says `needs --isa` beside each whose
+system bounds the machine not at all, such as `freestanding-riscv32`, so a target spelled
+that way names its instruction set. The list is read from the catalog and mirl's carried
+conventions, so mach holds no table of its own.
+
+```
+target                 env                                            abi                            code_model      linkage                                            note
+linux-x86_64           *none,gnu                                      *sysv64                        *small          *static gnu:*pie,dynamic,static
+linux-riscv32          *none,gnu                                      ilp32,ilp32f,ilp32d            *medany         *static gnu:*pie,dynamic,static                    needs --isa
+vulkan-spirv           *none,vulkan1.0,vulkan1.1,vulkan1.2,vulkan1.3  *shader                        -               - vulkan1.0:- vulkan1.1:- vulkan1.2:- vulkan1.3:-
+```
+
+`mach info` alone prints the version and the tuple the host resolves to, a key and its
+value a line, the keys in a column of their own:
+
+```
+mach        7.1.1
+host        linux-x86_64
+isa         cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2
+sys         linux
+env         none
+abi         sysv64
+code_model  small
+linkage     static
+object      elf
+```
 
 A value outside its axis's set is refused when the target resolves, so a typo is
 caught rather than silently never matching.

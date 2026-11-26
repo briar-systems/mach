@@ -32,11 +32,15 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 ```mach
 pub rec Outcome {
-    dir:     str;
-    modules: u32;
-    pages:   u32;
-    changed: u32;
-    removed: u32;
+    dir:      str;
+    files:    u32;
+    modules:  u32;
+    pages:    u32;
+    changed:  u32;
+    removed:  u32;
+    loading:  std.chrono.duration.Duration;
+    building: std.chrono.duration.Duration;
+    writing:  std.chrono.duration.Duration;
 }
 ```
 
@@ -45,10 +49,14 @@ what a run did
 | Field | Type | |
 | :--- | :--- | :--- |
 | `dir` | `str` | the directory it owns, `<dir>/<project id>` |
-| `modules` | `u32` | the source files it read |
+| `files` | `u32` | the source files it read |
+| `modules` | `u32` | the modules the reference documents |
 | `pages` | `u32` | the pages it wrote or found already current |
 | `changed` | `u32` | the pages whose text it wrote |
 | `removed` | `u32` | the files and directories it removed |
+| `loading` | `std.chrono.duration.Duration` | the time the sources took to list and parse |
+| `building` | `std.chrono.duration.Duration` | the time the reference took to build from them |
+| `writing` | `std.chrono.duration.Duration` | the time its pages took to render, write and prune |
 
 ### generate
 

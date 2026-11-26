@@ -66,7 +66,8 @@ pub fun run_sema_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
 a rejected module is one module's answer, so the pass folds it and carries
-on over the rest; an internal failure ends the pass where it met it
+on over the rest; an internal failure ends the pass where it met it. its row is the caller's
+to open and close, around the store settling, so what it reports lands before its row
 
 ### types_instances
 

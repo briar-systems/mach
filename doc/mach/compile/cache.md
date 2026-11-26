@@ -51,7 +51,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`note_written`](#note_written) | the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/` is remembered by its digest for the restore that reads it back |
 | [`store_written`](#store_written) | store the digests of the objects this build wrote, once they are in place |
 | [`object_written`](#object_written) | a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its record, since the object cache reads it back, and the build holds no form of it after: a link reads it back from there (objects_back) |
-| [`test_object_written`](#test_object_written) | the same for the module's test object, its time carved out of test codegen's |
+| [`test_object_written`](#test_object_written) | the same for the module's test object, read out as `<module path>#tests` |
 | [`objects_back`](#objects_back) | the objects of the units in the link's order, each read back from the file it was written to when its unit completed into the slot it left, as the cache restores one, so a link reads the one form whether the object was made now or restored |
 | [`test_objects_back`](#test_objects_back) | the same for the test objects of the emitted modules, in their order |
 | [`object_reread`](#object_reread) | `o` replaced by the object the file `from` holds, which the build wrote from it |
@@ -236,7 +236,7 @@ pub fun object_written(p: *mach.compile.project.Project, m: *mach.compile.projec
 a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its
 record, since the object cache reads it back, and the build holds no form of it after: a link
 reads it back from there (objects_back). a module the cache restored is there already, and one
-with nowhere to go keeps its object. the time is the emit row's, carved out of codegen's
+with nowhere to go keeps its object. the time is the write row's, carved out of prepare's
 
 ### test_object_written
 
@@ -244,7 +244,7 @@ with nowhere to go keeps its object. the time is the emit row's, carved out of c
 pub fun test_object_written(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
 ```
 
-the same for the module's test object, its time carved out of test codegen's
+the same for the module's test object, read out as `<module path>#tests`
 
 ### objects_back
 

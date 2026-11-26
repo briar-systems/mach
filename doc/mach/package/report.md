@@ -2,11 +2,11 @@
 
 # mach.package.report
 
-where dependency management reports while it works. a progress line (a verb from
-mach.report.layout's table and what it acted on), a remark, a note and a failure the
-operation goes on past stream to the caller as they happen; `effects` collects
-a note for each change an operation made before it failed, which the caller shows after
-the failure, so a failed command still names the state it left
+where dependency management reports while it works. a result line (a verb from
+mach.report.layout's table and what it acted on), a note, a failure the operation goes on
+past, and each remote whose releases it fetches stream to the caller as they happen; `effects`
+collects a note for each change an operation made before it failed, which the caller shows
+after the failure, so a failed command still names the state it left
 
 Source: [`src/package/report.mach`](../../../src/package/report.mach)
 
@@ -14,56 +14,87 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.layout`](../r
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Report`](#report) | `rec` | a sink for progress lines, notes and faults, with the effect notes an operation collected |
+| [`Sink`](#sink) | `rec` | what a report's sink does with each thing reported |
+| [`Report`](#report) | `rec` | a sink for result lines, notes, faults and fetches, with the effect notes an operation collected and the fetches it made |
+
+| On `Sink` | |
+| :--- | :--- |
+| [`init`](#init) | a report over the given sink, whose effects `a` owns |
 
 | On `Report` | |
 | :--- | :--- |
-| [`init`](#init) | a report over the given sink, whose effects `a` owns |
 | [`dnit`](#dnit) | free the effect notes the report kept |
-| [`said`](#said) | write a progress line to the sink: verb v, then the n texts at `texts`, borrowed for the call |
-| [`said1`](#said1) | a progress line of verb v and what it acted on |
-| [`said2`](#said2) | a progress line of verb v, what it acted on and one detail |
-| [`said3`](#said3) | a progress line of verb v, what it acted on and two details |
-| [`line`](#line) | write a remark to the sink |
+| [`said`](#said) | write a result line to the sink: verb v, then the n texts at `texts`, borrowed for the call |
+| [`said1`](#said1) | a result line of verb v and what it acted on |
+| [`said2`](#said2) | a result line of verb v, what it acted on and one detail |
+| [`said3`](#said3) | a result line of verb v, what it acted on and two details |
 | [`note`](#note) | write a note to the sink |
 | [`fault`](#fault) | report a failure the operation goes on past |
+| [`stage`](#stage) | the caller opened a stage over the fetches from here, which it expects `n` of, 0 when it cannot count them; the sink counts them as they begin and shows each as an item of that stage |
+| [`fetching`](#fetching) | a fetch from the remote at `url` begins |
+| [`fetched`](#fetched) | the fetch from `url` ended after `d` |
 | [`effectf`](#effectf) | keep an effect note formatted as std.format formats it; a note that cannot be kept is dropped, since it only explains a failure already reported |
 | [`notef`](#notef) | a note formatted as std.format formats it, through storage `a` lends for the call |
 | [`discard`](#discard) | a report that keeps nothing, for work that has nothing to say or a test that checks state rather than what is said |
 
 ---
 
-## Report
+## Sink
 
 ```mach
-pub rec Report {
-    ctx:     ptr;
-    said:    SaidFn;
-    line:    LineFn;
-    note:    NoteFn;
-    fault:   FaultFn;
-    effects: Vector[str];
+pub rec Sink {
+    said:     SaidFn;
+    note:     NoteFn;
+    fault:    FaultFn;
+    fetching: FetchingFn;
+    fetched:  FetchedFn;
 }
 ```
 
-a sink for progress lines, notes and faults, with the effect notes an operation collected
+what a report's sink does with each thing reported
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `ctx` | `ptr` | the context each callback receives |
-| `said` | `SaidFn` | writes a progress line |
-| `line` | `LineFn` | writes a remark |
+| `said` | `SaidFn` | writes a result line |
 | `note` | `NoteFn` | writes a note |
 | `fault` | `FaultFn` | reports a failure the operation goes on past |
-| `effects` | `Vector[str]` | the effect notes kept so far, owned by the report |
+| `fetching` | `FetchingFn` | shows a fetch beginning |
+| `fetched` | `FetchedFn` | shows a fetch ended |
 
 ### init
 
 ```mach
-pub fun init(a: *std.allocator.Allocator, ctx: ptr, on_said: SaidFn, on_line: LineFn, on_note: NoteFn, on_fault: FaultFn) Report
+pub fun init(a: *std.allocator.Allocator, ctx: ptr, sink: Sink) Report
 ```
 
 a report over the given sink, whose effects `a` owns
+
+## Report
+
+```mach
+pub rec Report {
+    ctx:      ptr;
+    sink:     Sink;
+    effects:  Vector[str];
+    staged:   bool;
+    expected: u32;
+    fetches:  u32;
+    fetching: std.chrono.duration.Duration;
+}
+```
+
+a sink for result lines, notes, faults and fetches, with the effect notes an operation
+collected and the fetches it made
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ctx` | `ptr` | the context each callback receives |
+| `sink` | `Sink` | what the callbacks are |
+| `effects` | `Vector[str]` | the effect notes kept so far, owned by the report |
+| `staged` | `bool` | whether the caller opened a stage over the fetches, which then show as its items |
+| `expected` | `u32` | the fetches the caller expects in its stage, 0 when it cannot count them |
+| `fetches` | `u32` | the fetches ended since the stage opened |
+| `fetching` | `std.chrono.duration.Duration` | the time they took together |
 
 ### dnit
 
@@ -83,7 +114,7 @@ free the effect notes the report kept
 pub fun said(r: *Report, v: mach.report.layout.Verb, texts: *str, n: usize)
 ```
 
-write a progress line to the sink: verb v, then the n texts at `texts`, borrowed for the call
+write a result line to the sink: verb v, then the n texts at `texts`, borrowed for the call
 
 ### said1
 
@@ -91,7 +122,7 @@ write a progress line to the sink: verb v, then the n texts at `texts`, borrowed
 pub fun said1(r: *Report, v: mach.report.layout.Verb, a: str)
 ```
 
-a progress line of verb v and what it acted on
+a result line of verb v and what it acted on
 
 ### said2
 
@@ -99,7 +130,7 @@ a progress line of verb v and what it acted on
 pub fun said2(r: *Report, v: mach.report.layout.Verb, a: str, b: str)
 ```
 
-a progress line of verb v, what it acted on and one detail
+a result line of verb v, what it acted on and one detail
 
 ### said3
 
@@ -107,20 +138,7 @@ a progress line of verb v, what it acted on and one detail
 pub fun said3(r: *Report, v: mach.report.layout.Verb, a: str, b: str, c: str)
 ```
 
-a progress line of verb v, what it acted on and two details
-
-### line
-
-```mach
-pub fun line(r: *Report, text: str)
-```
-
-write a remark to the sink
-
-| Parameter | |
-| :--- | :--- |
-| `r` | the report |
-| `text` | the remark, borrowed for the call |
+a result line of verb v, what it acted on and two details
 
 ### note
 
@@ -147,6 +165,31 @@ report a failure the operation goes on past
 | :--- | :--- |
 | `r` | the report |
 | `f` | the failure |
+
+### stage
+
+```mach
+pub fun stage(r: *Report, n: u32)
+```
+
+the caller opened a stage over the fetches from here, which it expects `n` of, 0 when it cannot
+count them; the sink counts them as they begin and shows each as an item of that stage
+
+### fetching
+
+```mach
+pub fun fetching(r: *Report, url: str)
+```
+
+a fetch from the remote at `url` begins
+
+### fetched
+
+```mach
+pub fun fetched(r: *Report, url: str, d: std.chrono.duration.Duration)
+```
+
+the fetch from `url` ended after `d`
 
 ### effectf
 

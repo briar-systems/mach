@@ -402,12 +402,12 @@ def main():
     tdir = os.path.join(HERE, 'target')
     targets = [Target(os.path.join(tdir, f)) for f in sorted(os.listdir(tdir)) if f.endswith('.target')]
     info = subprocess.run([cfg.mach, 'info'], capture_output=True, text=True).stdout
-    host = re.search(r'^host:\s*(\S+)', info, re.M).group(1)
+    host = re.search(r'^host\s+(\S+)', info, re.M).group(1)
     fails = []
 
     # every system the compiler lists is under test or declined with a reason
     declined = {l.split()[0] for l in open(os.path.join(tdir, 'declined'), encoding='utf-8') if l.strip() and not l.startswith('#')}
-    listed = [l.split()[0] for l in subprocess.run([cfg.mach, 'info', 'targets'], capture_output=True, text=True).stdout.splitlines() if l.strip()]
+    listed = [l.split()[0] for l in subprocess.run([cfg.mach, 'info', 'targets'], capture_output=True, text=True).stdout.splitlines()[1:] if l.strip()]
     for name in listed:
         if name not in declined and not any(t.system == name for t in targets):
             fails.append(f'{name}: the compiler lists it, and no file of test/target builds for it or declines it')

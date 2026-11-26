@@ -139,7 +139,7 @@ directory under dep/ outside the closure, where a realizing walk notes and retai
 | :--- | :--- |
 | `op` | the operation |
 | `reqs` | receives the closure, which the caller frees |
-| `quiet` | report no progress lines |
+| `quiet` | report no result lines |
 | `unchanged` | report a git dependency found already realized as unchanged, as pull does |
 | `offline` | fetch nothing |
 | `verify_only` | change nothing |

@@ -2,7 +2,7 @@
 
 # mach.report.layout
 
-how every line a command prints for a person is laid out: progress lines, rows of columns,
+how every line a command prints for a person is laid out: result lines, rows of columns,
 bars, and the one written form of a duration, a size, a count and a commit
 
 a row is cells in columns. each column has a width, sits its cells left or right, and has
@@ -18,9 +18,9 @@ measured duration is microseconds below a millisecond, milliseconds below a seco
 of one takes the singular noun, and a count shown among others groups its digits by three
 (`30,634`). a commit is its first COMMIT_SHORT hex digits.
 
-a progress line is a verb from one closed table, right-aligned in a gutter of GUTTER, then
-what it acted on; its detail sits on lines beneath, indented past the gutter. a bar is `#`
-up to BAR long, scaled to the largest of its table.
+a result line is a verb from one closed table, left-aligned in a gutter of GUTTER, then what
+it acted on and its details, each GAP apart. a bar is `#` up to BAR long, scaled to the
+largest of its table.
 
 Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 
@@ -28,8 +28,8 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 | :--- | :--- | :--- |
 | [`Align`](#align) | `def` | where a cell sits in its column |
 | [`Column`](#column) | `rec` | one column of a block |
-| [`Text`](#text) | `rec` | storage one written value lives in while its line is written storage one written value lives in while its line is written, and how much a text writer has put in it |
-| [`Verb`](#verb) | `def` | what a progress line says was done, the word in its gutter |
+| [`Text`](#text) | `rec` | storage one written value lives in while its line is written, and how much a text writer has put in it |
+| [`Verb`](#verb) | `def` | what a result line says was done, the word in its gutter |
 
 | On `Align` | |
 | :--- | :--- |
@@ -54,23 +54,23 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 
 | On `Verb` | |
 | :--- | :--- |
-| [`CREATED`](#verb), [`REALIZED`](#verb), [`UPDATED`](#verb), [`UNCHANGED`](#verb), [`ADDED`](#verb), [`REMOVED`](#verb), [`BUILT`](#verb), [`CHECKED`](#verb), [`FORMATTED`](#verb), [`DIFFERS`](#verb), [`DOCUMENTED`](#verb), [`VERIFIED`](#verb), [`FETCHED`](#verb), [`READING`](#verb), [`PASSED`](#verb), [`FAILED`](#verb), [`SKIPPED`](#verb), [`COMPILING`](#verb), [`MIGRATED`](#verb) | |
-| [`said`](#said) | the gutter of a progress line: its verb right-aligned, then the gap before what it acted on |
+| [`CREATED`](#verb), [`REALIZED`](#verb), [`UPDATED`](#verb), [`UNCHANGED`](#verb), [`ADDED`](#verb), [`REMOVED`](#verb), [`BUILT`](#verb), [`CHECKED`](#verb), [`FORMATTED`](#verb), [`DIFFERS`](#verb), [`DOCUMENTED`](#verb), [`VERIFIED`](#verb), [`FETCHED`](#verb), [`PASSED`](#verb), [`FAILED`](#verb), [`SKIPPED`](#verb), [`MIGRATED`](#verb) | |
+| [`verb_word`](#verb_word) | the word a verb says, as `formatted` |
+| [`said`](#said) | the lead of a result line: its verb left-aligned in the gutter, then the gap before what it acted on |
 
 | Functions | |
 | :--- | :--- |
 | [`aside`](#aside) | write a remark after a row's cells, parted from them by GAP |
 | [`spaces`](#spaces) | write n spaces |
 | [`noun`](#noun) | the noun a count takes |
-| [`beneath`](#beneath) | the lead of a detail line beneath a progress line: the gutter and its gap, empty |
-| [`bar_length`](#bar_length) | the length of the bar of `part` against the largest `most`, rounded to nearest, zero for a part too small to show |
+| [`bar_length`](#bar_length) | the length of the bar of `part` against the largest `most`, rounded to nearest, one for any part above zero and zero for none |
 
 | Constants | |
 | :--- | :--- |
 | [`GAP`](#constants) | the spaces between two columns, unless a column states its own |
 | [`TEXT_CAP`](#constants) | the room one written number, duration, size or commit takes, its terminator included |
 | [`COMMIT_SHORT`](#constants) | the hex digits a commit is shown by, unless a listing asks for the whole of it |
-| [`GUTTER`](#constants) | the gutter's width: the widest verb, right-aligned in it |
+| [`GUTTER`](#constants) | the gutter's width: the widest verb, left-aligned in it |
 | [`BAR`](#constants) | the room a bar may take |
 
 ---
@@ -146,7 +146,6 @@ pub rec Text {
 }
 ```
 
-storage one written value lives in while its line is written
 storage one written value lives in while its line is written, and how much a text writer
 has put in it
 
@@ -223,7 +222,7 @@ a bar of n `#`, nil when n is zero
 pub def Verb: u8
 ```
 
-what a progress line says was done, the word in its gutter
+what a result line says was done, the word in its gutter
 
 | Name | Value | |
 | :--- | :--- | :--- |
@@ -240,12 +239,18 @@ what a progress line says was done, the word in its gutter
 | `DOCUMENTED` | `10` |  |
 | `VERIFIED` | `11` |  |
 | `FETCHED` | `12` |  |
-| `READING` | `13` |  |
-| `PASSED` | `14` |  |
-| `FAILED` | `15` |  |
-| `SKIPPED` | `16` |  |
-| `COMPILING` | `17` |  |
-| `MIGRATED` | `18` |  |
+| `PASSED` | `13` |  |
+| `FAILED` | `14` |  |
+| `SKIPPED` | `15` |  |
+| `MIGRATED` | `16` |  |
+
+### verb_word
+
+```mach
+pub fun verb_word(v: Verb) str
+```
+
+the word a verb says, as `formatted`
 
 ### said
 
@@ -253,7 +258,8 @@ what a progress line says was done, the word in its gutter
 pub fun said(w: *std.io.writer.Writer, v: Verb)
 ```
 
-the gutter of a progress line: its verb right-aligned, then the gap before what it acted on
+the lead of a result line: its verb left-aligned in the gutter, then the gap before what it
+acted on
 
 ## Functions
 
@@ -281,22 +287,14 @@ pub fun noun(n: u64, one: str, many: str) str
 
 the noun a count takes
 
-### beneath
-
-```mach
-pub fun beneath(w: *std.io.writer.Writer)
-```
-
-the lead of a detail line beneath a progress line: the gutter and its gap, empty
-
 ### bar_length
 
 ```mach
 pub fun bar_length(part: u64, most: u64) usize
 ```
 
-the length of the bar of `part` against the largest `most`, rounded to nearest, zero for a
-part too small to show
+the length of the bar of `part` against the largest `most`, rounded to nearest, one for any
+part above zero and zero for none
 
 ## Constants
 
@@ -305,6 +303,6 @@ part too small to show
 | `GAP` | `usize` | `2` | the spaces between two columns, unless a column states its own |
 | `TEXT_CAP` | `usize` | `48` | the room one written number, duration, size or commit takes, its terminator included |
 | `COMMIT_SHORT` | `usize` | `12` | the hex digits a commit is shown by, unless a listing asks for the whole of it |
-| `GUTTER` | `usize` | `10` | the gutter's width: the widest verb, right-aligned in it |
+| `GUTTER` | `usize` | `10` | the gutter's width: the widest verb, left-aligned in it |
 | `BAR` | `usize` | `24` | the room a bar may take |
 

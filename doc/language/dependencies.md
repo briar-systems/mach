@@ -95,7 +95,8 @@ what resolution chose.
 
 **`--offline`.** `add`, `update` and `outdated` read candidates from each
 dependency's repository: one `git ls-remote --tags` per URL and command,
-announced first (`reading  <url>  releases`), and the first time a
+shown on the live line while it runs and logged under `-v` as a `fetch` line
+(see [readout.md](readout.md#log-lines)), and the first time a
 release's manifest is needed, every listed release's manifest at once, in two
 fetches into a scratch repository, which every later resolution in the same
 command reads again (`add` resolves the new range and then the closure,
@@ -169,12 +170,19 @@ hedgeacme -> hedge -> std, which requires ref = "tag/v2.1.0". nothing checks tha
 ```
 
 A requirement that asks for exactly the root's selection is no override and is
-not noted. `mach dep list` shows each root declaration's winning selection
-(`ref=`, `version=` or `path=`, and the recorded `pin=` in full), its state
-(`realized`, `missing`, or, for a `version` selection whose range excludes the
-pinned release, `out of range (the pinned release 7.0.2 is outside ^8.0)`) and,
-under it, every requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
-ref = "tag/v2.1.0"`). `mach dep outdated` names the requirements of a chosen
+not noted. `mach dep list` shows a table of each root declaration: its id, its
+winning selection (the `ref`, `version` or `path`), its recorded pin by its
+first 12 hex digits, its state (`realized`, `missing`, or `out of range` for a
+`version` selection whose range excludes the pinned release, with a note saying
+why, as `std is out of range: the pinned release 7.0.2 is outside ^8.0`) and its
+source, and under it every requirement it overrides (`overrides hedgeacme ->
+hedge -> std, which requires ref = "tag/v2.1.0"`). A cell with nothing to show
+reads `-`:
+
+```
+dependency  version  pin           state     source
+std         ^10.1.1  378ad6bb40a8  realized  https://github.com/briar-systems/mach-std
+``` `mach dep outdated` names the requirements of a chosen
 release that a root or a fixed dependency overrides (`app declares b by ref
 "branch/main", overriding app -> a 1.0.0 requires b ^1.2`).
 
@@ -237,7 +245,7 @@ under its prefix (`test/consumer/dep/std` for a subproject at `test/consumer`)
 the same way: `pull` realizes that gitlink's commit and `update` moves it and
 stages it. Without such a gitlink, and in a filesystem project, Git dependencies
 are plain clones whose own checkout commits are verified. A project in no
-repository records no pin at all: `mach dep list` lists no `pin=` for its Git
+repository records no pin at all: `mach dep list` shows no pin for its Git
 dependencies, runs no Git command that needs a repository, and says once, as a
 note, that the project records no pins. Local path dependencies are verified
 from their filesystem realizations, independently of any Git index.
@@ -412,21 +420,21 @@ dep verify` checks:
   directory Git retained from an earlier removal;
 - a checkout already where its record holds it is left as it is.
 
-Each step prints a [progress line](readout.md#progress-lines) on stdout, a verb
+Each step prints a [result line](readout.md#result-lines) on stdout, a verb
 in the gutter then the dependency and what was done, and a Git dependency pull
-found already in place prints `unchanged` with its commit and selection, so a
+found already in place prints `unchanged` with its selection and commit, so a
 pull with nothing to do still names every dependency it checked:
 
 ```
-  realized  std     1c484f5f57d9  branch/dev
-   updated  std     1c484f5f57d9 -> 5a0e3d21b7c4
- unchanged  crypto  2c564d948fbc  tag/v1.4.0
-  realized  helper  demo/../helper  (copy made from its source)
-     added  [dep.helper]
+realized    std  branch/dev  1c484f5f57d9
+updated     std  1c484f5f57d9 -> 5a0e3d21b7c4
+unchanged   crypto  tag/v1.4.0  2c564d948fbc
+realized    helper  demo/../helper  (copy made from its source)
+added       [dep.helper]
 ```
 
-A progress line names a commit by its first 12 hex digits. `mach dep list`
-shows a pin in full.
+A result line names a commit by its first 12 hex digits, as `mach dep list`
+names a pin.
 
 Then, when the checkout lacks the tag its selection is read by (the tag a
 `tag/` names, or a release tag naming a `version` selection's pin), pull
