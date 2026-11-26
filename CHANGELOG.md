@@ -9,6 +9,8 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.2.0] - 2026-11-26
+
 ### Added
 - `kind = "module"` builds a WebAssembly module of its exports on `wasi` and freestanding `wasm32`, a reactor its host calls only through what it marks `#[export]`. It links as a `bin` does, from its link entries and every input the link takes, the pins and `-l` inputs a `bin` checks included, but it is rooted at its exports: it needs no `main`, has no `_start` and no `_initialize`, and imports only what its exports reach. The corpus gains `reactor/` and a module target file for each system (#5007).
 
