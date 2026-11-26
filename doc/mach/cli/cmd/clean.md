@@ -37,7 +37,7 @@ staging and dependency trees beneath each cell's work directory, dependency
 requirement cells included; a dependency never realized was never built, so
 it adds no cell. they are sorted, collapsed under their ancestors,
 and removed inside the project root; a path that escapes the root or crosses a symlink is refused. a missing path is
-not an error. each path removed has its result line once all are tried, and a run that removed
+not an error. each path removed has its result once all are tried, and a run that removed
 nothing says the project is unchanged
 
 | Parameter | |

@@ -2,7 +2,7 @@
 
 # mach.report.layout
 
-how every line a command prints for a person is laid out: result lines, rows of columns,
+how every line a command prints for a person is laid out: results, rows of columns,
 bars, and the one written form of a duration, a size, a count and a commit
 
 a row is cells in columns. each column has a width, sits its cells left or right, and has
@@ -18,9 +18,9 @@ measured duration is microseconds below a millisecond, milliseconds below a seco
 of one takes the singular noun, and a count shown among others groups its digits by three
 (`30,634`). a commit is its first COMMIT_SHORT hex digits.
 
-a result line is a verb from one closed table, left-aligned in a gutter of GUTTER, then what
-it acted on and its details, each GAP apart. a bar is `#` up to BAR long, scaled to the
-largest of its table.
+a result is a verb from one closed table and what it acted on, on one line, then its fields
+beneath it, one a line, indented INDENT, each key padded to the block's widest and GAP before
+its value. a bar is `#` up to BAR long, scaled to the largest of its table.
 
 Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 
@@ -29,7 +29,9 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 | [`Align`](#align) | `def` | where a cell sits in its column |
 | [`Column`](#column) | `rec` | one column of a block |
 | [`Text`](#text) | `rec` | storage one written value lives in while its line is written, and how much a text writer has put in it |
-| [`Verb`](#verb) | `def` | what a result line says was done, the word in its gutter |
+| [`Value`](#value) | `rec` | storage one field's value lives in while its result is written, and how much a value writer has put in it |
+| [`Verb`](#verb) | `def` | what a result says was done, the word that opens it |
+| [`Field`](#field) | `rec` | one line of a result's block: what the value is, then the value |
 
 | On `Align` | |
 | :--- | :--- |
@@ -46,17 +48,24 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 | [`text_writer`](#text_writer) | a writer into t, from its start: what does not fit is dropped, and text_end closes it |
 | [`text_end`](#text_end) | what a text writer wrote into t |
 | [`count`](#count) | a count in decimal |
+| [`nonzero`](#nonzero) | a count as a field's value: nil for none, which leaves the field out |
 | [`duration`](#duration) | a measured duration, rounded to the nearest of its last digit: a tenth below ten of microseconds or milliseconds and whole above, seconds to a tenth below a minute, then minutes and whole seconds |
 | [`size`](#size) | a size in bytes: exact below a KiB, then the largest binary unit it holds one of, rounded to the nearest tenth below ten of the unit and to the nearest whole above |
 | [`commit`](#commit) | a commit as it is shown: its first COMMIT_SHORT digits |
 | [`grouped`](#grouped) | a count with a comma between each group of three digits |
 | [`bar_text`](#bar_text) | a bar of n `#`, nil when n is zero |
 
+| On `Value` | |
+| :--- | :--- |
+| [`value_writer`](#value_writer) | a writer into v, from its start: what does not fit is dropped, and value_end closes it |
+| [`value_end`](#value_end) | what a value writer wrote into v |
+| [`target`](#target) | a target as a result names it, its profile after it when it has one |
+
 | On `Verb` | |
 | :--- | :--- |
 | [`CREATED`](#verb), [`REALIZED`](#verb), [`UPDATED`](#verb), [`UNCHANGED`](#verb), [`ADDED`](#verb), [`REMOVED`](#verb), [`BUILT`](#verb), [`CHECKED`](#verb), [`FORMATTED`](#verb), [`DIFFERS`](#verb), [`DOCUMENTED`](#verb), [`VERIFIED`](#verb), [`FETCHED`](#verb), [`PASSED`](#verb), [`FAILED`](#verb), [`SKIPPED`](#verb), [`MIGRATED`](#verb) | |
 | [`verb_word`](#verb_word) | the word a verb says, as `formatted` |
-| [`said`](#said) | the lead of a result line: its verb left-aligned in the gutter, then the gap before what it acted on |
+| [`result`](#result) | a result: its verb and what it acted on on one line, then each field that has a value on a line of its own, indented INDENT, its key padded to the widest key shown and GAP before its value |
 
 | Functions | |
 | :--- | :--- |
@@ -69,8 +78,9 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 | :--- | :--- |
 | [`GAP`](#constants) | the spaces between two columns, unless a column states its own |
 | [`TEXT_CAP`](#constants) | the room one written number, duration, size or commit takes, its terminator included |
+| [`VALUE_CAP`](#constants) | the room one field's value takes when it is written of parts, as `linux-x86_64 debug`, its terminator included |
 | [`COMMIT_SHORT`](#constants) | the hex digits a commit is shown by, unless a listing asks for the whole of it |
-| [`GUTTER`](#constants) | the gutter's width: the widest verb, left-aligned in it |
+| [`INDENT`](#constants) | the spaces a result's fields are indented by |
 | [`BAR`](#constants) | the room a bar may take |
 
 ---
@@ -173,6 +183,14 @@ pub fun count(t: *Text, n: u64) str
 
 a count in decimal
 
+### nonzero
+
+```mach
+pub fun nonzero(t: *Text, n: u64) str
+```
+
+a count as a field's value: nil for none, which leaves the field out
+
 ### duration
 
 ```mach
@@ -216,13 +234,49 @@ pub fun bar_text(t: *Text, n: usize) str
 
 a bar of n `#`, nil when n is zero
 
+## Value
+
+```mach
+pub rec Value {
+    bytes: [VALUE_CAP]u8;
+    len:   usize;
+}
+```
+
+storage one field's value lives in while its result is written, and how much a value writer
+has put in it
+
+### value_writer
+
+```mach
+pub fun value_writer(v: *Value) std.io.writer.Writer
+```
+
+a writer into v, from its start: what does not fit is dropped, and value_end closes it
+
+### value_end
+
+```mach
+pub fun value_end(v: *Value) str
+```
+
+what a value writer wrote into v
+
+### target
+
+```mach
+pub fun target(v: *Value, name: str, profile: str) str
+```
+
+a target as a result names it, its profile after it when it has one
+
 ## Verb
 
 ```mach
 pub def Verb: u8
 ```
 
-what a result line says was done, the word in its gutter
+what a result says was done, the word that opens it
 
 | Name | Value | |
 | :--- | :--- | :--- |
@@ -252,14 +306,37 @@ pub fun verb_word(v: Verb) str
 
 the word a verb says, as `formatted`
 
-### said
+### result
 
 ```mach
-pub fun said(w: *std.io.writer.Writer, v: Verb)
+pub fun result(w: *std.io.writer.Writer, v: Verb, subject: str, fields: *Field, n: usize)
 ```
 
-the lead of a result line: its verb left-aligned in the gutter, then the gap before what it
-acted on
+a result: its verb and what it acted on on one line, then each field that has a value on a line
+of its own, indented INDENT, its key padded to the widest key shown and GAP before its value
+
+| Parameter | |
+| :--- | :--- |
+| `w` | where the result goes |
+| `v` | what was done |
+| `subject` | what it was done to |
+| `fields` | the result's fields in the order they show, n of them |
+
+## Field
+
+```mach
+pub rec Field {
+    key:   str;
+    value: str;
+}
+```
+
+one line of a result's block: what the value is, then the value
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `key` | `str` | the field's name, as `time` |
+| `value` | `str` | what the result has for it, nil or empty for nothing, which leaves the field out |
 
 ## Functions
 
@@ -302,7 +379,8 @@ part above zero and zero for none
 | :--- | :--- | :--- | :--- |
 | `GAP` | `usize` | `2` | the spaces between two columns, unless a column states its own |
 | `TEXT_CAP` | `usize` | `48` | the room one written number, duration, size or commit takes, its terminator included |
+| `VALUE_CAP` | `usize` | `256` | the room one field's value takes when it is written of parts, as `linux-x86_64 debug`, its terminator included |
 | `COMMIT_SHORT` | `usize` | `12` | the hex digits a commit is shown by, unless a listing asks for the whole of it |
-| `GUTTER` | `usize` | `10` | the gutter's width: the widest verb, left-aligned in it |
+| `INDENT` | `usize` | `2` | the spaces a result's fields are indented by |
 | `BAR` | `usize` | `24` | the room a bar may take |
 

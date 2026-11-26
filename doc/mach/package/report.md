@@ -2,8 +2,8 @@
 
 # mach.package.report
 
-where dependency management reports while it works. a result line (a verb from
-mach.report.layout's table and what it acted on), a note, a failure the operation goes on
+where dependency management reports while it works. a result (a verb from mach.report.layout's
+table, what it acted on and its fields), a note, a failure the operation goes on
 past, and each remote whose releases it fetches stream to the caller as they happen; `effects`
 collects a note for each change an operation made before it failed, which the caller shows
 after the failure, so a failed command still names the state it left
@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.layout`](../r
 | Type | | |
 | :--- | :--- | :--- |
 | [`Sink`](#sink) | `rec` | what a report's sink does with each thing reported |
-| [`Report`](#report) | `rec` | a sink for result lines, notes, faults and fetches, with the effect notes an operation collected and the fetches it made |
+| [`Report`](#report) | `rec` | a sink for results, notes, faults and fetches, with the effect notes an operation collected and the fetches it made |
 
 | On `Sink` | |
 | :--- | :--- |
@@ -24,10 +24,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.layout`](../r
 | On `Report` | |
 | :--- | :--- |
 | [`dnit`](#dnit) | free the effect notes the report kept |
-| [`said`](#said) | write a result line to the sink: verb v, then the n texts at `texts`, borrowed for the call |
-| [`said1`](#said1) | a result line of verb v and what it acted on |
-| [`said2`](#said2) | a result line of verb v, what it acted on and one detail |
-| [`said3`](#said3) | a result line of verb v, what it acted on and two details |
+| [`said`](#said) | write a result to the sink: verb v, what it acted on, then the n fields at `fields`, each borrowed for the call |
 | [`note`](#note) | write a note to the sink |
 | [`fault`](#fault) | report a failure the operation goes on past |
 | [`stage`](#stage) | the caller opened a stage over the fetches from here, which it expects `n` of, 0 when it cannot count them; the sink counts them as they begin and shows each as an item of that stage |
@@ -55,7 +52,7 @@ what a report's sink does with each thing reported
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `said` | `SaidFn` | writes a result line |
+| `said` | `SaidFn` | writes a result |
 | `note` | `NoteFn` | writes a note |
 | `fault` | `FaultFn` | reports a failure the operation goes on past |
 | `fetching` | `FetchingFn` | shows a fetch beginning |
@@ -83,7 +80,7 @@ pub rec Report {
 }
 ```
 
-a sink for result lines, notes, faults and fetches, with the effect notes an operation
+a sink for results, notes, faults and fetches, with the effect notes an operation
 collected and the fetches it made
 
 | Field | Type | |
@@ -111,34 +108,11 @@ free the effect notes the report kept
 ### said
 
 ```mach
-pub fun said(r: *Report, v: mach.report.layout.Verb, texts: *str, n: usize)
+pub fun said(r: *Report, v: mach.report.layout.Verb, subject: str, fields: *mach.report.layout.Field, n: usize)
 ```
 
-write a result line to the sink: verb v, then the n texts at `texts`, borrowed for the call
-
-### said1
-
-```mach
-pub fun said1(r: *Report, v: mach.report.layout.Verb, a: str)
-```
-
-a result line of verb v and what it acted on
-
-### said2
-
-```mach
-pub fun said2(r: *Report, v: mach.report.layout.Verb, a: str, b: str)
-```
-
-a result line of verb v, what it acted on and one detail
-
-### said3
-
-```mach
-pub fun said3(r: *Report, v: mach.report.layout.Verb, a: str, b: str, c: str)
-```
-
-a result line of verb v, what it acted on and two details
+write a result to the sink: verb v, what it acted on, then the n fields at `fields`, each
+borrowed for the call
 
 ### note
 

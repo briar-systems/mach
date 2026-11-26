@@ -42,7 +42,7 @@ file. the entry is src/bin/main.mach and a bin artifact, or with `--lib` src/lib
 a static artifact. std is declared at the selection this compiler states for it, a range being
 resolved before anything is written, and is checked out once the project is. `--no-deps` declares no dependency and reads nothing
 from the network. in git mode the project is made a repository unless it stands in one, and a
-`.gitignore` naming its work directory is written where none is. `--quiet` leaves out the result lines
+`.gitignore` naming its work directory is written where none is. `--quiet` leaves out the results
 
 | Parameter | |
 | :--- | :--- |

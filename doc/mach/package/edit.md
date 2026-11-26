@@ -108,7 +108,7 @@ pub fun update(op: *mach.package.closure.Operation, all: bool, name: str, quiet:
 | `op` | the operation, on the project root; a failure may borrow from its session, so the caller shows it before ending either |
 | `all` | move every identity |
 | `name` | the identity to move when not `all` |
-| `quiet` | report no result lines |
+| `quiet` | report no results |
 | `lowest` | resolve each range to its lowest admitted release |
 | `offline` | fetch nothing |
 | **returns** | err naming the failure, whose effects the operation's report holds |
@@ -151,7 +151,7 @@ the update that checks the dependency out
 | `op` | the operation, on the project root; a failure may borrow from its session, so the caller shows it before ending either |
 | `text` | the project's manifest, as it will be written |
 | `spec` | the dependency, a git source with no ref, and the range to choose in or none for any |
-| `quiet` | report no result line |
+| `quiet` | report no result |
 | **returns** | the range, `^X.Y.Z`; err naming the failure |
 
 ### change
@@ -170,7 +170,7 @@ add or remove the [dep] table `spec` describes and realize the closure it leaves
 | `name` | the dependency identity |
 | `adding` | add the table; false removes it |
 | `purge` | on remove, delete dep/\<name> as well |
-| `quiet` | report no result lines |
+| `quiet` | report no results |
 | `realize` | realize the closure; false only writes the table |
 | `offline` | fetch nothing |
 | **returns** | err naming the failure, whose effects the operation's report holds |

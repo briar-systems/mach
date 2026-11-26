@@ -11,7 +11,7 @@ and runs only the front end. `mach clean` and `mach test` plan through
 
 Source: [`src/cli/cmd/build.mach`](../../../../src/cli/cmd/build.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.build.plan`](../../build/plan.md), [`mach.cli.args`](../args.md), [`mach.cli.diagnostic`](../diagnostic.md), [`mach.compile.closure`](../../compile/closure.md), [`mach.compile.request`](../../compile/request.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.manifest.select`](../../manifest/select.md), [`mach.session`](../../session.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.build.plan`](../../build/plan.md), [`mach.cli.args`](../args.md), [`mach.compile.closure`](../../compile/closure.md), [`mach.compile.request`](../../compile/request.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.manifest.select`](../../manifest/select.md), [`mach.session`](../../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,7 +21,6 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | :--- | :--- |
 | [`plan_invocation`](#plan_invocation) | initialise a session, load the manifest, resolve the selectors and plan a build of every resolved cell, one plan per profile |
 | [`plan_selection`](#plan_selection) | resolve the selectors against a loaded manifest and plan every resolved cell, one plan per profile |
-| [`shape_of`](#shape_of) | the units of every plan of a selection, which the result lines are laid out over |
 
 | Functions | |
 | :--- | :--- |
@@ -98,14 +97,6 @@ each other: a caller that runs them all checks they write disjoint outputs
 | `m` | the root manifest |
 | `unrealized` | what a dependency nothing is realized for is |
 | **returns** | the plans; err from selection, a request, planning or dependency configuration |
-
-### shape_of
-
-```mach
-pub fun shape_of(planned: *Planned, s: *mach.cli.diagnostic.Shape)
-```
-
-the units of every plan of a selection, which the result lines are laid out over
 
 ## Functions
 
