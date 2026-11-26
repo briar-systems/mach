@@ -15,6 +15,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Type | | |
 | :--- | :--- | :--- |
 | [`Doc`](#doc) | `rec` | a manifest's text, the file it was read from, its slot in the source map its reader holds, and its TOML tree, owned through the allocator that made it and released with `doc_dnit` |
+| [`Header`](#header-1) | `rec` | what a manifest states that every compiler reads alike, before holding it to its own schema: the project id and the compiler range it builds with, and where the range is written |
 
 | On `Doc` | |
 | :--- | :--- |
@@ -22,6 +23,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`doc_parse`](#doc_parse) | `text`, the manifest at `path`, as a doc whose text is loaded into `sources`: bytes a manifest refuses and a document that is not TOML are failures pointing at the byte refused |
 | [`doc_parse_bytes`](#doc_parse_bytes) | `doc_parse` over the `n` bytes at `data`, which need not end in a NUL and may hold one, which is refused where it is written |
 | [`doc_read`](#doc_read) | the manifest file at `path` read and parsed as `doc_parse` parses it; a file that cannot be read is refused as a path the project names |
+| [`header`](#header) | the header `doc` states, read from its TOML tree with no schema check |
 | [`doc_dnit`](#doc_dnit) | release a doc and everything it owns |
 
 | Functions | |
@@ -105,6 +107,14 @@ pub fun doc_read(alloc: *std.allocator.Allocator, sources: *mach.base.source.Sou
 the manifest file at `path` read and parsed as `doc_parse` parses it; a file
 that cannot be read is refused as a path the project names
 
+### header
+
+```mach
+pub fun header(doc: *Doc) Header
+```
+
+the header `doc` states, read from its TOML tree with no schema check
+
 ### doc_dnit
 
 ```mach
@@ -112,6 +122,28 @@ pub fun doc_dnit(alloc: *std.allocator.Allocator, d: *Doc)
 ```
 
 release a doc and everything it owns
+
+## Header
+
+```mach
+pub rec Header {
+    id:      str;
+    mach:    str;
+    mach_at: mach.base.source.Location;
+}
+```
+
+what a manifest states that every compiler reads alike, before holding it to its own schema:
+the project id and the compiler range it builds with, and where the range is written. a
+manifest written for another compiler's schema is read this far, so its range can refuse it
+ahead of a key this schema removed or renamed. each text is empty when the manifest does not
+write it as a string, and borrows from the doc
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `id` | `str` | `[project].id` |
+| `mach` | `str` | `[project].mach` |
+| `mach_at` | `mach.base.source.Location` | where `mach`'s value is written, in the doc's file, or nowhere |
 
 ## Functions
 

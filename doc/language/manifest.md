@@ -69,8 +69,9 @@ boundary.
 ### Dependency manifests
 
 A dependency's `mach.toml` is held to exactly the rules of the project being
-built. It is read once, and an unknown, removed, mistyped or missing key in it
-fails the consumer's build pointing into the dependency's own file:
+built, once its identity and [compiler range](#compiler-range) admit it. It is
+read once, and an unknown, removed, mistyped or missing key in it fails the
+consumer's build pointing into the dependency's own file:
 
 ```
 error[manifest.unknown_key] dependency 'gfx' cannot be read (mach.toml: unknown key 'bogus' in [project])
@@ -212,6 +213,12 @@ error[mach.version_unaccepted] this is mach 7.0.0, and the dependency closure do
 4 | mach = ">=7.1"
   |        ^^^^^^^
 ```
+
+A dependency's `[project].id` and `mach` are read before the rest of its
+manifest, so one written for another compiler is refused by its range, never by
+a key this compiler does not know, and nothing under it is read. Where a newer
+selection has moved past the realized commit, `mach dep pull` and `mach dep
+verify` refuse the stale checkout instead, naming `mach dep update`.
 
 Every manifest must state `mach`, a dependency's included. One without it is
 refused like any missing required key (`mach.toml: [project] is missing required

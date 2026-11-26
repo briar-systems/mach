@@ -12,16 +12,23 @@ artifact cascades, and the template variables a manifest reads
 
 Source: [`src/compile/closure.mach`](../../../src/compile/closure.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.project`](project.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.template`](../manifest/template.md), [`mach.session`](../session.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.compile.project`](project.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.load`](../manifest/load.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.template`](../manifest/template.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`Check`](#check) | `rec` | the checks a caller holds each located edge to, nil for a build |
+| [`Unmet`](#unmet) | `rec` | a compiler range the running compiler is outside of, stated by one manifest of the closure |
 | [`Unrealized`](#unrealized) | `def` | what locating makes of a dependency nothing is realized for under dep/ |
 
 | On `Check` | |
 | :--- | :--- |
 | [`locate`](#locate) | locate a root manifest's dependency closure as a build reads it: every dependency is the directory its key names under dep/, read through its manifest |
+
+| On `Unmet` | |
+| :--- | :--- |
+| [`unmet_names`](#unmet_names) | whether `unmet` already names the dependency `key` |
+| [`admitted`](#admitted) | what a dependency's manifest is held to as read, before its schema: the identity rule, then the compiler range |
+| [`unaccepted`](#unaccepted) | the refusal of a closure that does not accept the running compiler, naming every unmet range with who states it and pointing at the first |
 
 | On `Unrealized` | |
 | :--- | :--- |
@@ -32,6 +39,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | :--- | :--- |
 | [`root_dependency`](#root_dependency) | the root manifest's own declaration of a dependency |
 | [`compiler_admitted`](#compiler_admitted) | whether the running compiler satisfies `text`; a range that no longer parses counts as unmet |
+| [`compiler_outside`](#compiler_outside) | whether `text` is a range the running compiler is outside of; a range that does not parse is not one, and is the schema's to refuse |
 | [`running_mach_range_floor`](#running_mach_range_floor) | mach_range_floor for this compiler |
 | [`check_dep_root`](#check_dep_root) | whether the dependency root exists; err when it is anything but a physical directory |
 | [`adopt`](#adopt) | the cell `p` configures compiles against `c`: its `deps` borrow every entry |
@@ -40,6 +48,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`resolve_cascade_libs`](#resolve_cascade_libs) | collect the exported `[link.*]` entries of the cell's dependencies that match its target each dependency is walked after the dependencies it reaches |
 | [`check_realized`](#check_realized) | refuse a dependency checkout a build cannot read: nothing realized at `dep_dir` (absent, or the empty directory a pin leaves on a fresh clone), or a symlink or other entry in its place |
 | [`diag_dep_manifest_error`](#diag_dep_manifest_error) | the message for a dependency whose manifest cannot be read |
+| [`dep_manifest_refused`](#dep_manifest_refused) | `read_err`, a failure to read or parse the manifest of the dependency `alias`, worded as one |
 | [`check_dep_identity`](#check_dep_identity) | the manifest key, the directory under dep/ and the project id are one name |
 | [`build_dep_root`](#build_dep_root) | the directory a dependency is realized in, `<project_root>/<dir_dep>/<alias>` |
 | [`cell_tmpl_vars`](#cell_tmpl_vars) | the template values a manifest of the cell expands in: its target, profile and artifact requirements |
@@ -81,9 +90,9 @@ pub fun locate(s: *mach.session.Session, alloc: *std.allocator.Allocator, m: *ma
 
 locate a root manifest's dependency closure as a build reads it: every
 dependency is the directory its key names under dep/, read through its
-manifest. nothing is checked against git, a pin, a selector or the identity
-rule; `mach dep pull` realizes what is missing and `mach dep verify` checks
-what exists. a root with no dependency still has its compiler range checked
+manifest. nothing is checked against git, a pin or a selector; `mach dep pull`
+realizes what is missing and `mach dep verify` checks what exists. a root with no
+dependency still has its compiler range checked
 
 | Parameter | |
 | :--- | :--- |
@@ -94,6 +103,63 @@ what exists. a root with no dependency still has its compiler range checked
 | `check` | what each located edge is also held to, or nil for a build, which locates only |
 | `unrealized` | what a dependency nothing is realized for is |
 | **returns** | the closure; err naming a missing dependency, an unreadable manifest, a cycle or an unaccepted compiler range, or the first edge that does not hold to `check` |
+
+## Unmet
+
+```mach
+pub rec Unmet {
+    key:   mach.base.intern.StrId;
+    who:   mach.base.intern.StrId;
+    range: mach.base.intern.StrId;
+    at:    mach.base.source.Location;
+}
+```
+
+a compiler range the running compiler is outside of, stated by one manifest of the closure
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `key` | `mach.base.intern.StrId` | the dependency's key, nil for the root |
+| `who` | `mach.base.intern.StrId` | who states it, as the refusal names it: the chain that reaches a dependency |
+| `range` | `mach.base.intern.StrId` | the range as written |
+| `at` | `mach.base.source.Location` | where the range is written |
+
+### unmet_names
+
+```mach
+pub fun unmet_names(unmet: *Vector[Unmet], key: mach.base.intern.StrId) bool
+```
+
+whether `unmet` already names the dependency `key`
+
+### admitted
+
+```mach
+pub fun admitted(s: *mach.session.Session, key: str, chain: str, doc: *mach.manifest.load.Doc) res[opt[Unmet], mach.base.fail.Fail]
+```
+
+what a dependency's manifest is held to as read, before its schema: the identity rule, then
+the compiler range. a manifest written for another compiler may lack or misspell keys this
+one requires, so a range the running compiler is outside of stops it before the schema
+reads it, and the closure is refused once with every such range. an id or a range it does
+not state, or a range that does not parse, is the schema's to refuse
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session, which interns the unmet range |
+| `key` | the dependency's key |
+| `chain` | the chain that reaches it |
+| `doc` | its manifest, read |
+| **returns** | the range it states that the running compiler is outside of, none when the schema is to read it; err when it realizes another project |
+
+### unaccepted
+
+```mach
+pub fun unaccepted(s: *mach.session.Session, alloc: *std.allocator.Allocator, unmet: *Vector[Unmet]) mach.base.fail.Fail
+```
+
+the refusal of a closure that does not accept the running compiler, naming every unmet range
+with who states it and pointing at the first
 
 ## Unrealized
 
@@ -131,6 +197,15 @@ pub fun compiler_admitted(text: str) bool
 ```
 
 whether the running compiler satisfies `text`; a range that no longer parses counts as unmet
+
+### compiler_outside
+
+```mach
+pub fun compiler_outside(text: str) bool
+```
+
+whether `text` is a range the running compiler is outside of; a range that does not parse
+is not one, and is the schema's to refuse
 
 ### running_mach_range_floor
 
@@ -237,6 +312,14 @@ the message for a dependency whose manifest cannot be read
 | `alias` | the dependency's key |
 | `read_err` | why the read failed |
 | **returns** | the message, or the failure of formatting it |
+
+### dep_manifest_refused
+
+```mach
+pub fun dep_manifest_refused(s: *mach.session.Session, alias: str, read_err: mach.base.fail.Fail) mach.base.fail.Fail
+```
+
+`read_err`, a failure to read or parse the manifest of the dependency `alias`, worded as one
 
 ### check_dep_identity
 
