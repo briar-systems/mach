@@ -1069,7 +1069,8 @@ A `wasi` target builds a wasm32 module that a host runtime instantiates, so its
 programs run under a command the manifest declares as the target's `runner`, since
 a wasm module is not a program the host runs itself. mach knows no runtime by name. The one `sys` is
 `wasi` under the one environment, `preview1`: the module imports its system
-interface from `wasi_snapshot_preview1`, starts at `_start`, and runs one thread.
+interface from `wasi_snapshot_preview1` and runs one thread. A `bin` starts at
+`_start`, and a `module` is a module of its exports with none.
 
 ```toml
 [target.wasi-wasm32]
@@ -1086,10 +1087,19 @@ runner = ["wasmtime", "{artifact.out}"]
   `wasm`. Name `isa` and `ext` as on any target: with no `isa` the target stands on
   `wasm1`, WebAssembly's core 1.0, and `ext` adds features from masc's wasm set (see
   [Instruction-set extensions](#instruction-set-extensions)).
-- **Artifacts.** A `bin` artifact is a `.wasm` module and a `static` one a `.a`
-  archive of objects whose relocation records mink links. The module has no loader
-  to map it, so it is never position-independent and no `shared` artifact exists:
-  a `shared` artifact is refused with mink's reason, naming the system.
+- **Artifacts.** A `bin` artifact is a `.wasm` module a runtime runs as a command,
+  through its `_start`, which `use std.runtime;` defines to call `main`. A `module`
+  artifact is a `.wasm` module of its exports, a reactor its host calls through
+  what it marks `#[export]`, and it needs no `main`. A `bin` that defines no
+  `_start` is refused, saying a module of exports states `kind = "module"`. A
+  `static` artifact is a `.a` archive of objects whose relocation records mink
+  links. The module has no loader to map it, so it is never position-independent
+  and no `shared` artifact exists: a `shared` artifact is refused with mink's
+  reason, naming the system.
+- **A module's start.** Nothing runs before the host calls a `module`'s first
+  export, and mach exports no `_initialize`: a mach global's initializer is
+  constant, so the module's data segments already hold every global's value when
+  the host instantiates it.
 - **No linker-side image options.** A wasm module has no PE subsystem, so
   `subsystem` and `--set subsystem` are refused as on any format without one. Its data
   starts in linear memory past the stack, which grows down from there, so a stack
@@ -1139,7 +1149,7 @@ arch   = ["wasm32"]
 abi    = ["*"]
 
 [artifact.counter]
-kind    = "bin"
+kind    = "module"
 entry   = "main.mach"
 out     = "{project.work}/bin/counter{artifact.suffix}"
 targets = ["web"]
@@ -1170,11 +1180,14 @@ pub fun add(a: i32, b: i32) i32 {
 - **Exports.** Every `#[export]` declaration, under its symbol name, and the linear
   memory as `memory`. A `#[export]` variable is exported as an immutable global holding
   its address.
-- **The entry.** A `bin` needs none: a program that defines `_start` has it exported
-  as `_start`, and one that does not is a module of its exports. Other freestanding
-  targets still need `_start`. `use std.runtime;` defines one that calls
-  `main(0, nil)` and returns, and traps when main returns anything but 0, since a
-  module has no process to exit. A program that wants no entry leaves std.runtime out.
+- **The entry.** A module its host calls through its exports is a `module`
+  artifact, with no entry, as on `wasi`. A `bin` has `_start` exported as `_start`:
+  `use std.runtime;` defines one that calls `main(0, nil)` and returns, and traps
+  when main returns anything but 0, since a module has no process to exit. Other
+  freestanding targets need `_start` too.
+- **A `bin` with no `_start`** is still a module of its exports, as it was before
+  `kind = "module"` built one on wasm. That form is deprecated and mach 8 refuses
+  it: state `kind = "module"` for a module of exports.
 - **Memory.** As on `wasi`: the stack lies at the bottom of linear memory, from its
   base down to address zero, 64 KiB unless `stack_reserve` states its size, and the
   data starts at the base, so a stack overflow traps below address zero. The memory's
@@ -1701,7 +1714,7 @@ reads the selected artifact's name.
 
 | Key       | Required | Meaning |
 |-----------|----------|---------|
-| `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates, such as a SPIR-V module). Any other value is refused listing mink's products (see below). |
+| `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates: a SPIR-V module, or a WebAssembly module its host calls through its exports). Any other value is refused listing mink's products (see below). |
 | `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing those the target runs, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. v6 rooted it under the expanded `[project].out` without saying so, so `mach migrate` writes `{project.work}/` before each `out` of a manifest that still writes `[project].out`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
@@ -1732,7 +1745,11 @@ any of them (see [test.md](test.md#which-tests-run)).
   such as a finished-module `spirv` target, refuses it in mink's words.
 - **`module`** is a module a runtime instantiates. On a finished-module target
   such as `spirv` it is the module mink's link joins from the build's objects,
-  written at `out`. A format
+  written at `out`. On a `wasm32` target, `wasi` or freestanding, it is a module of
+  the declarations marked `#[export]`, linked as a `bin` is, from the artifact's
+  link entries and every input the link takes, but rooted at its exports: it has
+  no `_start`, runs nothing before its host calls an export, and imports only what
+  its exports reach (see [WebAssembly targets](#webassembly-targets)). A format
   mink builds no module in, such as ELF, refuses it.
 - **`object`** is each module's object, written under `obj/` for a later link,
   as `--emit obj` writes them. A target whose back end compiles an artifact whole,

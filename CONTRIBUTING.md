@@ -84,7 +84,8 @@ The compiler's tests are a corpus under `test/`, one program a file, with no
 project around any of them but those under `project/`. A file under `run/` builds for every target and
 exits 0 where the host can run it. A file under `refuse/` is refused with the
 diagnostic kind its first line names. A file under `gpu/` builds for the shader
-targets. A directory under `project/` is a small project and its `steps` file,
+targets. A file under `reactor/` builds as a WebAssembly module its host calls only
+through its exports. A directory under `project/` is a small project and its `steps` file,
 the commands run in order in one fresh work directory, each with the exit code it
 expects and, after `|`, text a line of its output must hold, for what only a
 sequence of commands shows. Each file under `target/` names a target's flags and states what
