@@ -33,7 +33,7 @@ package pinned at different commits within it, the closure realized all the same
 | `s` | the session; a failure may borrow from it, so the caller shows it before ending it |
 | `a` | the storage the operation works in |
 | `root` | the project root directory |
-| `quiet` | report no result lines |
-| `rep` | receives result lines, notes, and the effects a failure left |
+| `quiet` | report no results |
+| `rep` | receives results, notes, and the effects a failure left |
 | **returns** | err naming the failure |
 

@@ -24,8 +24,8 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | On `Report` | |
 | :--- | :--- |
-| [`close`](#close) | the pass is over: the live line goes, under -v its log lines say what the transform and the writes took, then each file it rewrote or found differing has its result line |
-| [`result`](#result) | the pass's closing line on stdout, which a stream operand's text never shares |
+| [`close`](#close) | the pass is over: the live line goes, under -v its log lines say what the transform and the writes took, then each file it rewrote or found differing has its result |
+| [`result`](#result) | the pass's closing result on stdout, which a stream operand's text never shares |
 
 | On `Sink` | |
 | :--- | :--- |
@@ -120,7 +120,7 @@ one command's pass over its inputs
 | `transform` | `Transform` | the text each source becomes |
 | `context` | `ptr` | what the command hands its transform |
 | `heading` | `Heading` | what heads each change a diff prints, nil for none |
-| `verb` | `mach.report.layout.Verb` | what the result line of a rewritten file says was done to it |
+| `verb` | `mach.report.layout.Verb` | what the result of a rewritten file says was done to it |
 | `stage` | `str` | what the log line and the live line call the transform, as `format` |
 | `subject` | `str` | what the closing line names, the project's id or the operand, which outlives the pass |
 | `started` | `mach.report.readout.Instant` | when the pass began |
@@ -137,7 +137,7 @@ pub fun close(report: *Report)
 ```
 
 the pass is over: the live line goes, under -v its log lines say what the transform and the
-writes took, then each file it rewrote or found differing has its result line
+writes took, then each file it rewrote or found differing has its result
 
 ### result
 
@@ -145,10 +145,11 @@ writes took, then each file it rewrote or found differing has its result line
 pub fun result(report: *Report, check: bool, faulted: bool, sink: Sink)
 ```
 
-the pass's closing line on stdout, which a stream operand's text never shares. it fails for a
+the pass's closing result on stdout, which a stream operand's text never shares. it fails for a
 malformed file, a file --check found the transform would change, or a fault the command found
-beside, passes under --check, and says unchanged when no file differed. a pass that rewrote files
-said so file by file and closes on nothing more
+beside, passes under --check, and says unchanged when no file differed. it counts the files it
+read, those the transform would change under --check, and those malformed. a pass that rewrote
+files said so file by file and closes on nothing more
 
 | Parameter | |
 | :--- | :--- |

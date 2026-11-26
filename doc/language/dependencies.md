@@ -409,36 +409,45 @@ directory Git retained) and takes the one step that brings it to what `mach
 dep verify` checks:
 
 - a staged gitlink with nothing checked out, as on a fresh clone or after the
-  directory was deleted, is initialized in place (`realized  std  <commit>  <selector>
-  (initialized the committed gitlink)`), first restoring its `.gitmodules`
+  directory was deleted, is initialized in place (`realized std`, its `action`
+  `initialized the committed gitlink`), first restoring its `.gitmodules`
   entry from the manifest if that entry is gone;
 - a checkout at another commit than its gitlink is checked out at the gitlink;
 - a clean checkout of its own with no gitlink is registered, moved to the
-  declared selector from the declared source, and staged (`(registered the
-  existing checkout)`);
+  declared selector from the declared source, and staged (its `action`
+  `registered the existing checkout`);
 - with neither, the submodule is added at the selector, reusing a module
   directory Git retained from an earlier removal;
 - a checkout already where its record holds it is left as it is.
 
-Each step prints a [result line](readout.md#result-lines) on stdout, a verb
-in the gutter then the dependency and what was done, and a Git dependency pull
-found already in place prints `unchanged` with its selection and commit, so a
-pull with nothing to do still names every dependency it checked:
+Each step prints a [result](readout.md#results) on stdout: the verb and the
+dependency, then what was done as fields, a Git dependency's `ref` or `version`
+and its `commit`, a path dependency's `source` and `copy`. A Git dependency
+pull found already in place prints `unchanged` with its selection and commit,
+so a pull with nothing to do still names every dependency it checked:
 
 ```
-realized    std  branch/dev  1c484f5f57d9
-updated     std  1c484f5f57d9 -> 5a0e3d21b7c4
-unchanged   crypto  tag/v1.4.0  2c564d948fbc
-realized    helper  demo/../helper  (copy made from its source)
-added       [dep.helper]
+realized std
+  ref     branch/dev
+  commit  1c484f5f57d9
+updated std
+  ref     branch/dev
+  commit  1c484f5f57d9 -> 5a0e3d21b7c4
+unchanged crypto
+  ref     tag/v1.4.0
+  commit  2c564d948fbc
+realized helper
+  source  demo/../helper
+  copy    made from its source
+added [dep.helper]
 ```
 
-A result line names a commit by its first 12 hex digits, as `mach dep list`
-names a pin.
+A result names a commit by its first 12 hex digits, as `mach dep list` names a
+pin.
 
 Then, when the checkout lacks the tag its selection is read by (the tag a
 `tag/` names, or a release tag naming a `version` selection's pin), pull
-fetches its tags (`fetched  std  tags`). `update` and `outdated` fetch
+fetches its tags (`fetched std`, its `refs` `tags`). `update` and `outdated` fetch
 them the same way to read a pin's release, unless `--offline`.
 
 `pull` refuses an identity pinned at two commits across the closure, as
@@ -452,7 +461,7 @@ checkout `remove` retained registers that checkout, and it refuses a dirty one.
 A checkout that was already there, as one realized for a requirer or retained
 by `remove`, is then moved to the selector the command names, the way `mach dep
 update <path> <id>` moves it, and its gitlink is staged where the project
-records one (`updated  b  <commit> -> <other>  (pinned to the exact selector)`):
+records one (`updated b`, its `commit` `<commit> -> <other>`):
 `add` realizes a new dependency at its selector, and declaring one over an
 existing checkout is the same explicit request, so `add` never leaves a
 checkout that `mach dep verify` refuses. A dependency added by `version` is
@@ -462,11 +471,10 @@ No gitlink command ever runs against a path that is not a checkout of its own.
 A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
 declared `path` every time, and `mach dep update` does the same, once per
 command. Unless `--quiet`, each says whether the copy was made, refreshed or
-reused (`realized  hedge  ./../..  (copy made from its source)`, naming the
-source as the project root joined with the declared `path`, when `dep/<id>`
-did not exist, `(copy refreshed from its source)`, or `(copy reused: it already
-matched its source)`), so a copy left from another checkout cannot pass
-unnoticed. `mach dep add` of a path dependency makes the copy once and says so
+reused (`realized hedge` with `copy  made from its source`, its `source` the
+project root joined with the declared `path`, when `dep/<id>` did not exist,
+`copy  refreshed from its source`, or `copy  reused, it already matched its
+source`), so a copy left from another checkout cannot pass unnoticed. `mach dep add` of a path dependency makes the copy once and says so
 the same way. A build reads the copy as it is and never syncs it. A changed
 `path` realizes the new source. A file the source no longer has is removed and
 named, and a file whose content differs from the source is overwritten and named
@@ -504,8 +512,8 @@ dependencies in these projects are verified from their own plain checkouts.
 `branch/` selector to its current remote tip and re-stages the gitlink, and it
 moves an exact selector to the commit it names, so an identity realized at a
 dependency's selection lands on the root's declaration once the root declares
-one (`updated  b  <commit> -> <other>  (pinned to the exact selector)`, or
-`unchanged  b  <commit>  (exact selector, already pinned)` when nothing moves). `<name>` is looked up in the whole
+one (`updated b`, its `ref` the selector and its `commit` `<commit> -> <other>`,
+or `unchanged b` with the one `commit` when nothing moves). `<name>` is looked up in the whole
 dependency closure, so `mach dep update <path> b` for an identity the root does
 not declare moves its checkout to the selector its requirers declare, and
 `--all` moves every selector in the closure. Resolution reads a dependency

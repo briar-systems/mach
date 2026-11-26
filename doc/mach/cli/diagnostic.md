@@ -14,20 +14,14 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Shape`](#shape) | `rec` | what a plan of units shows on each result line: the units' artifact, target and profile, which of them differ between units, and the widest of each |
 | [`Readout`](#readout) | `rec` | every command's build and test events rendered the moment each arrives: the renderer of the readout contract (doc/language/readout.md) |
 | [`Format`](#format) | `def` | how a command reports to stderr: `--report human`, the default, or the records in one of their two encodings, `--report json` or `--report lines` |
 | [`Report`](#report) | `rec` | how a build-shaped command reports to stderr, and what it has reported |
 
-| On `Shape` | |
-| :--- | :--- |
-| [`shape_init`](#shape_init) | an empty plan shape in place |
-| [`shape_unit`](#shape_unit) | one unit of the plan, each of its names borrowed for the call |
-
 | On `Readout` | |
 | :--- | :--- |
 | [`readout_begin`](#readout_begin) | start rendering a command's events to r, at the level and quietness its command line set |
-| [`readout_unit`](#readout_unit) | the unit a test run that follows belongs to, which its result lines name; each name borrowed until the run ends |
+| [`readout_unit`](#readout_unit) | the unit a test run that follows belongs to, which its results name; each name borrowed until the run ends |
 | [`readout_end`](#readout_end) | close a plan's rendering: the live line goes |
 
 | On `Format` | |
@@ -38,9 +32,9 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | On `Report` | |
 | :--- | :--- |
 | [`report_store`](#report_store) | render every diagnostic of a store through a command's report: as text, counted into the report's errors and warnings, or a record each under json |
-| [`dependency_report`](#dependency_report) | where a dependency command reports: result lines on standard output, notes and failures, the ones the command goes on past too, through the command's report, and each fetch on the live line and in the log |
+| [`dependency_report`](#dependency_report) | where a dependency command reports: results on standard output, notes and failures, the ones the command goes on past too, through the command's report, and each fetch on the live line and in the log |
 | [`report_level`](#report_level) | the readout level and quietness the command line asked for |
-| [`results_shown`](#results_shown) | whether a command's result lines are written: human text without `--quiet` |
+| [`results_shown`](#results_shown) | whether a command's results are written: human text without `--quiet` |
 | [`log_stage`](#log_stage) | a stage of a command that is not a build closed: under -v its log line, `[t] label  time  detail` |
 | [`log_item`](#log_item) | one item of a stage finished: under -vv its line, `[t]   label  time  name` |
 | [`live_begin`](#live_begin) | the live line shows the stage `label` running from now, on a terminal and without `--quiet` |
@@ -50,7 +44,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`report_init`](#report_init) | start a report in place; it holds its own arena, so it stays where it was made until `report_dnit` |
 | [`out`](#out) | where a command writes its output, stdout through the report, so a refused write fails the command as the system's |
 | [`report_note`](#report_note) | report a note of kind `k`, which points at nothing: `note text` in human text, or a diagnostic record of note severity under json |
-| [`report_said`](#report_said) | report what a command did as a result line in human text, and as the note record of kind `k` saying `text` under the records modes |
+| [`report_said`](#report_said) | report what a command did as a result in human text, and as the note record of kind `k` saying `text` under the records modes |
 | [`report_fail`](#report_fail) | report a carried failure as the diagnostic it reads as, in text or as a diagnostic record under json |
 | [`report_case`](#report_case) | one collected test as a record under json, as `mach test --list` lists it; human text writes nothing here |
 | [`report_skip`](#report_skip) | a (target, profile) whose tests were built and not run, as a record under json; human text writes nothing here |
@@ -62,10 +56,8 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`refuse`](#refuse) | render_fail for a failure built in place |
 | [`dependency_outcome`](#dependency_outcome) | show how a dependency command ended: its failure, then a note for each change it made before failing |
 | [`outcome_code`](#outcome_code) | map a build outcome's severity to the process exit code, an unknown severity reported to stderr |
-| [`shown_path`](#shown_path) | a path as a result line shows it, without a leading `./` |
+| [`shown_path`](#shown_path) | a path as a result shows it, without a leading `./` |
 | [`has_capture`](#has_capture) | whether a result kept output worth pointing at |
-| [`said_row`](#said_row) | a result line on w: its verb in the gutter, then `n` texts parted by GAP |
-| [`said_cells`](#said_cells) | the same result line left open, for a detail the caller ends it with |
 
 | Constants | |
 | :--- | :--- |
@@ -73,44 +65,12 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 ---
 
-## Shape
-
-```mach
-pub rec Shape {
-    units:   usize;
-    first:   [SHAPE_COLUMNS]str;
-    differs: [SHAPE_COLUMNS]bool;
-    widths:  [SHAPE_COLUMNS]usize;
-}
-```
-
-what a plan of units shows on each result line: the units' artifact, target and profile, which
-of them differ between units, and the widest of each. a column shows on a result line only
-when the units differ in it, the artifact always
-
-### shape_init
-
-```mach
-pub fun shape_init(s: *Shape)
-```
-
-an empty plan shape in place
-
-### shape_unit
-
-```mach
-pub fun shape_unit(s: *Shape, artifact: str, target: str, profile: str)
-```
-
-one unit of the plan, each of its names borrowed for the call
-
 ## Readout
 
 ```mach
 pub rec Readout {
     sink:     mach.report.readout.Sink;
     r:        *Report;
-    shape:    Shape;
     quiet:    bool;
     unit:     mach.report.readout.Unit;
     errors:   u32;
@@ -124,13 +84,11 @@ pub rec Readout {
     run:      *mach.report.readout.TestResult;
     count:    u32;
     finished: u32;
-    mod_w:    usize;
-    tests_w:  usize;
 }
 ```
 
 every command's build and test events rendered the moment each arrives: the renderer of the
-readout contract (doc/language/readout.md). result lines go to stdout, the same at every
+readout contract (doc/language/readout.md). results go to stdout, the same at every
 level; log lines, items, facts and diagnostics go to stderr as they happen, and a terminal
 shows the live line beneath them. the records modes write each diagnostic and failure as a
 record, and under -v each unit, phase row, item, fact and counter
@@ -139,8 +97,7 @@ record, and under -v each unit, phase row, item, fact and counter
 | :--- | :--- | :--- |
 | `sink` | `mach.report.readout.Sink` | what the engine and the test runner are given; its ctx is this record, which must not move |
 | `r` | `*Report` | the command's report |
-| `shape` | `Shape` | the plan's units, which the result lines' columns follow |
-| `quiet` | `bool` | `--quiet`, which leaves out the result lines |
+| `quiet` | `bool` | `--quiet`, which leaves out the results |
 | `unit` | `mach.report.readout.Unit` | the unit the events now arriving belong to |
 | `errors` | `u32` | the errors the unit reported, its warnings in `warnings` |
 | `rows` | `[readout.PHASE_COUNT]Row` | the unit's recap, by phase |
@@ -149,12 +106,11 @@ record, and under -v each unit, phase row, item, fact and counter
 | `counts` | `[readout.COUNTER_COUNT]u64` | the unit's counter totals, those `held` |
 | `run` | `*mach.report.readout.TestResult` | the running test run's results, from its run_start to its run_end, `count` of them |
 | `finished` | `u32` | how many of them have finished |
-| `mod_w` | `usize` | a module line's module column, and `tests_w` its count column |
 
 ### readout_begin
 
 ```mach
-pub fun readout_begin(rd: *Readout, r: *Report, shape: *Shape)
+pub fun readout_begin(rd: *Readout, r: *Report)
 ```
 
 start rendering a command's events to r, at the level and quietness its command line set
@@ -163,7 +119,6 @@ start rendering a command's events to r, at the level and quietness its command 
 | :--- | :--- |
 | `rd` | the renderer, initialised in place since its sink points at it |
 | `r` | the command's report |
-| `shape` | the plan's units |
 
 ### readout_unit
 
@@ -171,7 +126,7 @@ start rendering a command's events to r, at the level and quietness its command 
 pub fun readout_unit(rd: *Readout, artifact: str, target: str, profile: str)
 ```
 
-the unit a test run that follows belongs to, which its result lines name; each name borrowed
+the unit a test run that follows belongs to, which its results name; each name borrowed
 until the run ends
 
 ### readout_end
@@ -231,7 +186,7 @@ pub rec Report {
     out:     std.io.writer.Writer;
     # when the command began, which a log line's stamp and a run's time count from
     origin: mach.report.readout.Instant;
-    # the readout level `-v` and `-vv` set, and `--quiet`, which leaves out the result lines
+    # the readout level `-v` and `-vv` set, and `--quiet`, which leaves out the results
     level: u8;
     quiet: bool;
     # the console both streams share with the live line: `lock` serialises their writes and the
@@ -291,7 +246,7 @@ report's errors and warnings, or a record each under json
 pub fun dependency_report(a: *std.allocator.Allocator, r: *Report) mach.package.report.Report
 ```
 
-where a dependency command reports: result lines on standard output, notes and failures, the
+where a dependency command reports: results on standard output, notes and failures, the
 ones the command goes on past too, through the command's report, and each fetch on the live
 line and in the log
 
@@ -321,7 +276,7 @@ the readout level and quietness the command line asked for
 pub fun results_shown(r: *Report) bool
 ```
 
-whether a command's result lines are written: human text without `--quiet`
+whether a command's results are written: human text without `--quiet`
 
 ### log_stage
 
@@ -432,19 +387,19 @@ diagnostic record of note severity under json
 ### report_said
 
 ```mach
-pub fun report_said(r: *Report, k: mach.base.diagnostic.kind.Kind, v: mach.report.layout.Verb, texts: *str, n: usize, detail: str, text: str)
+pub fun report_said(r: *Report, k: mach.base.diagnostic.kind.Kind, v: mach.report.layout.Verb, subject: str, fields: *mach.report.layout.Field, n: usize, detail: str, text: str)
 ```
 
-report what a command did as a result line in human text, and as the note record of kind
-`k` saying `text` under the records modes
+report what a command did as a result in human text, and as the note record of kind `k`
+saying `text` under the records modes
 
 | Parameter | |
 | :--- | :--- |
 | `r` | the command's report |
 | `k` | the note's kind, a row of note level |
-| `v` | the verb of the result line |
-| `texts` | what it acted on, then its details on the line, `n` of them |
-| `n` | how many texts |
+| `v` | the result's verb |
+| `subject` | what it acted on |
+| `fields` | the result's fields, `n` of them |
 | `detail` | a note after it, nil for none |
 | `text` | the note record's message |
 
@@ -576,7 +531,7 @@ map a build outcome's severity to the process exit code, an unknown severity rep
 pub fun shown_path(p: str) str
 ```
 
-a path as a result line shows it, without a leading `./`
+a path as a result shows it, without a leading `./`
 
 ### has_capture
 
@@ -585,22 +540,6 @@ pub fun has_capture(r: *mach.report.testrun.GateResult) bool
 ```
 
 whether a result kept output worth pointing at
-
-### said_row
-
-```mach
-pub fun said_row(w: *std.io.writer.Writer, v: mach.report.layout.Verb, texts: *str, n: usize)
-```
-
-a result line on w: its verb in the gutter, then `n` texts parted by GAP
-
-### said_cells
-
-```mach
-pub fun said_cells(w: *std.io.writer.Writer, v: mach.report.layout.Verb, texts: *str, n: usize)
-```
-
-the same result line left open, for a detail the caller ends it with
 
 ## Constants
 

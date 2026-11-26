@@ -26,8 +26,8 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 ## The stream
 
 - Records go to stderr, one per line, in the order the human rendering shows
-  the same reports. The result lines the human rendering writes to stdout are
-  not written. Stdout keeps the listings a command writes, such as `mach test
+  the same reports. The results the human rendering writes to stdout are not
+  written. Stdout keeps the listings a command writes, such as `mach test
   --list`, `mach dep list` or the listing `mach check --declassified` writes,
   which stay plain lines.
 - Every line mach writes to stderr is a record, a JSON object on a line of its
@@ -37,8 +37,8 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
   written as a `\u` escape, and a byte that is not valid UTF-8 as `\ufffd`,
   the escape of U+FFFD, so every line is valid UTF-8 and valid JSON.
 - Under `json` and `lines` the live line is not drawn, and the counts a `failed`
-  result line gives are the summary's. Under `-v` a `unit` record opens every unit,
-  where the text names a unit on its result line only when the plan has several.
+  result gives are the summary's. Under `-v` a `unit` record opens every unit,
+  as the text names the unit's target and profile on its result.
 
 ## A record
 
@@ -191,7 +191,7 @@ the manifest does not declare (`selection.unknown`).
 A note says what a command did or found, without failing it, and is a diagnostic
 record with `severity` `"note"`, its `code` the note's key, a `null`
 `primary` and no `origin`. The human rendering writes a note that reports what a
-command did as that command's result line, as `mach init` writes `created` for
+command did as that command's result, as `mach init` writes `created` for
 `project.created` and `realized` for `dep.realized`, and any other note as
 `note <message>`.
 
@@ -209,7 +209,7 @@ command did as that command's result line, as `mach init` writes `created` for
 
 ## Test records
 
-Under `mach test` a run is records too, in place of its result lines and its
+Under `mach test` a run is records too, in place of its results and its
 `test.failed` diagnostics.
 Each (target, profile) whose tests run opens with a `run_start` record, writes
 a `test` record per test in the order the tests finish, and closes with a
@@ -284,8 +284,7 @@ integer microseconds.
 ```
 
 A **unit** record opens each unit, before its rows. It is written for every
-unit, where the text names the unit's target and profile on its result line only
-when the plan has several units. It names the target the unit resolved to
+unit, as the text names every unit's target and profile on its result. It names the target the unit resolved to
 whether `-t` selected it or the host's default did, here a project with no
 `[target]` table, whose one target is `native`:
 

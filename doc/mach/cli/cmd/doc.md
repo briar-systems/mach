@@ -32,7 +32,7 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 per module that declares anything, one per directory and the project's page under
 `<root>/doc/<project id>/`, or under `-o <dir>` inside the project root, removing what
 that directory holds that the run did not write. under -v each stage logs its line, and a
-result line closes the run unless `--quiet`
+result closes the run unless `--quiet`
 
 | Parameter | |
 | :--- | :--- |
