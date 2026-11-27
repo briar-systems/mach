@@ -51,10 +51,10 @@ The word after `asm` is the head. It names the instruction set and is mandatory.
 
 - The head must be a selection for the architecture being built. Any other is refused.
 - A comment inside a block uses its dialect's character, not always Mach's `#`. On aarch64 `#` begins an immediate, as in `add x0, x0, #1`.
-- A head can add an extension for its block alone. Without one, an instruction the target does not select is refused:
+- A head can add an extension for its block alone, as `asm x86-64,popcnt { }` does. Without one, an instruction the target does not select is refused:
 
 ```text
-error[asm.extension] an asm block of 'app.bin.main.bits' uses `popcnt`, which the target's extensions do not admit. select popcnt in the target's `isa` or `ext`, or in the function's `#[extension]`
+error[asm.extension] an asm block of 'app.bin.main.bits' uses `popcnt`, which the target's extensions do not admit. select popcnt in the target's `isa` or `ext`, in the function's `#[extension]`, or in the block's head for that block alone
 ```
 
 The head `x86-64,popcnt` admits it. Whether the processor has the extension is then the program's to check.

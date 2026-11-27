@@ -13,8 +13,9 @@ newest by default. Start at [index.md](index.md).
 
 - `<page>.md` is one page. Its `#` title and the paragraph under it are the
   page's title and lead.
-- [nav.json](nav.json) lists every page once. `groups` gives the sidebar's
-  groups and the order of the pages in each. `moved` maps a retired page's name
+- [nav.json](nav.json) lists every page once, and the site reads only the
+  pages it lists, so a page with no entry there never appears. `groups` gives
+  the sidebar's groups and the order of the pages in each. `moved` maps a retired page's name
   to where its content went, as `"variadics": "functions.html#variadic-packs"`,
   so its address keeps answering.
 
