@@ -10,7 +10,7 @@ test runner's events as they arrive, by the readout contract (doc/language/reado
 
 Source: [`src/cli/diagnostic.mach`](../../../src/cli/diagnostic.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.testrun`](../report/testrun.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.record`](../report/record.md), [`mach.report.testrun`](../report/testrun.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -41,6 +41,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`live_reached`](#live_reached) | the running stage has done `done` of `total` and reached `name`, 0 of 0 for a stage that counts nothing |
 | [`live_end`](#live_end) | nothing runs now, and the live line goes |
 | [`is_records`](#is_records) | whether the report writes records rather than human text |
+| [`record_open`](#record_open) | open a record of `kind` on a records report, for a command whose record is its own to lay out: it writes the fields through mach.report.record and closes it with `record.end` |
 | [`report_init`](#report_init) | start a report in place; it holds its own arena, so it stays where it was made until `report_dnit` |
 | [`out`](#out) | where a command writes its output, stdout through the report, so a refused write fails the command as the system's |
 | [`report_note`](#report_note) | report a note of kind `k`, which points at nothing: `note text` in human text, or a diagnostic record of note severity under json |
@@ -345,6 +346,21 @@ pub fun is_records(r: *Report) bool
 ```
 
 whether the report writes records rather than human text
+
+### record_open
+
+```mach
+pub fun record_open(r: *Report, o: *mach.report.record.Record, kind: str)
+```
+
+open a record of `kind` on a records report, for a command whose record is its own to lay
+out: it writes the fields through mach.report.record and closes it with `record.end`
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the command's report, one `is_records` holds of |
+| `o` | the record, opened in place |
+| `kind` | the record type |
 
 ### report_init
 

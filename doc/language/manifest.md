@@ -772,6 +772,10 @@ linkage     static
 object      elf
 ```
 
+Under `--report json` and `--report lines` neither text is written: the table is a
+`target` record a row and the page one `host` record, which state the same catalog with
+nothing to cut out of a cell ([report-records.md](report-records.md#info-records)).
+
 A value outside its axis's set is refused when the target resolves, so a typo is
 caught rather than silently never matching.
 
@@ -2419,7 +2423,9 @@ another key or a damaged record, links as before.
 
 `--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`
-removes the tree with the rest of the output.
+removes the tree with the rest of the output. `--verify` and `--passes` build
+the same way, since a cached object carries no verifier run and no pass report:
+a build asked to verify or to report compiles every module and links again.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step
