@@ -489,7 +489,7 @@ A mnemonic or a register that needs an extension the target does not select,
 outside such a function, is refused, naming the instruction and what it needs:
 
 ```
-error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, or in the function's `#[extension]`
+error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, in the function's `#[extension]`, or in the block's head for that block alone
 ```
 
 The check runs where the block is assembled, so `mach build` reports it and
