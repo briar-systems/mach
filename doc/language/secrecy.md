@@ -147,7 +147,10 @@ secret storage is refused the same way, as the weld keeps it from becoming a
 A C variadic accepts neither a secret value nor a value holding one
 (`secret.variadic`). Its extra arguments have no declared type for the value to
 stay `^` in, and a secret reaches a public place only by an explicit
-declassification, so the author writes `:>` to pass one.
+declassification, so the author writes `:>` to pass one. A pack spread into a
+C variadic (`c_printf(fmt, va...)`) is that many extra arguments, and each
+pack instance holds each of its elements to the same rule at the spread, the
+narrow-integer and `f32` promotions included.
 
 The gates hold in **every** function, whether or not it carries
 `#[constant_time]`. Branching, indexing, addressing or dividing on a `^` value
@@ -303,10 +306,12 @@ and a public field or element read of a secret constant (`K[0]`). A literal is
 public, and a public field of a constant that holds a secret elsewhere keeps
 its compile-time value (`C.count` of `R{count: 4, key: 9}`).
 
-A `$each` over a secret constant array is accepted: the count comes from the
-array's type, and each element is a run-time secret in the body, held there to
-every gate above, so `$if (x == 1)` on one is refused as a branch on a secret
-and `b[x]` as a secret index.
+A `$each` over a secret constant array, `[N]^T` or `^[N]T`, is accepted: the
+count comes from the array's type, and each element is a run-time `^T` in the
+body, held there to every gate above. `$if (x == 1)` on one is refused as a
+branch on a secret (`secret.branch`), `b[x]` as a secret index
+(`secret.index`), and a length (`[x]u8`) or a comptime argument (`take(x)`) as
+`secret.comptime`, the same as the constant itself would be.
 
 `:>` of a constant is itself compile-time evaluable, so an author who means the
 value writes the declassification where it is used, as anywhere else:
