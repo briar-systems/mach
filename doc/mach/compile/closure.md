@@ -317,7 +317,7 @@ each dependency is walked after the dependencies it reaches
 | `abi` | the target's abi |
 | `own_libs` | the cell's own link requirements, into which an entry naming the same library merges |
 | `own_count` | length of `own_libs` |
-| **returns** | ok, or a failure on a dependency cycle, an entry that cannot be expanded, a library stated with two versions, or an allocation or merge of link claims |
+| **returns** | ok, or a failure on a dependency cycle, an entry that cannot be expanded, a library stated with two versions, a framework stated in two directories, or an allocation or merge of link claims |
 
 ### check_realized
 

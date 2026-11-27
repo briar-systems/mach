@@ -3,16 +3,18 @@
 # mach.compile.cache.link
 
 the link records of a cell: for each output a link wrote, by its canonical path, the key of the
-link that wrote it, the sha-256 of the bytes it wrote, the files beyond its keyed inputs it read
-and whether it read a file a search found. a build that compiled nothing and keys its link as the
+link that wrote it, the sha-256 of the bytes it wrote, the files beyond its keyed inputs it read,
+whether it read a file a search found and the optional entry symbol it left absent, which a
+build that skips the link warns of again. a build that compiled nothing and keys its link as the
 record of its output does skips the link when the file there still hashes to the recorded
 digest. the records live at `<out>/.cache/link`, written after the output they describe is in
 place, so an interrupted build leaves a record naming the old bytes, never one naming bytes that
 were not written. a store that is missing, truncated or damaged reads as empty. the layout is
-`"MLK2"`, the record count, the records, then the sha-256 of everything before it. a record is
+`"MLK3"`, the record count, the records, then the sha-256 of everything before it. a record is
 its path (length then bytes), its 32-byte link key, its 32-byte digest, a byte that is one when
-the link read a file a search found, the count of the files it read and each file's path
-(length then bytes), every number a little-endian u32
+the link read a file a search found, the absent entry symbol (length then bytes, length zero for
+none), the count of the files it read and each file's path (length then bytes), every number a
+little-endian u32
 
 Source: [`src/compile/cache/link.mach`](../../../../src/compile/cache/link.mach)
 
@@ -20,7 +22,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Written`](#written) | `rec` | what wrote the output at a path: the link's key, the digest of the bytes it wrote, whether it read a file a search found, and the files beyond its keyed inputs it read, which a record owns and a caller's lends |
+| [`Written`](#written) | `rec` | what wrote the output at a path: the link's key, the digest of the bytes it wrote, whether it read a file a search found, the optional entry symbol it left absent, nil for none, and the files beyond its keyed inputs it read, which a record owns and a caller's lends |
 | [`Store`](#store) | `rec` | the link records of a cell, indexed by the hash of their paths |
 
 | On `Store` | |
@@ -42,13 +44,14 @@ pub rec Written {
     key:      [32]u8;
     digest:   [32]u8;
     searched: bool;
+    absent:   str;
     files:    Vector[str];
 }
 ```
 
 what wrote the output at a path: the link's key, the digest of the bytes it wrote, whether it
-read a file a search found, and the files beyond its keyed inputs it read, which a record owns
-and a caller's lends
+read a file a search found, the optional entry symbol it left absent, nil for none, and the files
+beyond its keyed inputs it read, which a record owns and a caller's lends
 
 ## Store
 

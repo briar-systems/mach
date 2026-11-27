@@ -28,6 +28,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | :--- | :--- |
 | [`unplaced_dnit`](#unplaced_dnit) | give back a failure of the compile, placed or not: its text and places, and the paths of the spots it still holds, all owned through `a`, the allocator the compile was given |
 | [`placed`](#placed) | the failure `u` placed in `sources`: one about a function as a whole at the function's definition, as `defined`, the facts the module's lowering kept, states it, and any other at the byte of its spot, with the bytes of the spots it names besides as its related places, as `located` finds them |
+| [`unverified`](#unverified) | mirl's verifier's refusal `e` of the lowered module `name`, a defect of the lowering, in mirl's words and at the source location mirl states for the instruction it names |
 | [`bare`](#bare) | the failure `f` with no spot |
 
 ---
@@ -120,6 +121,15 @@ the bytes of the spots it names besides as its related places, as `located` find
 whose lowering kept no facts passes nil, and its failures stand at their spots. `u` holds the
 placed failure from then on and no spot, its spots given back through `a`, the allocator the
 compile was given
+
+### unverified
+
+```mach
+pub fun unverified(a: *std.allocator.Allocator, m: *Module, name: str, e: mirl.verify.failure.Error) Unplaced
+```
+
+mirl's verifier's refusal `e` of the lowered module `name`, a defect of the lowering, in mirl's words and at the
+source location mirl states for the instruction it names
 
 ### bare
 

@@ -223,7 +223,7 @@ fun main(argc: i64, argv: **u8) i64 {
 > [!NOTE]
 > `mach run .` does not build first. Run `mach build .` after every change.
 
-From here, read [the documentation](doc/language/README.md) (a pamphlet, not a bible) or start from [mach-sieve](https://github.com/briar-systems/mach-sieve).
+From here, read [the documentation](doc/language/README.md) or start from [mach-sieve](https://github.com/briar-systems/mach-sieve).
 
 
 ## Contributing

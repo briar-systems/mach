@@ -37,6 +37,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 pub rec LinkRequirement {
     source: LinkSource;
     text:   mach.base.intern.StrId;
+    dir:    mach.base.intern.StrId;
     key:    mach.base.intern.StrId;
     at:     mach.base.source.Location;
 
@@ -55,6 +56,7 @@ the symbol array is owned; release it with `link_claims_dnit`
 | :--- | :--- | :--- |
 | `source` | `LinkSource` | copied from the link |
 | `text` | `mach.base.intern.StrId` | for a local source, the `path` expanded, anchored as an absolute path and interned; otherwise the link's `name` |
+| `dir` | `mach.base.intern.StrId` | for a framework source stating `dir`, that directory expanded, anchored and interned as `text` is for a local source; STR_NIL otherwise |
 | `key` | `mach.base.intern.StrId` | the link's table key, its identity |
 | `at` | `mach.base.source.Location` | where the link is stated, in the manifest that states it |
 | `symbols` | `*mach.base.intern.StrId` | an owned copy of the link's `symbols`, or nil when it has none |
@@ -125,7 +127,7 @@ pub fun link_requirement(alloc: *std.allocator.Allocator, itn: *mach.base.intern
 ```
 
 resolve a link entry for one target into a `LinkRequirement`. a local `path`
-is expanded with `expand_local_path`, anchored and interned, and the symbols are
+and a framework's `dir` are expanded, anchored and interned, and the symbols are
 copied into an owned array. the path is anchored once, here: at the root
 project's directory when its template names a variable whose value lies under
 it, as `{project.work}` does, and otherwise at the directory of the project

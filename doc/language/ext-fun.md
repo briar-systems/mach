@@ -697,6 +697,9 @@ mach build . -l c
   refused. Link a static library by its path, or by a `[link.X]` entry with
   `kind = "static"`. mach keeps no search of its own. `-L` and `-l` may each be
   repeated.
+- `-F <dir>` adds a framework directory, searched for a `framework` entry's
+  bundle ahead of the system's framework being linked from its claim (see
+  [manifest.md](manifest.md#frameworks)). It may be repeated.
 - A library is searched for by name only where the target's environment
   provides system libraries. On Linux that is `env = "gnu"` in the target, or
   `--env gnu` on an entry build. A target that states no `env` refuses `-l c` (``the target states no environment that provides system libraries, so
