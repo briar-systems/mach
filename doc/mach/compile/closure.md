@@ -51,7 +51,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`resolve_cascade_libs`](#resolve_cascade_libs) | collect the exported `[link.*]` entries of the cell's dependencies that match its target each dependency is walked after the dependencies it reaches |
 | [`check_realized`](#check_realized) | refuse a dependency checkout a build cannot read: nothing realized at `dep_dir` (absent, or the empty directory a pin leaves on a fresh clone), or a symlink or other entry in its place |
 | [`diag_dep_manifest_error`](#diag_dep_manifest_error) | the message for a dependency whose manifest cannot be read |
-| [`dep_manifest_refused`](#dep_manifest_refused) | `read_err`, a failure to read or parse the manifest of the dependency `alias`, worded as one |
+| [`dep_manifest_refused`](#dep_manifest_refused) | `read_err`, a failure to read or parse the manifest of the dependency `alias`, worded as one, with a note naming `chain`, the projects from the root that reach it |
 | [`check_dep_identity`](#check_dep_identity) | the manifest key, the directory under dep/ and the project id are one name |
 | [`build_dep_root`](#build_dep_root) | the directory a dependency is realized in, `<project_root>/<dir_dep>/<alias>` |
 | [`cell_tmpl_vars`](#cell_tmpl_vars) | the template values a manifest of the cell expands in: its target, profile and artifact requirements |
@@ -346,10 +346,12 @@ the message for a dependency whose manifest cannot be read
 ### dep_manifest_refused
 
 ```mach
-pub fun dep_manifest_refused(s: *mach.session.Session, alias: str, read_err: mach.base.fail.Fail) mach.base.fail.Fail
+pub fun dep_manifest_refused(s: *mach.session.Session, a: *std.allocator.Allocator, alias: str, chain: str, read_err: mach.base.fail.Fail) mach.base.fail.Fail
 ```
 
-`read_err`, a failure to read or parse the manifest of the dependency `alias`, worded as one
+`read_err`, a failure to read or parse the manifest of the dependency `alias`, worded as one,
+with a note naming `chain`, the projects from the root that reach it. `a` owns the failure's
+places, the note among them
 
 ### check_dep_identity
 

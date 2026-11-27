@@ -95,7 +95,7 @@ registration in .gitmodules, its module store and its committed gitlink
 ### realize_slot
 
 ```mach
-pub fun realize_slot(s: *mach.session.Session, root: str, id: str, url: str, ref: str, mode: u8,
+pub fun realize_slot(s: *mach.session.Session, root: str, id: str, chain: str, url: str, ref: str, mode: u8,
     slot: *Slot, offline: bool, rep: *mach.package.report.Report) res[u8, mach.base.fail.Fail]
 ```
 

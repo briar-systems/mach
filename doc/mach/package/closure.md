@@ -58,6 +58,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | :--- | :--- |
 | [`pin_command`](#pin_command) | the command that pins and realizes a version-selected dependency with no checkout yet; pull's refusal and init's --no-deps hint both name it |
 | [`unpinned_refusal`](#unpinned_refusal) | the refusal text for a version-selected dependency with no pin and no checkout yet |
+| [`root_id_of`](#root_id_of) | the id a root manifest that passed its schema check declares, which the schema requires, so every chain a dependency command names starts with it |
 | [`key_text`](#key_text) | a string key as the dependency commands read it: absent reads as empty |
 | [`parse_file`](#parse_file) | read and parse a manifest file, naming the file when it is not valid TOML |
 
@@ -152,7 +153,7 @@ directory under dep/ outside the closure, where a realizing walk notes and retai
 ### sync_path
 
 ```mach
-pub fun sync_path(op: *Operation, id: str, src: str, quiet: bool) res[u8, mach.base.fail.Fail]
+pub fun sync_path(op: *Operation, id: str, chain: str, src: str, quiet: bool) res[u8, mach.base.fail.Fail]
 ```
 
 sync the copy of the path dependency `id` with its source `src`, saying what the sync did
@@ -362,6 +363,15 @@ the refusal text for a version-selected dependency with no pin and no checkout y
 | `id` | the dependency identity |
 | `version` | the range it declares |
 | **returns** | the text naming the command that pins it, err when it cannot be formatted |
+
+### root_id_of
+
+```mach
+pub fun root_id_of(doc: *mach.manifest.load.Doc) str
+```
+
+the id a root manifest that passed its schema check declares, which the schema requires, so
+every chain a dependency command names starts with it
 
 ### key_text
 
