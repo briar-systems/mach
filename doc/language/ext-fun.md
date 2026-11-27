@@ -114,6 +114,11 @@ enter a variadic tail: its arguments have no declared type for the value to stay
 `^` in, and a secret reaches a public place only by an explicit declassification.
 Write `:>T` to pass it. The refusal is `secret.variadic`.
 
+A pack spread into the tail (`log(fmt, va...)` inside `fun f(fmt: *u8, va: ...)`)
+is one tail argument per element. The template has no element types to check, so
+each instance checks its own at the spread with both rules above, and reports at
+the call that formed the instance, pointing into the body at the spread.
+
 ### Per-target argument passing
 
 The fixed parameters always follow the target's ordinary calling convention. The
