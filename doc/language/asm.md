@@ -531,7 +531,8 @@ encoder refuses it unless the target selects that extension (the manifest's
 function admits it with [`#[extension(...)]`](decorators.md#extensionnames--an-outlier-function),
 or the block's head adds it.
 The refusal is `asm.extension`, and names the instruction, the extension, and the
-target's `isa` or `ext` and the function's `#[extension]` as the ways to admit it.
+target's `isa` or `ext`, the function's `#[extension]` and the block's head (as
+`asm x86-64,popcnt { }`) as the ways to admit it.
 The table lists the rows this page describes, not every one: masc's catalog for
 the instruction set holds the whole of each extension, so `vaddps` on `ymm`
 registers assembles under `avx` and `fmul` at `.8h` under `FEAT_FP16`.
