@@ -17,7 +17,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.lower.context`](lower/c
 | Functions | |
 | :--- | :--- |
 | [`lower_modules`](#lower_modules) | the modules the `count` requests at `reqs` name lowered into the one mirl module `m`, in their order, and the unit of facts kept of it, named for the last |
-| [`verify_module`](#verify_module) | the lowered module `m` named `name`, held to mirl's verifier on `machine` |
+| [`verify_module`](#verify_module) | the lowered module `m`, held to mirl's verifier on `machine` |
 
 ---
 
@@ -38,9 +38,9 @@ module to mirl's verifier is verify_module's, a stage of its own
 ### verify_module
 
 ```mach
-pub fun verify_module(machine: *mach.lower.context.Machine, a: *std.allocator.Allocator, name: str, m: *mirl.ir.module.Module) err[mach.base.fail.Fail]
+pub fun verify_module(machine: *mach.lower.context.Machine, m: *mirl.ir.module.Module) err[mirl.verify.failure.Error]
 ```
 
-the lowered module `m` named `name`, held to mirl's verifier on `machine`. a module the
-verifier refuses is the lowering's own fault, never the source's
+the lowered module `m`, held to mirl's verifier on `machine`. a module the verifier refuses is
+the lowering's own fault, never the source's, which the caller words with where mirl says it is
 
