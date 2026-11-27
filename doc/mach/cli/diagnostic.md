@@ -10,7 +10,7 @@ test runner's events as they arrive, by the readout contract (doc/language/reado
 
 Source: [`src/cli/diagnostic.mach`](../../../src/cli/diagnostic.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.record`](../report/record.md), [`mach.report.testrun`](../report/testrun.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.cli.ticker`](ticker.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.record`](../report/record.md), [`mach.report.testrun`](../report/testrun.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -198,13 +198,11 @@ pub rec Report {
     out_bare: bool;
     out_tty:  bool;
     owed:     bool;
-    # the live line: the slot the engine writes, whether the drawer runs and is told to stop,
-    # what wakes it, its thread, the terminal's width and the line on screen, none when shown_len is 0
+    # the live line: the slot the engine writes, whether the drawer runs, the ticker it runs on,
+    # the terminal's width and the line on screen, none when shown_len is 0
     live:      mach.report.readout.Live;
     drawing:   bool;
-    stop:      bool;
-    wake:      std.sync.condition.Condition;
-    drawer:    std.sync.thread.Thread;
+    ticker:    mach.cli.ticker.Ticker;
     width:     usize;
     shown:     [LIVE_LINE]u8;
     shown_len: usize;

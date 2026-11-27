@@ -55,6 +55,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | Constants | |
 | :--- | :--- |
+| [`PARALLEL`](#constants) | whether a run can have more than one worker: the host has threads to give them |
 | [`HASH_SIZE`](#constants) | |
 
 ---
@@ -359,7 +360,8 @@ canonical path inside the project root, taken as written
 pub fun workers(asked: u32) u32
 ```
 
-the workers a run uses: the `--threads` count, or the host's processor count when none was given
+the workers a run uses: the `--threads` count, or the host's processor count when none was given.
+a host with no threads runs one, and a count above one is refused there where it is parsed
 
 | Parameter | |
 | :--- | :--- |
@@ -370,5 +372,6 @@ the workers a run uses: the `--threads` count, or the host's processor count whe
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
+| `PARALLEL` | `bool` | `capability.HAS_THREADS` | whether a run can have more than one worker: the host has threads to give them |
 | `HASH_SIZE` | `usize` | `32` |  |
 

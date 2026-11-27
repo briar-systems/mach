@@ -2,29 +2,37 @@
 
 # mach.host.interrupt
 
-the process's interrupt. while a command holds something it must release before it ends
-(a scratch directory, a child it waits on), the signals or console events that would end
-the process are caught instead of ending it. the first one caught is kept for the rest of
-the process: every wait and every step that can stop asks `taken` and stops, the holder
-releases what it made, and the command ends with `status`. holds nest, and the first hold
-claims the process's one event source (std.process.events), the last returns it
+the process's interrupt, where the host can deliver one. both members export one surface: the
+signals or console events caught while a command holds something it must release, and on a
+host that delivers no such event an interrupt that is never taken
 
 Source: [`src/host/interrupt.mach`](../../../src/host/interrupt.mach)
 
-| Functions | |
+| Forwards | |
 | :--- | :--- |
-| [`hold`](#hold) | catch the ending events from here until the matching `release` |
-| [`release`](#release) | end one hold; the last restores the default handling, and an event caught before it stays taken |
-| [`queue`](#queue) | the wait queue every caught event wakes while something holds the interrupt, so a wait blocked on it ends for an event as well as for what it watches there |
-| [`taken`](#taken) | whether an ending event has been caught, now or earlier in the process |
-| [`name`](#name) | the name of the event taken: the signal on linux and darwin, the console or service event on windows |
-| [`status`](#status) | the exit status of a process ended by the event taken: 128 plus the signal's number, as a shell reports a process the signal ended, and the console's own status on windows |
+| [`queue`](#queue) | the wait queue a caught event wakes, which only a host with events has |
+| [`hold`](#hold), [`release`](#release), [`taken`](#taken), [`name`](#name), [`status`](#status) | |
 
 ---
 
-## Functions
+## Forwards
+
+### queue
+
+Forwards [`mach.host.interrupt.events.queue`](interrupt/events.md#queue), only where `capability.HAS_IO_QUEUE && capability.HAS_PROCESS`.
+
+```mach
+pub fun queue() *std.system.os.IoQueue
+```
+
+the wait queue a caught event wakes, which only a host with events has
 
 ### hold
+
+Forwards the first of these whose condition holds:
+
+- [`mach.host.interrupt.events.hold`](interrupt/events.md#hold), where `capability.HAS_IO_QUEUE && capability.HAS_PROCESS`
+- [`mach.host.interrupt.absent.hold`](interrupt/absent.md#hold), otherwise
 
 ```mach
 pub fun hold() err[std.io.error.Error]
@@ -32,11 +40,12 @@ pub fun hold() err[std.io.error.Error]
 
 catch the ending events from here until the matching `release`
 
-| Parameter | |
-| :--- | :--- |
-| **returns** | the refusal to claim the event source, which leaves nothing held |
-
 ### release
+
+Forwards the first of these whose condition holds:
+
+- [`mach.host.interrupt.events.release`](interrupt/events.md#release), where `capability.HAS_IO_QUEUE && capability.HAS_PROCESS`
+- [`mach.host.interrupt.absent.release`](interrupt/absent.md#release), otherwise
 
 ```mach
 pub fun release() err[std.io.error.Error]
@@ -44,24 +53,12 @@ pub fun release() err[std.io.error.Error]
 
 end one hold; the last restores the default handling, and an event caught before it stays taken
 
-| Parameter | |
-| :--- | :--- |
-| **returns** | the refusal to restore the handlers |
-
-### queue
-
-```mach
-pub fun queue() *std.system.os.IoQueue
-```
-
-the wait queue every caught event wakes while something holds the interrupt, so
-a wait blocked on it ends for an event as well as for what it watches there
-
-| Parameter | |
-| :--- | :--- |
-| **returns** | the queue, borrowed until the last release, or nil when nothing holds it |
-
 ### taken
+
+Forwards the first of these whose condition holds:
+
+- [`mach.host.interrupt.events.taken`](interrupt/events.md#taken), where `capability.HAS_IO_QUEUE && capability.HAS_PROCESS`
+- [`mach.host.interrupt.absent.taken`](interrupt/absent.md#taken), otherwise
 
 ```mach
 pub fun taken() bool
@@ -71,19 +68,30 @@ whether an ending event has been caught, now or earlier in the process
 
 ### name
 
+Forwards the first of these whose condition holds:
+
+- [`mach.host.interrupt.events.name`](interrupt/events.md#name), where `capability.HAS_IO_QUEUE && capability.HAS_PROCESS`
+- [`mach.host.interrupt.absent.name`](interrupt/absent.md#name), otherwise
+
 ```mach
-pub fun name() str
+pub fun name() opt[str]
 ```
 
-the name of the event taken: the signal on linux and darwin, the console or service event
-on windows
+the name of the event taken, none while none was: the signal on linux and darwin, the console
+or service event on windows
 
 ### status
 
+Forwards the first of these whose condition holds:
+
+- [`mach.host.interrupt.events.status`](interrupt/events.md#status), where `capability.HAS_IO_QUEUE && capability.HAS_PROCESS`
+- [`mach.host.interrupt.absent.status`](interrupt/absent.md#status), otherwise
+
 ```mach
-pub fun status() i64
+pub fun status() opt[i64]
 ```
 
-the exit status of a process ended by the event taken: 128 plus the signal's number, as a
-shell reports a process the signal ended, and the console's own status on windows
+the exit status of a process ended by the event taken, none while none was: 128 plus the
+signal's number, as a shell reports a process the signal ended, and the console's own status
+on windows
 
