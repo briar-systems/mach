@@ -19,7 +19,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Image`](#image) | `rec` | what the build states of the image it links, beyond its kind and format |
 | [`Stated`](#stated) | `rec` | where the build stated each option of the link it hands mink, a location of the source map its diagnostics read, so mink's refusal of an option points there |
 | [`Loaded`](#loaded) | `rec` | a dynamic library a link entry has the image load whether or not anything imports from it |
-| [`LinkRead`](#linkread) | `rec` | what a link read beyond the objects and the files it was handed by path |
+| [`LinkRead`](#linkread) | `rec` | what a link read beyond the objects and the files it was handed by path, and the optional entry it found absent, which a later build that leaves the artifact standing warns of again |
 | [`Linked`](#linked) | `rec` | a linked image and what its link read |
 
 | On `Back` | |
@@ -51,7 +51,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | On `LinkRead` | |
 | :--- | :--- |
 | [`link_read_init`](#link_read_init) | an empty record of what a link read |
-| [`link_read_dnit`](#link_read_dnit) | release the file names a link read record owns |
+| [`link_read_dnit`](#link_read_dnit) | release the file names and the absent entry a link read record owns |
 
 | Functions | |
 | :--- | :--- |
@@ -441,15 +441,18 @@ a dynamic library a link entry has the image load whether or not anything import
 pub rec LinkRead {
     files:    Vector[str];
     searched: bool;
+    absent:   str;
 }
 ```
 
-what a link read beyond the objects and the files it was handed by path
+what a link read beyond the objects and the files it was handed by path, and the optional
+entry it found absent, which a later build that leaves the artifact standing warns of again
 
 | Field | Type | |
 | :--- | :--- | :--- |
 | `files` | `Vector[str]` | each other file it read and no search found, by its identity, a copy the read owns |
 | `searched` | `bool` | it read a file a search found, which no digest of the file's bytes stands for |
+| `absent` | `str` | the system's optional entry symbol the link took and nothing defined, so the image is a module of its exports, a copy the read owns, nil for none |
 
 ### link_read_init
 
@@ -470,7 +473,7 @@ an empty record of what a link read
 pub fun link_read_dnit(a: *std.allocator.Allocator, r: *LinkRead)
 ```
 
-release the file names a link read record owns
+release the file names and the absent entry a link read record owns
 
 | Parameter | |
 | :--- | :--- |
