@@ -18,7 +18,7 @@ var hits: u64 = 0;
 
 - A decorator applies to the next declaration only, and appears at most once on it. Several may share a line.
 - An argument is a constant: an integer, or a string for a name, a mode or a path. A `val` works, so a `$if` can choose a symbol per target.
-- An unknown name is refused, and so is a decorator on a declaration it does not apply to.
+- An unknown name is refused, and so is a decorator its declaration or its target cannot take, as `naked` on wasm.
 - A comment that begins `#[` is read as a decorator. Write `# [`.
 
 ## The set
@@ -39,6 +39,7 @@ var hits: u64 = 0;
 | `noreturn` | `fun`, `ext fun`, an `asm` statement | Control never comes back |
 | `extension("avx2")` | `fun` | Admits instruction-set extensions the target does not select. The caller checks the processor |
 | `constant_time("soft")`, `constant_time("hard")` | `fun`, a `def` of a function type | A constant-time boundary. See [secrecy](secrecy.md) |
+| `intrinsic("mirl", "ir", "clz")` | bodyless `fun` | A call is that operation: `popcnt`, `clz`, `ctz`, `bswap` |
 | `gpu.*`, `intrinsic`, `handle` | Shader declarations | The shader interface and the target's instructions and types. See [shaders](shaders.md) |
 | **Layout and data** | | |
 | `align(N)` | `fun`, `rec`, `uni`, `tag`, `val`, `var` | Raises the alignment to `N` bytes |
@@ -66,8 +67,6 @@ pub fun hello() i64 {
 ```
 
 `symbol` gives the name the linker sees, on an import and on a definition alike. Mach code calls `c_write` and `hello`, and a C program linked against this library calls `shapes_hello`. An executable's entry is the function with `#[symbol("main")]`.
-
-A definition without `export` is visible to no other image, `pub` or not.
 
 ## Inlining
 

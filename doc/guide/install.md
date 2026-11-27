@@ -1,6 +1,6 @@
 # Install
 
-Mach is one `mach` binary with no other toolchain to install first. Take the latest release with the install script or as an archive, or build it from source.
+Mach is one `mach` binary with no other toolchain to install. Take the latest release with the install script or as an archive, or build it from source.
 
 ## Install script
 
@@ -30,7 +30,7 @@ The installer does not change `PATH`, so add the directory yourself.
 
 ## Precompiled binaries
 
-Every [release](https://github.com/briar-systems/mach/releases) carries an archive for Linux, macOS and Windows, each on x86_64 and aarch64. Unpack yours and put `mach` on `PATH`.
+Every [release](https://github.com/briar-systems/mach/releases) carries an archive for Linux, macOS and Windows, each on x86_64 and aarch64, and the compiler as a WASI module. Unpack yours and put `mach` on `PATH`.
 
 ## Building from source
 

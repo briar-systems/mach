@@ -30,7 +30,7 @@ targets = ["*"]
 
 [dep.std]
 git     = "https://github.com/briar-systems/mach-std"
-version = "^10.1.1"
+version = "^10.2.0"
 ```
 
 `mach init` writes this shape with six targets and a second profile, `release`. An unknown table or key is an error, and a required key has no default:
@@ -46,7 +46,7 @@ All five keys are required.
 | Key | Meaning |
 |---|---|
 | `id` | The first segment of every module path: `src/a/b.mach` is `<id>.a.b`. Letters, digits and `_` |
-| `version` | The project's version |
+| `version` | The project's version, as `major.minor.patch` |
 | `mach` | The compiler versions the project builds with, as a [version range](dependencies.md#version-ranges) |
 | `src` | The source directory |
 | `work` | The work directory, a [path template](#path-templates). Objects and caches go here |

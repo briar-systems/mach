@@ -109,7 +109,7 @@ simd = "scalarize"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^10.1.1"
+version = "^10.2.0"
 ```
 
 And `src/bin/main.mach`:

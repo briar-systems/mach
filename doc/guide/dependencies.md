@@ -7,7 +7,7 @@ A dependency is another Mach project, checked out under `dep/<id>`. `mach.toml` 
 ```toml
 [dep.std]
 git     = "https://github.com/briar-systems/mach-std"
-version = "^10.1.1"
+version = "^10.2.0"
 
 [dep.helper]
 path = "../helper"
@@ -27,7 +27,7 @@ An exact ref takes the place of the range:
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v10.1.0"
+ref = "tag/v10.2.0"
 ```
 
 ## Version ranges

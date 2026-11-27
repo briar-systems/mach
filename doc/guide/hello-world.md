@@ -15,7 +15,7 @@ created hello
   path   hello/
 realized std
   version  ^10
-  commit   378ad6bb40a8
+  commit   45c27d15c00d
   path     hello/dep/std
 ```
 

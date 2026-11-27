@@ -140,7 +140,7 @@ mach init demo
 
 ## Reports
 
-Every command takes `--report <human|json|lines>`. `json` turns stderr into records, one JSON object per line: each diagnostic, each test result and a closing summary. `lines` writes the same records as tab-separated `key=value` fields. The records are the stable interface for editors, CI and scripts.
+Every command takes `--report <human|json|lines>`. `json` turns stderr into records, one JSON object per line: each diagnostic, each test result, `mach info`'s rows and a closing summary. `lines` writes the same records as tab-separated `key=value` fields. The records are the stable interface for editors, CI and scripts.
 
 ```sh
 mach check . --report json
