@@ -13,6 +13,8 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | Type | | |
 | :--- | :--- | :--- |
+| [`Native`](#native) | `rec` | an instruction of the selected target's catalog |
+| [`Intrinsic`](#intrinsic) | `tag` | what an `#[intrinsic]` of the build makes a call of its function |
 | [`Declaration`](#declaration) | `rec` | one module-level function, `val` or `var` |
 | [`Param`](#param) | `rec` | one parameter of a declared function, as an importer's lowering needs it |
 | [`Exported`](#exported) | `rec` | one symbol on the module's public surface, as an importer of it names it |
@@ -43,6 +45,40 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 ---
 
+## Native
+
+```mach
+pub rec Native {
+    set:  mach.base.intern.StrId;
+    name: mach.base.intern.StrId;
+}
+```
+
+an instruction of the selected target's catalog
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `set` | `mach.base.intern.StrId` | its instruction set |
+| `name` | `mach.base.intern.StrId` | its name in the set |
+
+## Intrinsic
+
+```mach
+pub tag Intrinsic: u8 {
+    none;
+    native:    Native;
+    operation: Opcode;
+}
+```
+
+what an `#[intrinsic]` of the build makes a call of its function
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `none` |  | no intrinsic of the build, so a call is of the function itself |
+| `native` | `Native` | the instruction of the selected target's catalog |
+| `operation` | `Opcode` | mirl's own operation, by its opcode, on every target |
+
 ## Declaration
 
 ```mach
@@ -55,8 +91,7 @@ pub rec Declaration {
     generics:     u32;
     params_start: u32;
     params_len:   u32;
-    op_set:       mach.base.intern.StrId;
-    op_name:      mach.base.intern.StrId;
+    intrinsic:    Intrinsic;
     value:        mach.front.comptime.deep.Node;
 }
 ```
@@ -69,7 +104,7 @@ one module-level function, `val` or `var`
 | `at` | `mach.base.source.Location` | where its name is written |
 | `generics` | `u32` | how many type parameters a function declares |
 | `params_start` | `u32` | where a function's parameters start in `params` |
-| `op_set` | `mach.base.intern.StrId` | the instruction set and operation an `#[intrinsic]` names, STR_NIL without one |
+| `intrinsic` | `Intrinsic` | what an `#[intrinsic]` of the build makes a call of the function |
 | `value` | `mach.front.comptime.deep.Node` | the node in `values` of a `val`'s constant value, or of the value a `var`'s initializer gives it, comptime_deep.NONE when it has none |
 
 ## Param

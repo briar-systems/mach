@@ -23,6 +23,7 @@ The directory's root module is [`mach.lower`](../lower.md).
 | [`irt`](irt.md) | the mirl types lowering builds: interned in the module's type table, laid out by the target's data layout and never by mach |
 | [`linkage`](linkage.md) | what a build declares about linkage, owned by the build's project and read by the lowering that names declarations and the linker that binds imports: each declaration's export name and library, the name each declaration links under once the lowering has named it, and the library each imported symbol is pinned to |
 | [`mangle`](mangle.md) | linkage names: the symbols of declarations, tests and generic, value and pack instances |
+| [`operation`](operation.md) | an `#[intrinsic("mirl", "ir", name)]` declaration held to its operation's row |
 | [`placement`](placement.md) | placement: a module global `#[at(offset)]` places, as its object carries it to the link |
 | [`shader`](shader.md) | a shader declaration's decorators as the attributes of the target family that reads them |
 | [`stmt`](stmt.md) | the lowering of statements, with `asm` blocks and the comptime `$if` and `$each` among them |

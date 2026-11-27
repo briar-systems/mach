@@ -53,7 +53,7 @@ uses generic words such as `input` and `shared`.
 #[naked]             # no prologue or epilogue; body as written (no arguments)
 #[extension("a", "b")] # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
-#[intrinsic(tgt,set,name)] # the target instruction this function is (its body, if any, runs elsewhere)
+#[intrinsic(tgt,set,name)] # the instruction or mirl operation this function is ("mirl" names every target)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
 #[gpu.stage("name")]     # GPU pipeline stage; makes the function an entry point
@@ -1270,17 +1270,68 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   [manifest.md](manifest.md#stepname--build-steps) for the equivalent
   guarantee on `[step]` `in` entries.
 
+### `intrinsic(owner, set, name)` — a function that is an instruction or an operation
+
+A call of a function carrying this decorator is not a call: it becomes the
+instruction or operation the decorator names, inline. The three arguments are
+strings, and the first, the owner, says which of two forms the declaration is.
+
+**An architecture's instruction.** An owner that is an architecture name, the one
+the manifest's `arch` selects with, names an instruction of that target's
+instruction set. On the selected architecture a call is that instruction, its
+operands the parameters in order and its result the return type, checked against
+the target's table. On any other architecture the declaration is an ordinary
+function, so its body, if it has one, is what those targets run, and a bodyless
+one is left undefined there, so a call of it fails to link. SPIR-V is the target with a table today, and
+[gpu.md](gpu.md#intrinsictarget-set-name--a-function-that-is-a-target-instruction)
+describes the form, its sets and which instructions it may name.
+
+**One of mirl's own operations.** The reserved owner `"mirl"` names an operation
+of mirl, the compiler's intermediate language, and holds on every target. The set
+is `"ir"` and the name is the operation's:
+
+```mach
+#[intrinsic("mirl", "ir", "popcnt")]
+pub fun popcount(v: u64) u64;
+
+#[intrinsic("mirl", "ir", "clz")]
+pub fun clz(v: u32) u32;
+
+#[intrinsic("mirl", "ir", "ctz")]
+pub fun ctz(v: u8) u8;
+```
+
+The operations it may name are `popcnt`, `clz`, `ctz` and `bswap`: the bit count,
+the leading zero count, the trailing zero count and the byte reversal. A zero
+input counts as the operand's width, so `clz(0)` and `ctz(0)` of a `u64` are 64.
+`bswap` takes an integer of a whole number of bytes, and one byte reversed is
+itself. Every target computes them, with its own instruction where its selection
+has one and a short sequence where it does not.
+
+A call is the operation itself, as pure as mirl states it, so it folds on
+constants and moves and merges as any arithmetic does. A function value of the
+declaration calls a function the compiler defines, whose body is the operation.
+
+The declaration has no body, no type parameter, no `$` parameter and no pack, and
+each is refused with `op.signature`. An owner of `"mirl"` with a set other than
+`"ir"`, or a name it may not name, is refused with `op.unknown`. The signature is
+held to the operation's own typing where the function is declared, whether or not
+anything calls it: one parameter per operand, in order, refused with
+`op.operand_count`, each of the type the operand takes, and the return type the
+type the operation gives, each refused with `op.signature`. For all four that is
+one integer parameter, scalar or vector, and a return type of the same type, and
+for `bswap` the integer's width is a whole number of bytes. A
+secret parameter gives a secret result. These checks are part of building the
+module, so `mach check` does not make them.
+
 ### GPU decorators
 
 The `gpu.` decorators shape a pipeline stage and its workgroup, the shader
 interface and specialization constants. They, with the handle types a target
-mints (`handle`) and the functions that are target instructions (`intrinsic`),
-are described in [gpu.md](gpu.md). An `intrinsic` names any instruction of its
-set but one a construct of the language writes, which the refusal names, one that
-is no instruction a program writes, as a type or a decoration, and one that
-transfers control ([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)). v6 spelled the GPU set without its prefix
-(`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
-is refused naming its replacement, which takes the same arguments.
+mints (`handle`), are described in [gpu.md](gpu.md). v6 spelled the GPU set
+without its prefix (`#[stage]`, `#[input]` and the rest) and the instruction
+decorator `#[op]`. Each is refused naming its replacement, which takes the same
+arguments.
 
 ### `gpu.attachment(index)`: a subpass input's input attachment
 
@@ -1348,7 +1399,7 @@ a further rule the decorator's own section states.
 | `noreturn` | `fun`, `ext`, an `asm` statement | a function that states no result |
 | `extension` | `fun` | a function with a body |
 | `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
-| `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run |
+| `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run, and which has none for `"mirl"` |
 | `handle` | `def` | a `def` with no type, checked by `handle` itself |
 | `abi_type` | `def` | a `def` with no type, checked by `abi_type` itself |
 | `gpu.stage` | `fun` |  |
