@@ -23,11 +23,12 @@ any project in the closure declares is pinned there:
 
 Source: [`src/package/closure.mach`](../../../src/package/closure.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.manifest.load`](../manifest/load.md), [`mach.package.pin`](pin.md), [`mach.package.report`](report.md), [`mach.package.resolver`](resolver.md), [`mach.package.source`](source.md), [`mach.session`](../session.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.manifest.load`](../manifest/load.md), [`mach.manifest.version`](../manifest/version.md), [`mach.package.pin`](pin.md), [`mach.package.report`](report.md), [`mach.package.resolver`](resolver.md), [`mach.package.source`](source.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`Operation`](#operation) | `rec` | one operation on a project's dependencies: the session and storage it works in, the project root, the tables of the source and pin members, and where it reports |
+| [`RangeDecl`](#rangedecl) | `rec` | a further range declared for the identity of a request by another requirer: the closure keeps one request per identity, and every range on it takes part in resolution |
 | [`Request`](#request) | `rec` | one declared dependency of the closure |
 | [`Overridden`](#overridden) | `rec` | a requirement a root declaration replaced: `chain` asked for `asked` |
 | [`Walk`](#walk) | `rec` | how a closure walk reads a fixed git dependency: at the revision its selector picks, fetching one its checkout lacks unless `offline` |
@@ -43,19 +44,21 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`acquire`](#acquire) | acquire a git dependency's slot through the source and report what changed; `accept` is add taking an existing checkout, and `pinned_only` a range with no selector, which only a pin or an existing checkout realizes |
 | [`preflight`](#preflight) | a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the revision its selector picks, never from whatever its checkout holds |
 | [`effects`](#effects) | a note for each change made before a failure, which the caller shows after it |
+| [`root_manifest`](#root_manifest) | the root project's manifest, held to every check the manifest makes before a dependency command acts on it: it is the user's own, so unlike a dependency's it is never read past a refusal |
 
 | On `Request` | |
 | :--- | :--- |
 | [`selects_release`](#selects_release) | a release-selected git dependency: its requirements are the chosen release's |
 | [`index`](#index) | the position of an identity among the requests |
 | [`requests_dnit`](#requests_dnit) | free every request and then the vector itself |
-| [`declared`](#declared) | the root's own declarations in the manifest table `mt`, appended to `reqs` |
+| [`declared`](#declared) | the root's own declarations in its manifest `doc`, appended to `reqs` |
 | [`conflict_text`](#conflict_text) | the example table is valid TOML as printed: values are escaped as the manifest writer would write them |
 
 | Functions | |
 | :--- | :--- |
 | [`pin_command`](#pin_command) | the command that pins and realizes a version-selected dependency with no checkout yet; pull's refusal and init's --no-deps hint both name it |
 | [`unpinned_refusal`](#unpinned_refusal) | the refusal text for a version-selected dependency with no pin and no checkout yet |
+| [`root_id_of`](#root_id_of) | the id a root manifest that passed its schema check declares, which the schema requires, so every chain a dependency command names starts with it |
 | [`key_text`](#key_text) | a string key as the dependency commands read it: absent reads as empty |
 | [`parse_file`](#parse_file) | read and parse a manifest file, naming the file when it is not valid TOML |
 
@@ -128,7 +131,7 @@ resolution of the operation reads the same table
 
 ```mach
 pub fun realize(op: *Operation, reqs: *Vector[Request], quiet: bool, unchanged: bool, offline: bool, verify_only: bool,
-    candidate: *toml.value.Table, picks: *Vector[mach.package.resolver.Choice]) err[mach.base.fail.Fail]
+    candidate: *mach.manifest.load.Doc, picks: *Vector[mach.package.resolver.Choice]) err[mach.base.fail.Fail]
 ```
 
 walk and realize the closure into `reqs`, the root's manifest read from `candidate` when
@@ -143,14 +146,14 @@ directory under dep/ outside the closure, where a realizing walk notes and retai
 | `unchanged` | report a git dependency found already realized as unchanged, as pull does |
 | `offline` | fetch nothing |
 | `verify_only` | change nothing |
-| `candidate` | the root manifest's table, or nil to read it from the project |
+| `candidate` | the root manifest, or nil to read it from the project |
 | `picks` | the releases resolution chose, or nil |
 | **returns** | err naming the first failure |
 
 ### sync_path
 
 ```mach
-pub fun sync_path(op: *Operation, id: str, src: str, quiet: bool) res[u8, mach.base.fail.Fail]
+pub fun sync_path(op: *Operation, id: str, chain: str, src: str, quiet: bool) res[u8, mach.base.fail.Fail]
 ```
 
 sync the copy of the path dependency `id` with its source `src`, saying what the sync did
@@ -188,6 +191,40 @@ pub fun effects(op: *Operation, reqs: *Vector[Request])
 
 a note for each change made before a failure, which the caller shows after it
 
+### root_manifest
+
+```mach
+pub fun root_manifest(op: *Operation) res[mach.manifest.load.Doc, mach.base.fail.Fail]
+```
+
+the root project's manifest, held to every check the manifest makes before a dependency
+command acts on it: it is the user's own, so unlike a dependency's it is never read past a
+refusal
+
+| Parameter | |
+| :--- | :--- |
+| `op` | the operation, on the project root |
+| **returns** | the document, which the caller frees with doc_dnit; err when it cannot be read or is refused |
+
+## RangeDecl
+
+```mach
+pub rec RangeDecl {
+    range:    str;
+    admits:   mach.manifest.version.Range;
+    requirer: str;
+}
+```
+
+a further range declared for the identity of a request by another requirer: the closure
+keeps one request per identity, and every range on it takes part in resolution
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `range` | `str` | the range as written |
+| `admits` | `mach.manifest.version.Range` | `range` parsed, borrowing from it |
+| `requirer` | `str` | who declares it |
+
 ## Request
 
 ```mach
@@ -204,6 +241,7 @@ pub rec Request {
     via_release: bool;
     seed:        str;
     effect:      str;
+    range:       opt[mach.manifest.version.Range];
     also:        Vector[RangeDecl];
     decl:        str;
     overrode:    Vector[Overridden];
@@ -258,10 +296,10 @@ free every request and then the vector itself
 ### declared
 
 ```mach
-pub fun declared(a: *std.allocator.Allocator, reqs: *Vector[Request], root: str, mt: *toml.value.Table) err[mach.base.fail.Fail]
+pub fun declared(s: *mach.session.Session, a: *std.allocator.Allocator, reqs: *Vector[Request], root: str, doc: *mach.manifest.load.Doc) err[mach.base.fail.Fail]
 ```
 
-the root's own declarations in the manifest table `mt`, appended to `reqs`
+the root's own declarations in its manifest `doc`, appended to `reqs`
 
 ### conflict_text
 
@@ -325,6 +363,15 @@ the refusal text for a version-selected dependency with no pin and no checkout y
 | `id` | the dependency identity |
 | `version` | the range it declares |
 | **returns** | the text naming the command that pins it, err when it cannot be formatted |
+
+### root_id_of
+
+```mach
+pub fun root_id_of(doc: *mach.manifest.load.Doc) str
+```
+
+the id a root manifest that passed its schema check declares, which the schema requires, so
+every chain a dependency command names starts with it
 
 ### key_text
 

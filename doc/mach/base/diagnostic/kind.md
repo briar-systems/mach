@@ -54,6 +54,7 @@ Source: [`src/base/diagnostic/kind.mach`](../../../../src/base/diagnostic/kind.m
 | [`NORETURN_RETURNS`](#kind) | a `#[noreturn]` function whose body may return, or one that states a result |
 | [`RET_MISSING`](#kind) | a function with a result type whose body can reach its end without a `ret` |
 | [`TEST_FAILED`](#kind) | a test that failed when it ran: it exited nonzero, was stopped by a signal, timed out or could not be run |
+| [`ARTIFACT_ENTRYLESS_BIN`](#kind) | a bin whose link leaves its system's optional entry absent, so it is a module of its exports, which `kind = "module"` states |
 | [`spec`](#spec) | the row of `k`, nil for NONE or a kind no row declares |
 | [`is_error`](#is_error) | a diagnostic of kind `k` is an error: severity is the row's level, and a kind no row declares is a defect, raised as an error if at all |
 | [`is_warning`](#is_warning) | a diagnostic of kind `k` is a warning |
@@ -589,6 +590,7 @@ pub def Kind: u16
 | `NORETURN_RETURNS` | `539` | a `#[noreturn]` function whose body may return, or one that states a result |
 | `RET_MISSING` | `540` | a function with a result type whose body can reach its end without a `ret` |
 | `TEST_FAILED` | `541` | a test that failed when it ran: it exited nonzero, was stopped by a signal, timed out or could not be run |
+| `ARTIFACT_ENTRYLESS_BIN` | `542` | a bin whose link leaves its system's optional entry absent, so it is a module of its exports, which `kind = "module"` states |
 
 ### spec
 
@@ -767,5 +769,5 @@ the selection covers no warning row
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COUNT` | `usize` | `541` |  |
+| `COUNT` | `usize` | `542` |  |
 

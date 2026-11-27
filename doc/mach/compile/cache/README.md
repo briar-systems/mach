@@ -27,7 +27,7 @@ The directory's root module is [`mach.compile.cache`](../cache.md).
 | :--- | :--- |
 | [`compiler`](compiler.md) | the running compiler's identity: the sha-256 of its executable file, once per process |
 | [`key`](key.md) | the object cache's key builder, and the keys of a module's normal and test objects |
-| [`link`](link.md) | the link records of a cell: for each output a link wrote, by its canonical path, the key of the link that wrote it, the sha-256 of the bytes it wrote, the files beyond its keyed inputs it read and whether it read a file a search found |
+| [`link`](link.md) | the link records of a cell: for each output a link wrote, by its canonical path, the key of the link that wrote it, the sha-256 of the bytes it wrote, the files beyond its keyed inputs it read, whether it read a file a search found and the optional entry symbol it left absent, which a build that skips the link warns of again |
 | [`memo`](memo.md) | the digest memo: the surface digests of a source text, remembered under the sha-256 of that text, so a text the build has seen costs one hash and not the walks and three hashes its surfaces take |
 | [`objects`](objects.md) | the digests of the objects a cell's builds wrote into `obj/`: for each object, by its path under `obj/`, the sha-256 of its bytes as they were written |
 | [`record`](record.md) | the record an `obj/` object carries for the object cache in its `.mach.cache` section: the key the object was built under and what the engine reads from a module's lowered unit besides its object, so a module whose object is reused never has to lower |

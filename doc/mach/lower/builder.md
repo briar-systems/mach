@@ -136,9 +136,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_vec_insert`](#emit_vec_insert) | `vec` with lane `lane` replaced by `x`: a constant lane in place, any other through the vector's bytes in a slot |
 | [`emit_vec_build`](#emit_vec_build) | a vector of `ty` from one value per lane |
 | [`emit_shuffle`](#emit_shuffle) | lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty` |
-| [`emit_unary`](#emit_unary) | a lanewise or scalar operation of one operand |
-| [`emit_binary`](#emit_binary) | a lanewise or scalar operation of two operands |
-| [`emit_ternary`](#emit_ternary) | a lanewise or scalar operation of three operands |
+| [`emit_operation`](#emit_operation) | the operation `code` at the cursor over the `n` values at `values`, its operands in order |
 | [`emit_atomic_load`](#emit_atomic_load) | an atomic read of the integer `ty` at `addr` |
 | [`emit_atomic_store`](#emit_atomic_store) | an atomic write of `x` to `addr` |
 | [`emit_atomic_rmw`](#emit_atomic_rmw) | an atomic read-modify-write, giving the value held before |
@@ -1619,29 +1617,13 @@ pub fun emit_shuffle(b: *Builder, ty: Type, x: mach.lower.value.Value, y: mach.l
 
 lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty`
 
-### emit_unary
+### emit_operation
 
 ```mach
-pub fun emit_unary(b: *Builder, code: Opcode, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
+pub fun emit_operation(b: *Builder, code: Opcode, values: *mach.lower.value.Value, n: u32) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
-a lanewise or scalar operation of one operand
-
-### emit_binary
-
-```mach
-pub fun emit_binary(b: *Builder, code: Opcode, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
-```
-
-a lanewise or scalar operation of two operands
-
-### emit_ternary
-
-```mach
-pub fun emit_ternary(b: *Builder, code: Opcode, x: mach.lower.value.Value, y: mach.lower.value.Value, z: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
-```
-
-a lanewise or scalar operation of three operands
+the operation `code` at the cursor over the `n` values at `values`, its operands in order
 
 ### emit_atomic_load
 

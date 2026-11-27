@@ -1,151 +1,20 @@
-# the threads a codegen pass compiles on: a pool over std.sync.worker_pool that runs each task it
-# is handed on a thread with the driver's stack reserve, then reports the task's index on a channel
-# of finished indices, which only the owner reads. a task's writes reach the owner through that
-# channel, so the owner reads what a task made only once it received the task's index
+# the threads a codegen pass compiles on, where the host has threads to give. both members export
+# one crew, and on a host with no threads no crew opens, so each caller takes the serial path it
+# already has for a host that refused it a thread
 
-use A: std.allocator;
-use std.sync.channel;
-use std.sync.thread;
-use std.sync.worker_pool;
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
-use std.types.option.opt;
-use std.types.result.res;
-use std.types.size.usize;
+use std.system.capability;
 
-use mach.base.role;
-use mach.base.stack;
-
-# one task: `run(ctx)` on a worker, then `index` reported finished
-rec Task {
-    crew:  *Crew;
-    index: u32;
-    ctx:   ptr;
-    run:   fun(ptr);
+$if (capability.HAS_THREADS) {
+    use impl: mach.compile.workers.pooled;
+}
+$or {
+    use impl: mach.compile.workers.absent;
 }
 
-# the pool, its storage and the channel of finished indices, all drawn from `a`
-# ---
-# units:   the most tasks it is handed, one per index below it
-# started: the threads the pool runs, which a readout summed over them names
-pub rec Crew {
-    a:         *A.Allocator;
-    pool:      worker_pool.Pool;
-    queue:     *worker_pool.Task;
-    queue_cap: usize;
-    threads:   *thread.Thread;
-    workers:   *worker_pool.Worker;
-    count:     usize;
-    tasks:     *Task;
-    units:     usize;
-    finished:  channel.Channel[u32];
-    indices:   *u32;
-    started:   u32;
-}
-
-# a crew of `n` threads for at most `units` tasks, its queue holding `queued` waiting tasks, or false
-# when one cannot be had (storage, or a thread the host refused), the crew then holding nothing.
-# `c` must not move while the crew is open
-pub fun open(c: *Crew, a: *A.Allocator, n: u32, units: usize, queued: usize) bool {
-    @c = Crew{a: a, queue_cap: queued, count: n::usize, units: units};
-    if (n == 0 || units == 0 || queued == 0) { ret false; }
-    var made: bool = false;
-    fin {
-        if (!made) { storage_dnit(c); }
-    }
-    val res_queue: res[*worker_pool.Task, A.Error] = A.allocate[worker_pool.Task](a, queued);
-    if (sel res_queue.err) { ret false; }
-    c.queue = res_queue.ok;
-    val res_threads: res[*thread.Thread, A.Error] = A.allocate[thread.Thread](a, c.count);
-    if (sel res_threads.err) { ret false; }
-    c.threads = res_threads.ok;
-    val res_workers: res[*worker_pool.Worker, A.Error] = A.allocate[worker_pool.Worker](a, c.count);
-    if (sel res_workers.err) { ret false; }
-    c.workers = res_workers.ok;
-    val res_tasks: res[*Task, A.Error] = A.allocate[Task](a, units);
-    if (sel res_tasks.err) { ret false; }
-    c.tasks = res_tasks.ok;
-    val res_indices: res[*u32, A.Error] = A.allocate[u32](a, units);
-    if (sel res_indices.err) { ret false; }
-    c.indices = res_indices.ok;
-    val err_channel: channel.Operation = channel.make[u32](?c.finished, c.indices, units);
-    if (sel err_channel.err) { ret false; }
-    var config: thread.Config;
-    thread.config_default(?config);
-    config.stack_reserve = stack.WORKER_RESERVE;
-    config.name          = "mach codegen";
-    val made_pool: worker_pool.Status = worker_pool.make_with_config(?c.pool, c.queue, queued, c.threads, c.workers, c.count, ?config);
-    if (!sel made_pool.accepted) {
-        # a refused spawn leaves the pool joined, holding the threads it had started
-        if (sel made_pool.spawn_failed) { val err_pool: worker_pool.Operation = worker_pool.dnit(?c.pool); }
-        val closed:      channel.Transition = channel.close[u32](?c.finished);
-        val err_dropped: channel.Operation  = channel.dnit[u32](?c.finished);
-        ret false;
-    }
-    c.started = n;
-    made      = true;
-    ret true;
-}
-
-# `run(ctx)` handed to a thread as task `index`, below `units`, which no other open task holds
-pub fun submit(c: *Crew, index: u32, ctx: ptr, run: fun(ptr)) bool {
-    c.tasks[index] = Task{crew: c, index: index, ctx: ctx, run: run};
-    val status: worker_pool.Status = worker_pool.submit(?c.pool, worker_pool.Task{context: (?c.tasks[index])::ptr, fn_run: task_run});
-    ret sel status.accepted;
-}
-
-fun task_run(context: ptr) bool {
-    val t: *Task = context::*Task;
-    $if (role.CHECKED) { role.enter(); }
-
-    t.run(t.ctx);
-    $if (role.CHECKED) { role.leave(); }
-
-    val sent: channel.Status[u32] = channel.send[u32](?t.crew.finished, t.index);
-    ret sel sent.sent;
-}
-
-# the index of the next task to finish, waiting for one; none once the channel is closed
-pub fun finished(c: *Crew) opt[u32] {
-    val got: channel.Status[u32] = channel.receive[u32](?c.finished);
-    if (sel got.received) { ret opt[u32].some{got.received}; }
-    ret opt[u32].none{};
-}
-
-# the index of a task that finished and was not yet taken, none when there is none now
-pub fun finished_now(c: *Crew) opt[u32] {
-    val got: channel.Status[u32] = channel.try_receive[u32](?c.finished);
-    if (sel got.received) { ret opt[u32].some{got.received}; }
-    ret opt[u32].none{};
-}
-
-# no task starts after this: those still queued are dropped unrun, and it returns once every task a
-# thread took has finished and every thread has joined. the indices of finished tasks stay to be
-# taken with finished_now
-pub fun close(c: *Crew) {
-    var rejected: usize              = 0;
-    val aborted:  worker_pool.Status = worker_pool.close_abort(?c.pool, c.queue, c.queue_cap, ?rejected);
-    val joined:   worker_pool.Status = worker_pool.join(?c.pool);
-}
-
-# give back a closed crew once every finished index was taken
-pub fun dnit(c: *Crew) {
-    val err_pool:    worker_pool.Operation = worker_pool.dnit(?c.pool);
-    val closed:      channel.Transition    = channel.close[u32](?c.finished);
-    val err_dropped: channel.Operation     = channel.dnit[u32](?c.finished);
-    storage_dnit(c);
-}
-
-fun storage_dnit(c: *Crew) {
-    if (c.queue != nil)   { A.deallocate[worker_pool.Task](c.a, c.queue, c.queue_cap); }
-    if (c.threads != nil) { A.deallocate[thread.Thread](c.a, c.threads, c.count); }
-    if (c.workers != nil) { A.deallocate[worker_pool.Worker](c.a, c.workers, c.count); }
-    if (c.tasks != nil)   { A.deallocate[Task](c.a, c.tasks, c.units); }
-    if (c.indices != nil) { A.deallocate[u32](c.a, c.indices, c.units); }
-    c.queue   = nil;
-    c.threads = nil;
-    c.workers = nil;
-    c.tasks   = nil;
-    c.indices = nil;
-}
+fwd impl.Crew;
+fwd impl.open;
+fwd impl.submit;
+fwd impl.finished;
+fwd impl.finished_now;
+fwd impl.close;
+fwd impl.dnit;

@@ -29,12 +29,12 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.manifest.load`](.
 | [`revision`](#revision) | the commit a dependency's checkout is at |
 | [`selection_commit`](#selection_commit) | the commit the fixed selector `ref` picks in the checkout at dep_full: a commit or a tag as named, and a branch at dep/\<id>'s pin unless `advance` moves it, then at its fetched tip |
 | [`manifest_at`](#manifest_at) | the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc` |
-| [`release_at_pin`](#release_at_pin) | the release version dep/\<id>'s pin is tagged with, read from its checkout's refs (an owned "" when no release tag points at it); the highest wins, and the caller frees the result |
+| [`release_at_pin`](#release_at_pin) | the release dep/\<id>'s pin is tagged with, read from its checkout's refs, none when no release tag points at it |
 | [`has_tags`](#has_tags) | whether the checkout at `dir` holds any tag: one that holds none, as a shallow clone (`git submodule update --depth 1`) does, cannot say which release a commit is |
 | [`holds_tags`](#holds_tags) | whether the checkout at dep_full holds any tag, which a shallow clone may not |
 | [`fetch_selection_tags`](#fetch_selection_tags) | fetch the tags of dep/\<id>'s checkout when it lacks the one its selection reads: the tag a `tag/` ref names, or a release tag naming the pin of a version range; whether it fetched |
 | [`pinned_at_release`](#pinned_at_release) | whether dep/\<id> is pinned at the release `version` and its checkout is at that pin; a checkout drifted from its gitlink is not, whatever release it holds, and a directory that is no checkout of its own is not |
-| [`release_at`](#release_at) | the release version the commit `rev` of the repository at `dir` is tagged with, read from its local refs (an owned "" when no `v`-prefixed semver tag points at it); the highest wins, and the caller frees the result on every path |
+| [`release_at`](#release_at) | the release the commit `rev` of the repository at `dir` is tagged with, read from its local refs, none when no `v`-prefixed semver tag points at it |
 | [`acquire`](#acquire) | bring dep/\<id> to an acquisition: its slot is observed, refused where realizing it would replace or record work mach did not make, and realized |
 | [`fetch_and_checkout`](#fetch_and_checkout) | check dep/\<id>'s checkout out at the selector `ref` after fetching every ref; `offline` fetches nothing, so a selector the checkout does not hold is refused |
 | [`gitlink_recorded`](#gitlink_recorded) | whether a moved checkout of dep/\<id> is to be staged: always in a repository root, where the gitlink is the pin, and in a subproject exactly when the enclosing repository already records a gitlink for it |
@@ -95,7 +95,7 @@ registration in .gitmodules, its module store and its committed gitlink
 ### realize_slot
 
 ```mach
-pub fun realize_slot(s: *mach.session.Session, root: str, id: str, url: str, ref: str, mode: u8,
+pub fun realize_slot(s: *mach.session.Session, root: str, id: str, chain: str, url: str, ref: str, mode: u8,
     slot: *Slot, offline: bool, rep: *mach.package.report.Report) res[u8, mach.base.fail.Fail]
 ```
 
@@ -150,12 +150,12 @@ the manifest the commit `rev` of the repository at `dir` holds, allocated from `
 ### release_at_pin
 
 ```mach
-pub fun release_at_pin(s: *mach.session.Session, root: str, id: str, dep_full: str, fetch: bool) res[str, mach.base.fail.Fail]
+pub fun release_at_pin(s: *mach.session.Session, root: str, id: str, dep_full: str, fetch: bool) res[opt[mach.package.source.Release], mach.base.fail.Fail]
 ```
 
-the release version dep/\<id>'s pin is tagged with, read from its checkout's refs (an owned ""
-when no release tag points at it); the highest wins, and the caller frees the result. with
-`fetch`, a checkout no release tag of which names the pin fetches its tags first
+the release dep/\<id>'s pin is tagged with, read from its checkout's refs, none when no release
+tag points at it. the highest wins, and the caller frees it with `package_source.release_free`.
+with `fetch`, a checkout no release tag of which names the pin fetches its tags first
 
 ### has_tags
 
@@ -198,12 +198,12 @@ is no checkout of its own is not
 ### release_at
 
 ```mach
-pub fun release_at(a: *std.allocator.Allocator, gi: *mach.package.git.Inspector, dir: str, rev: str) res[str, mach.base.fail.Fail]
+pub fun release_at(a: *std.allocator.Allocator, gi: *mach.package.git.Inspector, dir: str, rev: str) res[opt[mach.package.source.Release], mach.base.fail.Fail]
 ```
 
-the release version the commit `rev` of the repository at `dir` is tagged with, read from
-its local refs (an owned "" when no `v`-prefixed semver tag points at it); the highest
-wins, and the caller frees the result on every path
+the release the commit `rev` of the repository at `dir` is tagged with, read from its local
+refs, none when no `v`-prefixed semver tag points at it. the highest wins, and the caller
+frees it with `package_source.release_free`
 
 ### acquire
 

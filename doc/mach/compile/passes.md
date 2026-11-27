@@ -32,6 +32,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`compile_module`](#compile_module) | the mirl module `m`, the project's own, compiled into an object, which owns its storage in the session's backing allocator, the warnings mirl gave reported on `diags` |
 | [`run_link_pass`](#run_link_pass) | the link stage's computation: the current objects, then the link the build's job names, which runs only when one of its inputs moved |
 | [`prepare_link`](#prepare_link) | before the link stage's operation: when the artifact on disk is not what the link last wrote to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the database's next revision, so the link runs again |
+| [`entryless_told`](#entryless_told) | warn into `diags` of a bin whose link left `absent`, its system's optional entry symbol, undefined, so it is a module of its exports, at the artifact's `kind` where the manifest states it |
 | [`prepare_object_cache`](#prepare_object_cache) | key the loaded modules and read `obj/` under their keys (compile/cache), reported as the cache phase carved out of resolve, which it precedes |
 | [`module_in_current_project`](#module_in_current_project) | whether a module's path starts with the configured project's id |
 
@@ -230,6 +231,15 @@ pub fun prepare_link(p: *mach.compile.project.Project, artifact: str) err[mach.b
 before the link stage's operation: when the artifact on disk is not what the link last wrote
 to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the
 database's next revision, so the link runs again
+
+### entryless_told
+
+```mach
+pub fun entryless_told(p: *mach.compile.project.Project, diags: *mach.base.diagnostic.DiagnosticStore, absent: str) err[mach.base.fail.Fail]
+```
+
+warn into `diags` of a bin whose link left `absent`, its system's optional entry symbol,
+undefined, so it is a module of its exports, at the artifact's `kind` where the manifest states it
 
 ### prepare_object_cache
 

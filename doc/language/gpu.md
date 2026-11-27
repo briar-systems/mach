@@ -739,7 +739,10 @@ pub fun dot(a: f32x4, b: f32x4) f32;
 
 The first argument names the **target**, the second the instruction set, and the
 third the instruction within it. The target is the ISA name the manifest selects
-with, so nothing about this decorator is specific to one back end. The arguments
+with, so nothing about this decorator is specific to one back end. The reserved
+first argument `"mirl"` instead names one of mirl's own operations on every
+target, which [decorators.md](decorators.md#intrinsicowner-set-name--a-function-that-is-an-instruction-or-an-operation)
+describes. The rest of this section is the target form. The arguments
 must be strings on every target, but the instruction set and name are checked only
 when the named target is the one selected: a declaration for any other target is
 inert, and that target's table is not consulted. When it is checked, the parameter

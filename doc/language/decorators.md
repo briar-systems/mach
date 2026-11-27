@@ -53,7 +53,7 @@ uses generic words such as `input` and `shared`.
 #[naked]             # no prologue or epilogue; body as written (no arguments)
 #[extension("a", "b")] # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
-#[intrinsic(tgt,set,name)] # the target instruction this function is (its body, if any, runs elsewhere)
+#[intrinsic(tgt,set,name)] # the instruction or mirl operation this function is ("mirl" names every target)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
 #[gpu.stage("name")]     # GPU pipeline stage; makes the function an entry point
@@ -599,7 +599,11 @@ naming the type that closes it.
   a function still starts at the target's own entry alignment: 16 bytes on
   x86-64 and aarch64, and no padding on riscv. The
   bytes before an entry are an instruction that traps. `align` only raises the
-  target's alignment, so a value below it changes nothing.
+  target's alignment, so a value below it changes nothing. A target that aligns no
+  function's entry, as wasm and SPIR-V, refuses it where it is written
+  (`target.unsupported_op`).
+- On a target that does not address memory physically, as SPIR-V, a global has
+  no address, and `align` on a `var` / `val` is refused where it is written.
 - `align` does not apply to `def` aliases (transparent, no layout of their
   own).
 
@@ -828,8 +832,10 @@ fun f_hot(x: i64) i64 {
 pub var g_sec: u64 = 100;
 ```
 
-The named section is created if absent, and the globals of one object that
-name it share that one section, each at its own aligned offset. A function's
+The name is the section's name in the object, or a wasm object's data segment
+name, and a linked image that has no named sections, as a flat image or a wasm
+module, holds none. The named section is created if absent, and the globals of
+one object that name it share that one section, each at its own aligned offset. A function's
 section holds code, a `var`'s writable data, a `val`'s read-only data and a
 `#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
@@ -840,6 +846,10 @@ A function or global that nothing refers to is not in the image, in a named
 section or not, unless it is stated with `#[at]`, so a table a loader or the
 hardware reads by its address, as an interrupt vector table, is stated with
 `#[at]` or referred to from the entry's code. Naming a section keeps nothing.
+
+A target that places no function in a section, as wasm and SPIR-V, refuses
+`section` on a function where it is written, and a target that does not address
+memory physically, as SPIR-V, refuses it on a global (`target.unsupported_op`).
 
 ### `at(offset)` — placement in the image
 
@@ -866,7 +876,9 @@ val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
   is the same address: from the start of the global's region, or from the base,
   where the image's first loaded byte lies. A system whose loader maps the
   image places it where it chooses, so an offset means nothing there, and mink
-  refuses it.
+  refuses it. A target that does not address memory physically, as SPIR-V, has
+  no image to place a global in, and refuses `at` where it is written
+  (`target.unsupported_op`).
 
 ### `export` — a shared library's export
 
@@ -1055,6 +1067,10 @@ a thread entry point whose register state at entry *is* the interface.
   entry and returns, where it switches the timing mode, and a naked body writes
   its own. Both combinations are rejected in sema. `inline("never")` is
   redundant: the inliner declines a naked function unconditionally.
+- **A target that writes every entry itself refuses it.** Wasm and SPIR-V
+  define each function's entry and return in their own form, so `naked` there
+  is refused where it is written (`target.unsupported_op`). A naked function
+  shared between targets is declared under a `$if` that leaves such a target out.
 - **No unwind entry.** A naked function states no frame, so the object holds no
   `.eh_frame` FDE, `.pdata` or compact unwind record for it, whatever the
   profile's `unwind` key says: its body is entered with no frame the compiler
@@ -1254,17 +1270,68 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   [manifest.md](manifest.md#stepname--build-steps) for the equivalent
   guarantee on `[step]` `in` entries.
 
+### `intrinsic(owner, set, name)` — a function that is an instruction or an operation
+
+A call of a function carrying this decorator is not a call: it becomes the
+instruction or operation the decorator names, inline. The three arguments are
+strings, and the first, the owner, says which of two forms the declaration is.
+
+**An architecture's instruction.** An owner that is an architecture name, the one
+the manifest's `arch` selects with, names an instruction of that target's
+instruction set. On the selected architecture a call is that instruction, its
+operands the parameters in order and its result the return type, checked against
+the target's table. On any other architecture the declaration is an ordinary
+function, so its body, if it has one, is what those targets run, and a bodyless
+one is left undefined there, so a call of it fails to link. SPIR-V is the target with a table today, and
+[gpu.md](gpu.md#intrinsictarget-set-name--a-function-that-is-a-target-instruction)
+describes the form, its sets and which instructions it may name.
+
+**One of mirl's own operations.** The reserved owner `"mirl"` names an operation
+of mirl, the compiler's intermediate language, and holds on every target. The set
+is `"ir"` and the name is the operation's:
+
+```mach
+#[intrinsic("mirl", "ir", "popcnt")]
+pub fun popcount(v: u64) u64;
+
+#[intrinsic("mirl", "ir", "clz")]
+pub fun clz(v: u32) u32;
+
+#[intrinsic("mirl", "ir", "ctz")]
+pub fun ctz(v: u8) u8;
+```
+
+The operations it may name are `popcnt`, `clz`, `ctz` and `bswap`: the bit count,
+the leading zero count, the trailing zero count and the byte reversal. A zero
+input counts as the operand's width, so `clz(0)` and `ctz(0)` of a `u64` are 64.
+`bswap` takes an integer of a whole number of bytes, and one byte reversed is
+itself. Every target computes them, with its own instruction where its selection
+has one and a short sequence where it does not.
+
+A call is the operation itself, as pure as mirl states it, so it folds on
+constants and moves and merges as any arithmetic does. A function value of the
+declaration calls a function the compiler defines, whose body is the operation.
+
+The declaration has no body, no type parameter, no `$` parameter and no pack, and
+each is refused with `op.signature`. An owner of `"mirl"` with a set other than
+`"ir"`, or a name it may not name, is refused with `op.unknown`. The signature is
+held to the operation's own typing where the function is declared, whether or not
+anything calls it: one parameter per operand, in order, refused with
+`op.operand_count`, each of the type the operand takes, and the return type the
+type the operation gives, each refused with `op.signature`. For all four that is
+one integer parameter, scalar or vector, and a return type of the same type, and
+for `bswap` the integer's width is a whole number of bytes. A
+secret parameter gives a secret result. These checks are part of building the
+module, so `mach check` does not make them.
+
 ### GPU decorators
 
 The `gpu.` decorators shape a pipeline stage and its workgroup, the shader
 interface and specialization constants. They, with the handle types a target
-mints (`handle`) and the functions that are target instructions (`intrinsic`),
-are described in [gpu.md](gpu.md). An `intrinsic` names any instruction of its
-set but one a construct of the language writes, which the refusal names, one that
-is no instruction a program writes, as a type or a decoration, and one that
-transfers control ([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)). v6 spelled the GPU set without its prefix
-(`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
-is refused naming its replacement, which takes the same arguments.
+mints (`handle`), are described in [gpu.md](gpu.md). v6 spelled the GPU set
+without its prefix (`#[stage]`, `#[input]` and the rest) and the instruction
+decorator `#[op]`. Each is refused naming its replacement, which takes the same
+arguments.
 
 ### `gpu.attachment(index)`: a subpass input's input attachment
 
@@ -1332,7 +1399,7 @@ a further rule the decorator's own section states.
 | `noreturn` | `fun`, `ext`, an `asm` statement | a function that states no result |
 | `extension` | `fun` | a function with a body |
 | `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
-| `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run |
+| `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run, and which has none for `"mirl"` |
 | `handle` | `def` | a `def` with no type, checked by `handle` itself |
 | `abi_type` | `def` | a `def` with no type, checked by `abi_type` itself |
 | `gpu.stage` | `fun` |  |

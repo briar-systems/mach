@@ -35,10 +35,13 @@ The directory's root module is [`mach.compile`](../compile.md).
 | [`union`](union.md) | the union build's targets, under which every gate is decided, and every artifact's entry |
 | [`unit`](unit.md) | one unit's object, normal or test, made in two steps: a unit is one module, or every module of an artifact where the target's family compiles it whole |
 | [`view`](view.md) | the texts of a unit a build writes beside its object when `--emit` names them: mirl's text of the module mach lowered, mirl's text of it after mirl's pass schedule, and masc's listing of the object |
-| [`workers`](workers.md) | the threads a codegen pass compiles on: a pool over std.sync.worker_pool that runs each task it is handed on a thread with the driver's stack reserve, then reports the task's index on a channel of finished indices, which only the owner reads |
+| [`wake`](wake.md) | the wait one thread ends for another, where the host has a second thread |
+| [`workers`](workers.md) | the threads a codegen pass compiles on, where the host has threads to give |
 
 | Directory | |
 | :--- | :--- |
 | [`backend/`](backend/README.md) | the back half a build hands its lowered modules to: the target mirl readies once for the build, on which compile/backend/compile has mirl compile each unit to mink's object in memory, mink laying an object out in the target's format or reading one back, and mink linking objects into an image |
 | [`cache/`](cache/README.md) | the persistent object cache |
+| [`wake/`](wake/README.md) | the wait one thread ends for another, where the host has a second thread |
+| [`workers/`](workers/README.md) | the threads a codegen pass compiles on, where the host has threads to give |
 

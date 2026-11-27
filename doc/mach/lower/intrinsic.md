@@ -136,7 +136,7 @@ declaration holds the record's shape, so a declaration refused there or one whos
 ### declared
 
 ```mach
-pub fun declared(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, op: *mach.front.sema.interface.Declaration, fn: mach.type.kind.TypeId) err[mach.base.fail.Fail]
+pub fun declared(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, op: mach.front.sema.interface.Native, fn: mach.type.kind.TypeId) err[mach.base.fail.Fail]
 ```
 
 the `#[intrinsic]` declaration `op` of the selected target, of function type `fn`, held to
