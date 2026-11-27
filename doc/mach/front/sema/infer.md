@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | [`infer_expr`](#infer_expr) | types the expression `eid` and everything under it, records the type, and reports what it finds to `sc` |
 | [`is_field_type_operand`](#is_field_type_operand) | whether `eid` is the `.type` member of a field or case descriptor, as a type comparison reads one |
 | [`field_seq_owner`](#field_seq_owner) | the record a `$fields(T)` sequence enumerates, its field table made ready |
-| [`case_seq_owner`](#case_seq_owner) | `$cases(T)` enumerates the cases of one public tag; a secret shape is refused because outer secrecy protects the active case, and a generic parameter defers to its instantiation |
+| [`case_seq_owner`](#case_seq_owner) | `$cases(T)` enumerates the cases of one tag, `^` or not, since naming a type's cases reads no value; a generic parameter defers to its instantiation |
 | [`type_is_generic_param`](#type_is_generic_param) | whether `ty` is a generic type parameter |
 
 ---
@@ -87,8 +87,8 @@ the record a `$fields(T)` sequence enumerates, its field table made ready
 pub fun case_seq_owner(sc: *mach.front.sema.context.SemaContext, seq_eid: mach.front.ast.id.ExprId, span: mach.base.source.Span) mach.type.kind.TypeId
 ```
 
-`$cases(T)` enumerates the cases of one public tag; a secret shape is refused because outer
-secrecy protects the active case, and a generic parameter defers to its instantiation
+`$cases(T)` enumerates the cases of one tag, `^` or not, since naming a type's cases reads no
+value; a generic parameter defers to its instantiation
 
 ### type_is_generic_param
 
