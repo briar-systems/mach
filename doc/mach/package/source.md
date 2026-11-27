@@ -30,6 +30,7 @@ Uses types from [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.v
 
 | On `Release` | |
 | :--- | :--- |
+| [`release_free`](#release_free) | free the strings a release owns |
 | [`releases_dnit`](#releases_dnit) | free every release in a list and then the list itself |
 
 | Constants | |
@@ -53,6 +54,14 @@ pub rec Release {
 
 one release: its version (whose pre-release text borrows from `text`), the tag that
 names it and the commit it points at, all owned by the list's allocator
+
+### release_free
+
+```mach
+pub fun release_free(a: *std.allocator.Allocator, r: *Release)
+```
+
+free the strings a release owns
 
 ### releases_dnit
 

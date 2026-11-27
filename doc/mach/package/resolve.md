@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.load`](../m
 | Type | | |
 | :--- | :--- | :--- |
 | [`Resolution`](#resolution) | `rec` | notes are the lines a command prints unless --quiet: an --offline resolution, and each requirement a root `ref` or `path` overrides |
-| [`OutdatedRow`](#outdatedrow) | `rec` | one version-selected identity as `mach dep outdated` shows it: the release its pin is ("-" for none), the highest this compiler and every range accept, and the highest published |
+| [`OutdatedRow`](#outdatedrow) | `rec` | one version-selected identity as `mach dep outdated` shows it: the release its pin is ("-" for none, "unknown" when it cannot be read), the highest this compiler and every range accept, and the highest published |
 | [`Outdated`](#outdated) | `rec` | what `mach dep outdated` shows: the resolution's notes, whether any identity selects releases by version, and a row for each that does |
 
 | On `Resolution` | |
@@ -76,7 +76,7 @@ pub rec OutdatedRow {
 ```
 
 one version-selected identity as `mach dep outdated` shows it: the release its pin is ("-"
-for none), the highest this compiler and every range accept, and the highest published
+for none, "unknown" when it cannot be read), the highest this compiler and every range accept, and the highest published
 
 ## Outdated
 
