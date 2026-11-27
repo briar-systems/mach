@@ -110,9 +110,14 @@ A character literal is a `u8` and is refused the same way.
 
 An argument of 32 bits or wider passes as written: `i32`/`u32`, `i64`/`u64`, `f64`,
 any pointer, and a record or vector passed by value. A **secret** (`^T`) may not
-enter a variadic tail: the callee is foreign code that prints or logs the value, so
-it is an observation boundary. Declassify it with `:>T` first. The refusal is
-`secret.variadic`.
+enter a variadic tail: its arguments have no declared type for the value to stay
+`^` in, and a secret reaches a public place only by an explicit declassification.
+Write `:>T` to pass it. The refusal is `secret.variadic`.
+
+A pack spread into the tail (`log(fmt, va...)` inside `fun f(fmt: *u8, va: ...)`)
+is one tail argument per element. The template has no element types to check, so
+each instance checks its own at the spread with both rules above, and reports at
+the call that formed the instance, pointing into the body at the spread.
 
 ### Per-target argument passing
 

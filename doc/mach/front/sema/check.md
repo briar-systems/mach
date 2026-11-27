@@ -205,7 +205,7 @@ the position of a parameter or field in it
 ### check_call
 
 ```mach
-pub fun check_call(sc: *mach.front.sema.context.SemaContext, callee: mach.front.ast.id.ExprId, callee_sig: mach.type.kind.TypeId, args_start: u32, args_len: u32, span: mach.base.source.Span, pack_to_c_tail: bool) bool
+pub fun check_call(sc: *mach.front.sema.context.SemaContext, callee: mach.front.ast.id.ExprId, callee_sig: mach.type.kind.TypeId, args_start: u32, args_len: u32, span: mach.base.source.Span) bool
 ```
 
 check a call's arguments against the callee's signature: the count, each fixed argument's
@@ -219,7 +219,6 @@ type, pack spreads, and what a C-variadic or pack argument may be
 | `args_start` | the first argument in the module's expression id list |
 | `args_len` | how many arguments |
 | `span` | where a refusal of the callee or the count is reported |
-| `pack_to_c_tail` | whether the pack's elements reach a C-variadic tail, so each is held to its rules |
 | **returns** | true when the call holds or the callee's type is an error |
 
 ### check_comptime_call
