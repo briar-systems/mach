@@ -113,6 +113,7 @@ pub rec Choice {
     tag:     str;
     commit:  str;
     version: str;
+    chain:   str;
 }
 ```
 
@@ -125,4 +126,5 @@ the release resolution selected for one identity, its texts owned by the caller'
 | `tag` | `str` | the tag that names the release |
 | `commit` | `str` | the commit the tag points at |
 | `version` | `str` | the release's version text |
+| `chain` | `str` | the projects from the root that require it, the root first and the identity last |
 

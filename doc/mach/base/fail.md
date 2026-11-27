@@ -28,14 +28,14 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`environment`](#environment) | the machine refused: a file could not be read or written, a tool could not be spawned |
 | [`owning`](#owning) | the same failure owning its text, which was allocated through the allocator its holder releases it with (`dnit`); a reported failure carries none |
 | [`as_user`](#as_user) | a failure the user caused met by a phase that cannot classify it (target selection, source loading, import libraries): an internal text becomes the user class under `k`, a keyed failure keeps its own class and kind, a reported failure stays reported |
-| [`as_internal`](#as_internal) | a failure met on input the compiler produced itself (an object it wrote, a module it emitted): whatever the check says of the input, it is the compiler's defect, an internal failure keeping the text and the place |
-| [`defect`](#defect) | the compiler's defect a failure names, borrowing its text and keeping its place, for a holder of the first defect a phase met: an internal failure as it is, a keyed one as the defect its text names, and a reported one as the defect of being handed one, since its diagnostics name no defect of their own |
+| [`as_internal`](#as_internal) | a failure met on input the compiler produced itself (an object it wrote, a module it emitted): whatever the check says of the input, it is the compiler's defect, an internal failure keeping the text, the place and the notes, as it owned them |
+| [`defect`](#defect) | the compiler's defect a failure names, borrowing its text and notes and keeping its place, for a holder of the first defect a phase met: an internal failure as it is, a keyed one as the defect its text names, and a reported one as the defect of being handed one, since its diagnostics name no defect of their own |
 | [`at`](#at) | the same failure pointing at `at`, a location of the source map its caller reads |
 | [`spanned`](#spanned) | the same failure pointing at the span `s` of the file that caused it, which `placed` names, as `at` points it |
 | [`placed`](#placed) | the same failure with every span still waiting for its file, its own, each related one and each fix edit's, placed in `file` |
 | [`with_related`](#with_related) | the same failure naming the `n` locations at `locs` as its related places, in order, each unlabelled; a nil location is skipped |
 | [`with_fix`](#with_fix) | the same failure carrying the rewrite `label` names, which replaces the span `s` of the file the failure points into, or the bytes it points at when `s` is none, with `replacement` |
-| [`with_note`](#with_note) | the same failure carrying `text` as a note after any it carries, a line saying more than the failure's text, such as how the input it concerns was reached |
+| [`with_note`](#with_note) | the same failure carrying `text` as a note after any it carries, a line saying more than the failure's text: how the input it concerns was reached, or a failure met cleaning up after it |
 | [`notes_of`](#notes_of) | the notes a failure carries, in order, empty for one that carries none; they share the failure's places' lifetime |
 | [`fix_of`](#fix_of) | the rewrite a failure carries, none when it carries no fix; it shares the failure's places' lifetime |
 | [`related_of`](#related_of) | the related places a failure names, empty for one that names no other; they share the failure's places' lifetime |
@@ -48,7 +48,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`text`](#text) | the text a failure carries, absent for a reported one |
 | [`describe`](#describe) | the failure as one line of presentation text, borrowed from the failure, or REPORTED_TEXT for a reported one |
 | [`with_text`](#with_text) | the same failure carrying `text` instead, which it borrows: the class, the kind and the places are kept |
-| [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed): the text gains " |
+| [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed), as the note "cleanup also failed: " and the secondary's text, made through `a`: the text, class, kind and places stay the failure's |
 | [`retain`](#retain) | a copy of the failure that owns its text and its places through `a`, for a failure that outlives the storage its message was made in; released with `dnit` |
 | [`dnit`](#dnit) | release what a failure owns through `a`: its text and its places, each when it owns them |
 | [`places_retain`](#places_retain) | a copy of the failure whose places, every related place, its notes and its fix, are owned through `a`, its text left as it is; for a holder that keeps the text apart |
@@ -189,8 +189,8 @@ pub fun as_internal(f: Fail) Fail
 
 a failure met on input the compiler produced itself (an object it wrote, a
 module it emitted): whatever the check says of the input, it is the
-compiler's defect, an internal failure keeping the text and the place. a
-reported failure stays reported
+compiler's defect, an internal failure keeping the text, the place and the notes, as it
+owned them. a reported failure stays reported
 
 ### defect
 
@@ -198,7 +198,7 @@ reported failure stays reported
 pub fun defect(f: Fail) Fail
 ```
 
-the compiler's defect a failure names, borrowing its text and keeping its place, for a
+the compiler's defect a failure names, borrowing its text and notes and keeping its place, for a
 holder of the first defect a phase met: an internal failure as it is, a keyed one as the
 defect its text names, and a reported one as the defect of being handed one, since its
 diagnostics name no defect of their own
@@ -262,9 +262,10 @@ pub fun with_note(a: *std.allocator.Allocator, f: Fail, text: str) Fail
 ```
 
 the same failure carrying `text` as a note after any it carries, a line saying more than the
-failure's text, such as how the input it concerns was reached. the text is copied, so the
-failure owns its places through `a` as `places_retain` leaves them. a failure with no kind
-carries none, and one whose copy is refused is that refusal
+failure's text: how the input it concerns was reached, or a failure met cleaning up after it.
+the text is copied, so the failure owns its places through `a` as `places_retain` leaves them.
+a reported failure and an allocation refusal carry none, and one whose copy is refused is that
+refusal
 
 ### notes_of
 
@@ -376,15 +377,13 @@ kind and the places are kept. text the failure is to own goes through
 pub fun with_secondary(a: *std.allocator.Allocator, f: Fail, secondary: Fail) Fail
 ```
 
-the same failure also naming `secondary`, a failure met while releasing what
-the failing path held (a child cancelled, a file removed, a source closed):
-the text gains ". cleanup also failed (" and the secondary's, joined into
-`a`, and the class, kind and places stay the failure's. a reported failure
-has no text to carry it, so the secondary goes out in its place, the reported
-diagnostics already recorded, and a reported secondary already named itself.
-a refused join leaves the failure as it was, as `prefixed` does, so the
-secondary never takes the failure's place. the joined text is owned through
-`a`; a failure returned as it was keeps the ownership it had
+the same failure also naming `secondary`, a failure met while releasing what the failing path
+held (a child cancelled, a file removed, a source closed), as the note "cleanup also failed: "
+and the secondary's text, made through `a`: the text, class, kind and places stay the
+failure's. a reported failure has no text to carry it, so the secondary goes out in its place,
+the reported diagnostics already recorded, and a reported secondary already named itself. a
+refused note leaves the failure as it was, so the secondary never takes the failure's place,
+and an allocation refusal carries no note
 
 ### retain
 

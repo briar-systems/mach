@@ -126,7 +126,11 @@ related places and its notes. Its `severity` is `"error"`, its `code` the
 failure's key, its `notes` the lines the failure carries, in order, and its
 `help` is empty. A refusal of a dependency's manifest carries one note naming
 the chain of projects from the root that reaches the dependency, such as
-`"reached through app -> lib"`.
+`"reached through app -> lib"`. A failure met while cleaning up after the
+failure is a note on it, such as `"cleanup also failed: cannot remove the build
+step staging area '...' (permission denied)"`, and so is a later check of a
+build step that also failed, such as `"the step also failed: ..."`. The
+`message` is always the primary failure's own text.
 
 ```json
 {"schema":3,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`. an image takes its entry symbol from a module its artifact's entry reaches, so write a `use` of the module that defines it in that entry","origin":"link","primary":{"file":"mach.toml","line":43,"column":9,"end_line":43,"end_column":24,"byte_start":622,"byte_end":637},"related":[],"notes":[],"help":[],"fixes":[]}

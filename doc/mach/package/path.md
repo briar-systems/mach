@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`verify`](#verify) | what `mach dep verify` checks of a path dependency's copy: no repository metadata and no symlink anywhere in it |
-| [`realize`](#realize) | sync dep/\<id> with a path dependency's source |
+| [`realize`](#realize) | sync dep/\<id> with a path dependency's source, `chain` the projects from the root that require it |
 
 | Constants | |
 | :--- | :--- |
@@ -41,10 +41,10 @@ symlink anywhere in it
 ### realize
 
 ```mach
-pub fun realize(s: *mach.session.Session, root: str, id: str, src_dir: str, rep: *mach.package.report.Report) res[u8, mach.base.fail.Fail]
+pub fun realize(s: *mach.session.Session, root: str, id: str, chain: str, src_dir: str, rep: *mach.package.report.Report) res[u8, mach.base.fail.Fail]
 ```
 
-sync dep/\<id> with a path dependency's source
+sync dep/\<id> with a path dependency's source, `chain` the projects from the root that require it
 
 | Parameter | |
 | :--- | :--- |

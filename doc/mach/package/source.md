@@ -127,6 +127,7 @@ a member of the releases half of the source contract
 pub rec Acquisition {
     root:        str;
     id:          str;
+    chain:       str;
     url:         str;
     selector:    str;
     mode:        u8;
@@ -139,7 +140,8 @@ pub rec Acquisition {
 one acquisition of dep/\<id>: bring it to `selector` from `url` and record its pin as the
 project records pins (`mode`, a pin.mach mode). `accept` takes an existing checkout as the
 dependency, as `mach dep add` does; `pinned_only` is a selection by range alone, which
-acquires only what a pin or an existing checkout already names
+acquires only what a pin or an existing checkout already names. `chain` names the projects
+from the root that require it, the root first and `id` last
 
 ## Checkouts
 

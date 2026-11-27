@@ -110,7 +110,7 @@ a realization and passes
 ### verify_dep_manifest_id
 
 ```mach
-pub fun verify_dep_manifest_id(s: *mach.session.Session, dep_full: str, id: str) err[mach.base.fail.Fail]
+pub fun verify_dep_manifest_id(s: *mach.session.Session, dep_full: str, id: str, chain: str) err[mach.base.fail.Fail]
 ```
 
 check that the manifest of a realized dependency declares the id it is realized under, read
@@ -123,7 +123,8 @@ range, with every chain that reaches it
 | `s` | the session whose allocator, interner and source map read the manifest |
 | `dep_full` | the dependency's root directory |
 | `id` | the identity it is realized under, its directory name under dep/ |
-| **returns** | ok when the declared id matches, err when the manifest cannot be read, declares another id or fails the schema, which refuses one declaring none |
+| `chain` | the projects from the root that require it, the root first and `id` last |
+| **returns** | ok when the declared id matches, err when the manifest cannot be read, declares another id or fails the schema, which refuses one declaring none; a manifest that cannot be read or fails the schema is refused as the dependency's, naming `chain` |
 
 ### dep_rel_of
 
