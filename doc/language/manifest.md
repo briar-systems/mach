@@ -2419,7 +2419,9 @@ another key or a damaged record, links as before.
 
 `--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`
-removes the tree with the rest of the output.
+removes the tree with the rest of the output. `--verify` and `--passes` build
+the same way, since a cached object carries no verifier run and no pass report:
+a build asked to verify or to report compiles every module and links again.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step

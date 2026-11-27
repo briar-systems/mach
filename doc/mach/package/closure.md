@@ -43,6 +43,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`acquire`](#acquire) | acquire a git dependency's slot through the source and report what changed; `accept` is add taking an existing checkout, and `pinned_only` a range with no selector, which only a pin or an existing checkout realizes |
 | [`preflight`](#preflight) | a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the revision its selector picks, never from whatever its checkout holds |
 | [`effects`](#effects) | a note for each change made before a failure, which the caller shows after it |
+| [`root_manifest`](#root_manifest) | the root project's manifest, held to every check the manifest makes before a dependency command acts on it: it is the user's own, so unlike a dependency's it is never read past a refusal |
 
 | On `Request` | |
 | :--- | :--- |
@@ -187,6 +188,21 @@ pub fun effects(op: *Operation, reqs: *Vector[Request])
 ```
 
 a note for each change made before a failure, which the caller shows after it
+
+### root_manifest
+
+```mach
+pub fun root_manifest(op: *Operation) res[mach.manifest.load.Doc, mach.base.fail.Fail]
+```
+
+the root project's manifest, held to every check the manifest makes before a dependency
+command acts on it: it is the user's own, so unlike a dependency's it is never read past a
+refusal
+
+| Parameter | |
+| :--- | :--- |
+| `op` | the operation, on the project root |
+| **returns** | the document, which the caller frees with doc_dnit; err when it cannot be read or is refused |
 
 ## Request
 
