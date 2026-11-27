@@ -10,7 +10,7 @@ Source: [`src/host/subprocess.mach`](../../../src/host/subprocess.mach)
 
 | Forwards | |
 | :--- | :--- |
-| [`STATE_UNSTARTED`](#state_unstarted), [`STATE_SPAWN_FAILURE`](#state_spawn_failure), [`STATE_EXITED`](#state_exited), [`STATE_SIGNALED`](#state_signaled), [`SubprocessTerminal`](#subprocessterminal), [`CaptureIoResult`](#captureioresult), [`SpawnOptions`](#spawnoptions), [`spawn_options`](#spawn_options), [`Error`](#error), [`refusal`](#refusal), [`refusal_of`](#refusal_of), [`resolve`](#resolve), [`OwnedSubprocess`](#ownedsubprocess), [`init`](#init), [`bound`](#bound), [`expired`](#expired), [`dnit`](#dnit), [`spawn`](#spawn), [`spawn_native`](#spawn_native), [`running`](#running), [`wait`](#wait), [`wait_any`](#wait_any), [`finish_capture`](#finish_capture), [`abandon_capture`](#abandon_capture), [`capture_bytes`](#capture_bytes), [`capture_dnit`](#capture_dnit), [`timeout`](#timeout), [`cancel`](#cancel) | |
+| [`STATE_UNSTARTED`](#state_unstarted), [`STATE_SPAWN_FAILURE`](#state_spawn_failure), [`STATE_EXITED`](#state_exited), [`STATE_SIGNALED`](#state_signaled), [`SubprocessTerminal`](#subprocessterminal), [`CaptureIoResult`](#captureioresult), [`SpawnOptions`](#spawnoptions), [`spawn_options`](#spawn_options), [`Error`](#error), [`refusal`](#refusal), [`refusal_of`](#refusal_of), [`reason`](#reason), [`unable`](#unable), [`resolve`](#resolve), [`OwnedSubprocess`](#ownedsubprocess), [`init`](#init), [`bound`](#bound), [`expired`](#expired), [`dnit`](#dnit), [`spawn`](#spawn), [`spawn_native`](#spawn_native), [`running`](#running), [`wait`](#wait), [`wait_any`](#wait_any), [`finish_capture`](#finish_capture), [`abandon_capture`](#abandon_capture), [`capture_bytes`](#capture_bytes), [`capture_dnit`](#capture_dnit), [`timeout`](#timeout), [`cancel`](#cancel) | |
 
 ---
 
@@ -167,6 +167,33 @@ pub fun refusal_of(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kin
 
 the machine's refusal `e` of `op`, which names the child as its caller knows it
 (a runner, a build step); an allocation refusal is internal
+
+### reason
+
+Forwards the first of these whose condition holds:
+
+- [`mach.host.subprocess.native.reason`](subprocess/native.md#reason), where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_PROCESS && capability.HAS_THREADS`
+- [`mach.host.subprocess.absent.reason`](subprocess/absent.md#reason), otherwise
+
+```mach
+pub fun reason(e: Error) str
+```
+
+what refused in `e`, static, for a line that names the child itself (a test that could not be
+launched); a failure goes through `refusal`
+
+### unable
+
+Forwards the first of these whose condition holds:
+
+- [`mach.host.subprocess.native.unable`](subprocess/native.md#unable), where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_PROCESS && capability.HAS_THREADS`
+- [`mach.host.subprocess.absent.unable`](subprocess/absent.md#unable), otherwise
+
+```mach
+pub fun unable(identity: str) opt[Error]
+```
+
+none: this host starts processes, so nothing is refused before a spawn is tried
 
 ### resolve
 

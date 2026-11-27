@@ -28,6 +28,8 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`failure`](#failure) | the refusal `cause`, named by `identity` |
 | [`refusal`](#refusal) | the machine's refusal `e` to `verb` the child, an environment failure under `k` naming the child and, when `cwd` is given, the directory it runs in; an allocation refusal is internal |
 | [`refusal_of`](#refusal_of) | the machine's refusal `e` of `op`, which names the child as its caller knows it (a runner, a build step); an allocation refusal is internal |
+| [`reason`](#reason) | what refused in `e`, static, for a line that names the child itself (a test that could not be launched); a failure goes through `refusal` |
+| [`unable`](#unable) | none: this host starts processes, so nothing is refused before a spawn is tried |
 | [`resolve`](#resolve) | the program `name` names on PATH, as a path a spawn takes |
 
 | On `OwnedSubprocess` | |
@@ -100,6 +102,23 @@ pub fun refusal_of(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kin
 
 the machine's refusal `e` of `op`, which names the child as its caller knows it
 (a runner, a build step); an allocation refusal is internal
+
+### reason
+
+```mach
+pub fun reason(e: Error) str
+```
+
+what refused in `e`, static, for a line that names the child itself (a test that could not be
+launched); a failure goes through `refusal`
+
+### unable
+
+```mach
+pub fun unable(identity: str) opt[Error]
+```
+
+none: this host starts processes, so nothing is refused before a spawn is tried
 
 ### resolve
 
