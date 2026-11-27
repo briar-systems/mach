@@ -73,5 +73,6 @@ as `example.<path>`.
 A block is laid out as `mach fmt` writes it. Output a page shows is copied from
 a real run, in a `text` block.
 
-The site builds every block that is not a fragment against each release, runs
-the programs among them and holds the refused ones to their text.
+No check builds these blocks, here or on the site, so a fence is its author's
+claim. Build a block with the compiler the page ships with before giving it a
+fence that says it builds.
