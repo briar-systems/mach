@@ -36,13 +36,12 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | :--- | :--- |
 | [`init`](#init) | an empty linkage record whose tables allocate from `alloc` |
 | [`dnit`](#dnit) | release every table of `l` |
-| [`clear`](#clear) | forget every declaration and import, as a project does when its module registry is reset |
 | [`register_export_name`](#register_export_name) | record the name declaration `did` of `mid` is exported under, replacing an earlier one |
 | [`forget_names`](#forget_names) | drop every export name and linkage name of one module's declarations, before its syntax tree is replaced and its declaration ids no longer name the same declarations |
 | [`export_name`](#export_name) | the name declaration `did` of `mid` is exported under, nil when it names none |
 | [`register_export_library`](#register_export_library) | record the library declaration `did` of `mid` is imported from, replacing an earlier one |
 | [`export_library`](#export_library) | the library declaration `did` of `mid` is imported from, nil when it names none |
-| [`register_import_library`](#register_import_library) | pin the imported symbol `name`, known as `sort`, to the library `lib` |
+| [`register_import_library`](#register_import_library) | pin the imported symbol `name`, known as `sort`, to the library `lib`, `listed` when the library's link entry lists it |
 | [`import_library`](#import_library) | the library the imported symbol `name` is pinned to, nil when it is pinned to none |
 
 ---
@@ -65,9 +64,10 @@ what the build knows an imported symbol to be
 
 ```mach
 pub rec Import {
-    name: mach.base.intern.StrId;
-    lib:  mach.base.intern.StrId;
-    sort: Sort;
+    name:   mach.base.intern.StrId;
+    lib:    mach.base.intern.StrId;
+    sort:   Sort;
+    listed: bool;
 }
 ```
 
@@ -78,6 +78,7 @@ an imported symbol pinned to a library
 | `name` | `mach.base.intern.StrId` | its link name |
 | `lib` | `mach.base.intern.StrId` | the library's key |
 | `sort` | `Sort` | what the build knows it to be |
+| `listed` | `bool` | whether the library's link entry lists it, so every object claims it, referring to it or not |
 
 ## Named
 
@@ -176,15 +177,6 @@ release every table of `l`
 | :--- | :--- |
 | `l` | the linkage to release |
 
-### clear
-
-```mach
-pub fun clear(l: *Linkage)
-```
-
-forget every declaration and import, as a project does when its
-module registry is reset
-
 ### register_export_name
 
 ```mach
@@ -251,11 +243,12 @@ the library declaration `did` of `mid` is imported from, nil when it names none
 ### register_import_library
 
 ```mach
-pub fun register_import_library(l: *Linkage, name: mach.base.intern.StrId, lib: mach.base.intern.StrId, sort: Sort) err[mach.base.fail.Fail]
+pub fun register_import_library(l: *Linkage, name: mach.base.intern.StrId, lib: mach.base.intern.StrId, sort: Sort, listed: bool) err[mach.base.fail.Fail]
 ```
 
-pin the imported symbol `name`, known as `sort`, to the library `lib`. a symbol pinned
-again takes the later pin, a sort the earlier one left unstated included
+pin the imported symbol `name`, known as `sort`, to the library `lib`, `listed` when the
+library's link entry lists it. a symbol pinned again takes the later pin, a sort the earlier
+one left unstated included, and stays listed once a pin lists it
 
 ### import_library
 
