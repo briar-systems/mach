@@ -13,6 +13,8 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Functions | |
 | :--- | :--- |
+| [`placed`](#placed) | `rel`, a path relative to the project root, placed beneath `root` |
+| [`relative`](#relative) | `path`, which `placed` put beneath `root`, relative to the root, as a view into it |
 | [`under`](#under) | `tree` beneath the work directory `work` |
 | [`within`](#within) | `name` within `tree` beneath `work`: a project's objects, a tested artifact's runs, a step's staging or a dependency's artifacts |
 
@@ -33,6 +35,33 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 ---
 
 ## Functions
+
+### placed
+
+```mach
+pub fun placed(a: *std.allocator.Allocator, root: str, rel: str) res[str, mach.base.fail.Fail]
+```
+
+`rel`, a path relative to the project root, placed beneath `root`. past the root a
+build spells every path it places with `/` on every host, which windows reads as it
+reads its own separator, so `relative` reads a placed path back with no host rule
+
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the path |
+| **returns** | the path; err when it cannot be formatted |
+
+### relative
+
+```mach
+pub fun relative(root: str, path: str) str
+```
+
+`path`, which `placed` put beneath `root`, relative to the root, as a view into it
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the relative path, nil when `path` is not beneath `root` or names the root itself |
 
 ### under
 

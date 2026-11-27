@@ -22,6 +22,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | :--- | :--- |
 | [`state`](#state) | add to `o` the claims of every link requirement of `p`'s unit, nothing for none |
 | [`described`](#described) | whether the link makes the library the requirement `req` names from its claim: a shared system library on a target whose link does, which no file is looked for for |
+| [`pin_listed`](#pin_listed) | pin each symbol a link entry of `p`'s unit lists to the entry's library, under the name the target's objects spell it with |
 
 ---
 
@@ -43,4 +44,15 @@ pub fun described(req: *mach.manifest.link.LinkRequirement, describes: bool) boo
 
 whether the link makes the library the requirement `req` names from its claim: a
 shared system library on a target whose link does, which no file is looked for for
+
+### pin_listed
+
+```mach
+pub fun pin_listed(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
+```
+
+pin each symbol a link entry of `p`'s unit lists to the entry's library, under the name the
+target's objects spell it with. the names are made here, before any pass, since a pass on a
+crew names strings only by merging units, and every claim and the link read them from the pins.
+a symbol two libraries claim is refused
 
