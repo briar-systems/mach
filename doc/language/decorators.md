@@ -1285,11 +1285,12 @@ pub fun clz(v: u32) u32;
 pub fun ctz(v: u8) u8;
 ```
 
-The operations it may name are `popcnt`, `clz` and `ctz`, the bit count, the
-leading zero count and the trailing zero count. A zero input counts as the
-operand's width, so `clz(0)` and `ctz(0)` of a `u64` are 64. Every target computes
-them, with its own instruction where its selection has one and a short sequence
-where it does not.
+The operations it may name are `popcnt`, `clz`, `ctz` and `bswap`: the bit count,
+the leading zero count, the trailing zero count and the byte reversal. A zero
+input counts as the operand's width, so `clz(0)` and `ctz(0)` of a `u64` are 64.
+`bswap` takes an integer of a whole number of bytes, and one byte reversed is
+itself. Every target computes them, with its own instruction where its selection
+has one and a short sequence where it does not.
 
 A call is the operation itself, as pure as mirl states it, so it folds on
 constants and moves and merges as any arithmetic does. A function value of the
@@ -1301,8 +1302,9 @@ each is refused with `op.signature`. An owner of `"mirl"` with a set other than
 held to the operation's own typing where the function is declared, whether or not
 anything calls it: one parameter per operand, in order, refused with
 `op.operand_count`, each of the type the operand takes, and the return type the
-type the operation gives, each refused with `op.signature`. For these three that
-is one integer parameter, scalar or vector, and a return type of the same type. A
+type the operation gives, each refused with `op.signature`. For all four that is
+one integer parameter, scalar or vector, and a return type of the same type, and
+for `bswap` the integer's width is a whole number of bytes. A
 secret parameter gives a secret result. These checks are part of building the
 module, so `mach check` does not make them.
 
