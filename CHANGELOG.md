@@ -9,6 +9,12 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+### Changed
+- Builds against masc 0.2.0 and mirl 0.3.2, whose WebAssembly objects state each imported function from names the object already holds (#5016).
+
+### Fixed
+- A WebAssembly object names each function it imports from another object, as a call into std or an `ext fun` linked from an archive, by the function's own name. It could name one by bytes the compiler had already freed, so the link refused the build over a garbled undefined symbol, or a `wasi` module imported the garbled name in place of what the call needed (#5016).
+
 ## [7.2.0] - 2026-11-26
 
 ### Added
