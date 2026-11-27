@@ -4,7 +4,9 @@
 # requirement on it is overridden
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
+use fs:         std.filesystem;
 use std_format: std.format;
+use io_error:   std.io.error;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -13,7 +15,9 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.StrError;
 use std.types.string.str;
+use std.types.string.str_copy;
 use std.types.string.str_equals;
 use std.types.string.str_is_empty;
 use std.types.string.str_starts_with;
@@ -86,6 +90,47 @@ fun lock_push(a: *A.Allocator, locks: *Vector[resolver.Lock], id: str, version: 
     if (sel res_pushed.err) { str_free(a, version); }
 }
 
+# what dep/<id> holds as a lock reads it
+# ---
+# absent:   no checkout, so nothing to keep where it is
+# untagged: a checkout no local release tag names the pin of
+# held:     the release the pin is, freed by its reader
+tag Pinned: u8 {
+    absent;
+    untagged;
+    held: package_source.Release;
+}
+
+# what dep/<id> holds, its tags fetched first when `fetch` and none names its pin. a checkout
+# whose pin cannot be read is refused, naming the dependency and keeping the failure's kind,
+# since leaving it unlocked would let the command move a dependency it was not asked to move
+fun pinned_release(op: *package_closure.Operation, id: str, fetch: bool) res[Pinned, fail.Fail] {
+    val res_full: res[str, fail.Fail] = package.dep_full_of(op.a, op.root, id);
+    if (sel res_full.err) { ret res[Pinned, fail.Fail].err{res_full.err}; }
+    val res_is_dir: res[bool, io_error.Error] = fs.is_dir(res_full.ok);
+    if (sel res_is_dir.err) {
+        ret res[Pinned, fail.Fail].err{unreadable_pin(op, id, fail.user(diagnostic_kind.FS_READ, fail.cause_text(fail.Cause.io{res_is_dir.err})))};
+    }
+    if (!res_is_dir.ok) { ret res[Pinned, fail.Fail].ok{Pinned.absent{}}; }
+    val res_held: res[opt[package_source.Release], fail.Fail] = op.checkouts.release_at(op.checkouts.ctx, op.root, id, res_full.ok, fetch);
+    if (sel res_held.err) {
+        if (fail.is_message(res_held.err)) { ret res[Pinned, fail.Fail].err{res_held.err}; }
+        ret res[Pinned, fail.Fail].err{unreadable_pin(op, id, res_held.err)};
+    }
+    val held: opt[package_source.Release] = res_held.ok;
+    if (sel held.none) { ret res[Pinned, fail.Fail].ok{Pinned.untagged{}}; }
+    ret res[Pinned, fail.Fail].ok{Pinned.held{held.some}};
+}
+
+# `cause`, the failure to read the pin of dependency `id`, restated as the refusal of the command
+fun unreadable_pin(op: *package_closure.Operation, id: str, cause: fail.Fail) fail.Fail {
+    val res_text: res[str, std_format.FormatError] = std_format.sprint(op.a,
+        "the pin of dependency '{}' cannot be read ({}), so nothing is moved. run `mach dep pull <path>` for project '{}' to restore its checkout",
+        id, fail.describe(cause), op.root);
+    if (sel res_text.err) { ret fail.format_refused(res_text.err); }
+    ret fail.owning(fail.with_text(cause, res_text.ok));
+}
+
 fun locks_dnit(a: *A.Allocator, locks: *Vector[resolver.Lock]) {
     var i: usize = 0;
     for (i < locks.len) {
@@ -93,6 +138,95 @@ fun locks_dnit(a: *A.Allocator, locks: *Vector[resolver.Lock]) {
         i = i + 1;
     }
     collections_vector.dnit[resolver.Lock](locks);
+}
+
+# the release each realized version-selected checkout of the closure `doc` reaches is
+# pinned at, but `unlocked`'s, read before a command moves anything so that it moves no
+# dependency it was not asked to: a pin that cannot be read, or that no release tag names
+# once its tags are fetched, refuses the command. every pin is read before any checkout
+# fetches tags, and `offline` fetches none
+# ---
+# op:       the operation
+# doc:      the manifest as it stands before the command
+# unlocked: the identity the command may move, nil for none
+# offline:  fetch no tags
+# out:      receives each lock, its id and version owned, freed by `held_dnit`
+# ret:      ok, or the refusal naming the dependency whose pin cannot be read
+pub fun held_locks(op: *package_closure.Operation, doc: *manifest_load.Doc, unlocked: str, offline: bool, out: *Vector[resolver.Lock]) err[fail.Fail] {
+    val a:       *A.Allocator                    = op.a;
+    var closure: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    fin { package_closure.requests_dnit(a, ?closure); }
+    var walk:       package_closure.Walk = package_closure.Walk{offline: true, all: false, name: nil, quiet: true};
+    val err_walked: err[fail.Fail]       = package_closure.preflight(op, doc, ?closure, true, ?walk);
+    if (sel err_walked.err) { ret err_walked; }
+    var untagged: Vector[str] = collections_vector.init[str](a);
+    fin { collections_vector.dnit[str](?untagged); }
+    var i: usize = 0;
+    for (i < closure.len) {
+        val r: *package_closure.Request = ?closure.data[i];
+        i = i + 1;
+        if (!package_closure.selects_release(r))           { cnt; }
+        if (unlocked != nil && str_equals(r.id, unlocked)) { cnt; }
+        val res_pinned: res[Pinned, fail.Fail] = pinned_release(op, r.id, false);
+        if (sel res_pinned.err) { ret err[fail.Fail].err{res_pinned.err}; }
+        val pinned: Pinned = res_pinned.ok;
+        if (sel pinned.held) {
+            val err_kept: err[fail.Fail] = hold(op, out, r.id, pinned.held);
+            if (sel err_kept.err) { ret err_kept; }
+        }
+        or (sel pinned.untagged) {
+            if (offline) { ret err[fail.Fail].err{untagged_pin(op, r.id)}; }
+            collections_vector.push[str](?untagged, r.id);
+        }
+    }
+    i = 0;
+    for (i < untagged.len) {
+        val id: str = untagged.data[i];
+        i = i + 1;
+        val res_pinned: res[Pinned, fail.Fail] = pinned_release(op, id, true);
+        if (sel res_pinned.err) { ret err[fail.Fail].err{res_pinned.err}; }
+        val pinned: Pinned = res_pinned.ok;
+        if (!sel pinned.held) { ret err[fail.Fail].err{untagged_pin(op, id)}; }
+        val err_kept: err[fail.Fail] = hold(op, out, id, pinned.held);
+        if (sel err_kept.err) { ret err_kept; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# keep `rel`, the release dep/<id> is pinned at, as a held lock owning its id and version
+fun hold(op: *package_closure.Operation, out: *Vector[resolver.Lock], id: str, rel: package_source.Release) err[fail.Fail] {
+    val a: *A.Allocator = op.s.build_alloc;
+    str_free(a, rel.tag);
+    str_free(a, rel.commit);
+    val res_id: res[str, StrError] = str_copy(a, id);
+    if (sel res_id.err) {
+        str_free(a, rel.text);
+        ret err[fail.Fail].err{fail.message("a held lock's id could not be copied")};
+    }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[resolver.Lock](out, resolver.Lock{id: res_id.ok, version: rel.text});
+    if (sel res_pushed.err) {
+        str_free(a, res_id.ok);
+        str_free(a, rel.text);
+        ret err[fail.Fail].err{fail.refused(res_pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# release the locks `held_locks` read
+pub fun held_dnit(op: *package_closure.Operation, held: *Vector[resolver.Lock]) {
+    var i: usize = 0;
+    for (i < held.len) {
+        str_free(op.s.build_alloc, held.data[i].id);
+        i = i + 1;
+    }
+    locks_dnit(op.s.build_alloc, held);
+}
+
+# the refusal of a dependency whose pin no release tag names, which no lock can keep in place
+fun untagged_pin(op: *package_closure.Operation, id: str) fail.Fail {
+    ret fail.formatted_user(op.a, diagnostic_kind.DEP_UNPINNED,
+        "no release tag in the checkout of dependency '{}' names its pin, so it cannot be kept where it is and nothing is moved. run `mach dep pull <path>` for project '{}' to fetch its tags, or `mach dep update <path> {}` to pin a release",
+        id, op.root, id);
 }
 
 fun lock_listed(locks: *Vector[resolver.Lock], id: str) bool {
@@ -108,24 +242,24 @@ fun lock_listed(locks: *Vector[resolver.Lock], id: str) bool {
 # own ranges and every range a dependency reached by a ref or a path declares,
 # read from the same closure walk `pull` realizes. an identity the root or such a
 # dependency selects by ref or path is fixed, and a requirement on it is
-# overridden. locks keep each realized version-selected checkout where it is
-# unless `unlocked` names it or `lock` is false; an identity with no checkout yet
+# overridden. `held`, read by `held_locks` before the command moved anything, keeps each
+# realized version-selected checkout where it is, and nil locks nothing; an identity with no checkout yet
 # is seeded by the pin of the dependency declaring it, when one exists and the range
 # admits it, so a dependency pulls its own tested pin in
 #
 # `root_notes` names the root's own overrides of a chosen release's requirements too; a
 # command that pulls the closure afterwards leaves them to the pull, which names every
 # requirement the root overrides
-pub fun versions(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, lock: bool, unlocked: str,
-    root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail] {
+pub fun versions(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, held: *Vector[resolver.Lock],
+    unlocked: str, root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail] {
     val res_releases: res[*package_source.Releases, fail.Fail] = package_closure.releases(op, walk);
     if (sel res_releases.err) { ret res[Resolution, fail.Fail].err{res_releases.err}; }
-    ret versions_listed(op, doc, lowest, lock, unlocked, root_notes, walk, res_releases.ok);
+    ret versions_listed(op, doc, lowest, held, unlocked, root_notes, walk, res_releases.ok);
 }
 
 # `versions` reading the releases each identity offers from `releases`
-fun versions_listed(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, lock: bool, unlocked: str,
-    root_notes: bool, walk: *package_closure.Walk, releases: *package_source.Releases) res[Resolution, fail.Fail] {
+fun versions_listed(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, held: *Vector[resolver.Lock],
+    unlocked: str, root_notes: bool, walk: *package_closure.Walk, releases: *package_source.Releases) res[Resolution, fail.Fail] {
     val s:          *session.Session                        = op.s;
     val a:          *A.Allocator                            = op.a;
     val offline:    bool                                    = walk.offline;
@@ -194,26 +328,13 @@ fun versions_listed(op: *package_closure.Operation, doc: *manifest_load.Doc, low
     if (needs_of.len == 0) { ret res[Resolution, fail.Fail].ok{out}; }
     out.ranged = true;
     if (offline) { collections_vector.push[str](?out.notes, "resolving from releases already fetched (--offline)"); }
-    if (lock) {
-        val res_ids: res[Vector[str], fail.Fail] = package.realized_ids(a, op.root);
-        if (sel res_ids.ok) {
-            var j: usize = 0;
-            for (j < res_ids.ok.len) {
-                val id: str = res_ids.ok.data[j];
-                j = j + 1;
-                if (unlocked != nil && str_equals(id, unlocked)) { cnt; }
-                val res_full: res[str, fail.Fail] = package.dep_full_of(a, op.root, id);
-                if (sel res_full.err) { cnt; }
-                val res_release_at: res[opt[package_source.Release], fail.Fail] = op.checkouts.release_at(op.checkouts.ctx, op.root, id, res_full.ok, !offline);
-                if (sel res_release_at.ok) {
-                    var held: opt[package_source.Release] = res_release_at.ok;
-                    if (sel held.some) {
-                        str_free(s.build_alloc, held.some.tag);
-                        str_free(s.build_alloc, held.some.commit);
-                        lock_push(s.build_alloc, ?locks, id, held.some.text);
-                    }
-                }
-            }
+    if (held != nil) {
+        i = 0;
+        for (i < held.len) {
+            val res_kept: res[str, StrError] = str_copy(s.build_alloc, held.data[i].version);
+            if (sel res_kept.err) { ret res[Resolution, fail.Fail].err{fail.message("a held lock could not be copied")}; }
+            lock_push(s.build_alloc, ?locks, held.data[i].id, res_kept.ok);
+            i = i + 1;
         }
         # a range with no checkout yet starts at the declaring dependency's own pin
         i = 0;
@@ -368,7 +489,7 @@ pub rec Outdated {
 pub fun outdated(op: *package_closure.Operation, doc: *manifest_load.Doc, offline: bool) res[Outdated, fail.Fail] {
     val a:            *A.Allocator               = op.a;
     var walk:         package_closure.Walk       = package_closure.Walk{offline: offline, all: false, name: nil, quiet: false};
-    val res_resolved: res[Resolution, fail.Fail] = versions(op, doc, false, false, nil, true, ?walk);
+    val res_resolved: res[Resolution, fail.Fail] = versions(op, doc, false, nil, nil, true, ?walk);
     if (sel res_resolved.err) { ret res[Outdated, fail.Fail].err{res_resolved.err}; }
     var out: Outdated = Outdated{notes: res_resolved.ok.notes, ranged: res_resolved.ok.ranged, rows: collections_vector.init[OutdatedRow](a)};
     if (!res_resolved.ok.ranged) { ret res[Outdated, fail.Fail].ok{out}; }
