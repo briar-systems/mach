@@ -225,7 +225,7 @@ def manifest_check(cfg, path):
     # dependency is read
     rel = os.path.relpath(path, ROOT)
     p = subprocess.run([cfg.mach, 'check', os.path.dirname(rel) or '.', '--artifact', '=', '--report', 'json'],
-                       capture_output=True, text=True, cwd=ROOT)
+                       capture_output=True, text=True, errors='replace', cwd=ROOT)
     return rel, p.returncode, errors(p.stdout + p.stderr)
 
 
@@ -273,7 +273,7 @@ def build(cfg, path, target):
     # an entry build names its entry by a relative path inside the directory it runs in
     cmd = [cfg.mach, 'build', rel, '--source', 'std=' + cfg.std, *target.flags, *header(path).get('flags', '').split(),
            '-w', os.path.join('out', 'work', target.name), '-o', out, '--report', 'json']
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
+    p = subprocess.run(cmd, capture_output=True, text=True, errors='replace', cwd=HERE)
     return p.returncode, errors(p.stdout + p.stderr), os.path.join(HERE, out)
 
 
@@ -287,7 +287,7 @@ def reports(cfg, path, target, host):
     out = os.path.join('out', 'bin', target.name, rel[:-len('.mach')].replace(os.sep, '-') + '-reports')
     cmd = [cfg.mach, 'build', rel, '--source', 'std=' + cfg.std, *target.flags, *header(path).get('flags', '').split(),
            '-w', os.path.join('out', 'work', target.name), '-o', out, '--passes']
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
+    p = subprocess.run(cmd, capture_output=True, text=True, errors='replace', cwd=HERE)
     if p.returncode != 0:
         return [fail(rel, target, f'does not build with --passes: exit {p.returncode}')]
     got = {line.strip() for line in p.stdout.splitlines()}
@@ -318,7 +318,7 @@ def one_target(cfg, target, files, refusals, host):
             ran += 1
         own = file_rules(path)
         if target.rules or own:
-            d = subprocess.run([cfg.mink, 'dump', out], capture_output=True, text=True)
+            d = subprocess.run([cfg.mink, 'dump', out], capture_output=True, text=True, errors='replace')
             if d.returncode != 0:
                 fails.append(fail(rel, target, 'mink cannot read the artifact'))
             for b in judge(target.rules, d.stdout):
@@ -375,7 +375,7 @@ def one_project(cfg, path):
     for n, code, argv, text, absent in steps(path):
         said = ' '.join(argv)
         try:
-            p = subprocess.run([cfg.mach, *argv], capture_output=True, text=True, cwd=work, timeout=600)
+            p = subprocess.run([cfg.mach, *argv], capture_output=True, text=True, errors='replace', cwd=work, timeout=600)
         except subprocess.TimeoutExpired:
             return f'{rel} step {n} ({said}) did not exit in 600s'
         if p.returncode != code:
@@ -401,13 +401,13 @@ def main():
 
     tdir = os.path.join(HERE, 'target')
     targets = [Target(os.path.join(tdir, f)) for f in sorted(os.listdir(tdir)) if f.endswith('.target')]
-    info = subprocess.run([cfg.mach, 'info'], capture_output=True, text=True).stdout
+    info = subprocess.run([cfg.mach, 'info'], capture_output=True, text=True, errors='replace').stdout
     host = re.search(r'^host\s+(\S+)', info, re.M).group(1)
     fails = []
 
     # every system the compiler lists is under test or declined with a reason
     declined = {l.split()[0] for l in open(os.path.join(tdir, 'declined'), encoding='utf-8') if l.strip() and not l.startswith('#')}
-    listed = [l.split()[0] for l in subprocess.run([cfg.mach, 'info', 'targets'], capture_output=True, text=True).stdout.splitlines()[1:] if l.strip()]
+    listed = [l.split()[0] for l in subprocess.run([cfg.mach, 'info', 'targets'], capture_output=True, text=True, errors='replace').stdout.splitlines()[1:] if l.strip()]
     for name in listed:
         if name not in declined and not any(t.system == name for t in targets):
             fails.append(f'{name}: the compiler lists it, and no file of test/target builds for it or declines it')
