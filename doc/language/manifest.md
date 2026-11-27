@@ -772,6 +772,10 @@ linkage     static
 object      elf
 ```
 
+Under `--report json` and `--report lines` neither text is written: the table is a
+`target` record a row and the page one `host` record, which state the same catalog with
+nothing to cut out of a cell ([report-records.md](report-records.md#info-records)).
+
 A value outside its axis's set is refused when the target resolves, so a typo is
 caught rather than silently never matching.
 
