@@ -1191,7 +1191,10 @@ pub fun add(a: i32, b: i32) i32 {
   freestanding targets need `_start` too.
 - **A `bin` with no `_start`** is still a module of its exports, as it was before
   `kind = "module"` built one on wasm. That form is deprecated and mach 8 refuses
-  it: state `kind = "module"` for a module of exports.
+  it: state `kind = "module"` for a module of exports. Until then the build warns
+  at the artifact's `kind` (`artifact.entryless_bin`), each build of it, a link left
+  up to date included, since the link decides it: an archive or a `-l` input can
+  define the `_start` the build's own objects do not.
 - **Memory.** As on `wasi`: the stack lies at the bottom of linear memory, from its
   base down to address zero, 64 KiB unless `stack_reserve` states its size, and the
   data starts at the base, so a stack overflow traps below address zero. The memory's
@@ -1511,6 +1514,7 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `secret.target_unenforceable` | an `#[constant_time]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
 | `readout.clock_refused` | the clock refuses a read while the back end times a module, so a row of the build's stage times is incomplete | no |
 | `link.report` | a link that succeeds reports something about the image as a whole, one warning per line mink reports | no |
+| `artifact.entryless_bin` | a `bin` links with no entry where its system takes an image with none, so it is a module of its exports, a form mach 8 refuses: a freestanding `wasm32` `bin` that defines no `_start` (see [Freestanding wasm](#freestanding-wasm)). State `kind = "module"` | no |
 
 A kind decided by source warns or not from the source text alone, whatever the
 target, goal or profile. Only such a key is reported when an `#[expect]`
