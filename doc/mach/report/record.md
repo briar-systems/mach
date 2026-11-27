@@ -31,6 +31,7 @@ Source: [`src/report/record.mach`](../../../src/report/record.mach)
 | [`text_or_null`](#text_or_null) | a text field, null when v is nil |
 | [`null`](#null) | a null field, which lines leaves out |
 | [`int`](#int) | an integer field |
+| [`flag`](#flag) | a truth field, `true` or `false` in both encodings |
 | [`nested_begin`](#nested_begin) | open a record-valued field `key` of r as child |
 | [`nested_end`](#nested_end) | close a nested record |
 | [`list_begin`](#list_begin) | open a list field `key` of r |
@@ -122,6 +123,14 @@ pub fun int(r: *Record, key: str, v: i64)
 ```
 
 an integer field
+
+### flag
+
+```mach
+pub fun flag(r: *Record, key: str, v: bool)
+```
+
+a truth field, `true` or `false` in both encodings
 
 ### nested_begin
 
