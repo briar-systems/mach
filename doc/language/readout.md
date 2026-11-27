@@ -412,7 +412,7 @@ artifact, with its `target`, the same counts and the time since the command
 began.
 
 A failure's diagnostic says why the test failed (`exited with 3`, `was stopped
-by signal 6`, `timed out after 10s`, `could not be launched`), points at where
+by signal 6`, `timed out after 10s`, `could not be launched (<what refused it>)`), points at where
 the test is declared, and carries the test's captured output, where its full
 output is when the capture was cut, and the command that reruns it alone, each
 as a note. A skipped test is neither a pass nor a failure. A test that ran past

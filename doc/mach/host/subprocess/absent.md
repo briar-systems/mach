@@ -19,6 +19,8 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | :--- | :--- |
 | [`refusal`](#refusal) | the machine's refusal `e` to `verb` the child, an environment failure under `k` naming the child and, when `cwd` is given, the directory it would have run in |
 | [`refusal_of`](#refusal_of) | the machine's refusal `e` of `op`, which names the child as its caller knows it |
+| [`reason`](#reason) | what refused in `e`, static, for a line that names the child itself |
+| [`unable`](#unable) | the refusal every spawn here meets, named by `identity`, so a command that would start a process can say so before it does the work that leads up to one |
 | [`resolve`](#resolve) | refuse the search: no program found on PATH could be started |
 
 | On `OwnedSubprocess` | |
@@ -66,6 +68,23 @@ pub fun refusal_of(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kin
 ```
 
 the machine's refusal `e` of `op`, which names the child as its caller knows it
+
+### reason
+
+```mach
+pub fun reason(e: Error) str
+```
+
+what refused in `e`, static, for a line that names the child itself
+
+### unable
+
+```mach
+pub fun unable(identity: str) opt[Error]
+```
+
+the refusal every spawn here meets, named by `identity`, so a command that would start a
+process can say so before it does the work that leads up to one
 
 ### resolve
 
