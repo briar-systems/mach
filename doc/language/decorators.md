@@ -832,8 +832,10 @@ fun f_hot(x: i64) i64 {
 pub var g_sec: u64 = 100;
 ```
 
-The named section is created if absent, and the globals of one object that
-name it share that one section, each at its own aligned offset. A function's
+The name is the section's name in the object, or a wasm object's data segment
+name, and a linked image that has no named sections, as a flat image or a wasm
+module, holds none. The named section is created if absent, and the globals of
+one object that name it share that one section, each at its own aligned offset. A function's
 section holds code, a `var`'s writable data, a `val`'s read-only data and a
 `#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
