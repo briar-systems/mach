@@ -1216,6 +1216,34 @@ console.log(instance.exports.add(2, 3));
 const memory = new Uint8Array(instance.exports.memory.buffer);
 ```
 
+### The compiler as a wasi program
+
+mach itself builds for `wasi-wasm32` (`mach build . -t wasi-wasm32 -a mach` in the
+compiler's own project), and a release ships it as `mach.wasm`, for a host that has a
+WASI runtime and no native compiler, a browser among them. It is the same compiler,
+built without what preview 1 cannot give a program, and it says so where a command
+needs one of them:
+
+- **One thread.** A build compiles on the one thread the module has. `--threads 1` is
+  accepted, and a count above one is refused as `cli.flag_value`, naming that the host
+  has no threads.
+- **No child process.** A `[step]`, a `runner`, the processes `mach test` and `mach run`
+  start, and the git that `mach dep` fetches a dependency through are each refused where
+  they would start, by the diagnostic of the command (`process.spawn`, `git.command`),
+  whose cause reads `this host cannot start a process`. A path dependency, `mach check`,
+  `mach build`, `mach fmt` and `mach info` need none.
+- **No ending event.** Nothing interrupts the module, so a command runs to its end.
+- **No terminal control.** No descriptor is taken to be a terminal, so there is no live
+  progress line.
+- **No object cache.** The cache keys every object on the compiler that made it, by the
+  digest of the running image's file, and a wasm module cannot read its own image. So
+  nothing in `obj/` is restored and every build compiles every module, as under
+  `--no-cache`. `-vv` reports it under the cache phase.
+
+Each of these is a capability the build asks std for (`std.system.capability`), not the
+name of the system, so a later preview that has threads or processes gets them by
+claiming the group.
+
 ### UEFI targets
 
 A `uefi` target builds a PE image that a UEFI firmware loads, on `x86_64` and
