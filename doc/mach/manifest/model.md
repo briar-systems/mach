@@ -502,6 +502,7 @@ pub rec LinkDef {
     source:             LinkSource;
     lib_name:           mach.base.intern.StrId;
     path:               mach.base.intern.StrId;
+    dir:                mach.base.intern.StrId;
     symbols:            *mach.base.intern.StrId;
     symbol_count:       u32;
     sys:                *mach.base.intern.StrId;
@@ -516,6 +517,7 @@ pub rec LinkDef {
     versions:           LinkVersions;
     at:                 mach.base.source.Location;
     path_at:            mach.base.source.Location;
+    dir_at:             mach.base.source.Location;
 }
 ```
 
@@ -528,6 +530,7 @@ and freed by `dnit`
 | `source` | `LinkSource` | the required `source` key |
 | `lib_name` | `mach.base.intern.StrId` | the `name` key, required for system and framework sources and rejected for local; STR_NIL for local |
 | `path` | `mach.base.intern.StrId` | the `path` key, required for a local source and rejected otherwise; a project-relative path template, STR_NIL for non-local |
+| `dir` | `mach.base.intern.StrId` | the `dir` key, written only on a framework source: the directory its bundle lies in, a project-relative path template; STR_NIL when absent |
 | `symbols` | `*mach.base.intern.StrId` | the `symbols` array; every entry non-empty and unique; nil when absent |
 | `symbol_count` | `u32` | length of `symbols` |
 | `sys` | `*mach.base.intern.StrId` | the required `sys` filter axis, each value canonical or "*"; nil for `[]`, which matches no target |
@@ -542,6 +545,7 @@ and freed by `dnit`
 | `versions` | `LinkVersions` | the `current_version` and `compatibility_version` keys, written only on a system source of the shared kind; unstated when absent |
 | `at` | `mach.base.source.Location` | where the table's key is written |
 | `path_at` | `mach.base.source.Location` | where the `path` value is written, the zero place when absent |
+| `dir_at` | `mach.base.source.Location` | where the `dir` value is written, the zero place when absent |
 
 ### link_def
 

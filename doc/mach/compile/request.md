@@ -77,20 +77,21 @@ a binary profile lever as the command line sets it
 
 ```mach
 pub rec Overrides {
-    output:       *u8;
-    work:         *u8;
-    views:        mach.compile.view.Set;
-    verify:       bool;
-    passes:       bool;
-    dep_warnings: bool;
-    optimize:     Lever;
-    debug:        Lever;
-    threads:      u32;
-    include_deps: bool;
-    no_cache:     bool;
-    declassified: bool;
-    link_tokens:  Vector[*u8];
-    lib_dirs:     Vector[*u8];
+    output:         *u8;
+    work:           *u8;
+    views:          mach.compile.view.Set;
+    verify:         bool;
+    passes:         bool;
+    dep_warnings:   bool;
+    optimize:       Lever;
+    debug:          Lever;
+    threads:        u32;
+    include_deps:   bool;
+    no_cache:       bool;
+    declassified:   bool;
+    link_tokens:    Vector[*u8];
+    lib_dirs:       Vector[*u8];
+    framework_dirs: Vector[*u8];
 }
 ```
 
@@ -239,8 +240,9 @@ pub rec BuildRequest {
     # "" for none
     work: str;
 
-    link_tokens: Vector[LinkToken];
-    lib_dirs:    Vector[str];
+    link_tokens:    Vector[LinkToken];
+    lib_dirs:       Vector[str];
+    framework_dirs: Vector[str];
 
     include_deps: bool;
     no_cache:     bool;

@@ -21,7 +21,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | Functions | |
 | :--- | :--- |
 | [`state`](#state) | add to `o` the claims of every link requirement of `p`'s unit, nothing for none |
-| [`described`](#described) | whether the link makes the library the requirement `req` names from its claim: a shared system library on a target whose link does, which no file is looked for for |
+| [`described`](#described) | whether the link takes the library or framework the requirement `req` names from its claim alone, on a target whose link makes one from its claim: a shared system library, which no file is looked for for, and a framework that states no directory, which the link makes from its claim unless a framework directory the command line gives holds it |
 
 ---
 
@@ -41,6 +41,8 @@ add to `o` the claims of every link requirement of `p`'s unit, nothing for none
 pub fun described(req: *mach.manifest.link.LinkRequirement, describes: bool) bool
 ```
 
-whether the link makes the library the requirement `req` names from its claim: a
-shared system library on a target whose link does, which no file is looked for for
+whether the link takes the library or framework the requirement `req` names from its claim
+alone, on a target whose link makes one from its claim: a shared system library, which no file
+is looked for for, and a framework that states no directory, which the link makes from its
+claim unless a framework directory the command line gives holds it
 

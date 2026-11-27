@@ -351,6 +351,8 @@ pub rec Image {
     subsystem:     opt[*mink.catalog.subsystem.Subsystem];
     libdirs:       *str;
     libdir_count:  usize;
+    fwdirs:        *str;
+    fwdir_count:   usize;
     stack_reserve: opt[u64];
     stack_commit:  opt[u64];
     symbols:       bool;
@@ -369,6 +371,8 @@ what the build states of the image it links, beyond its kind and format
 | `subsystem` | `opt[*mink.catalog.subsystem.Subsystem]` | the PE subsystem the image states, none for the host's |
 | `libdirs` | `*str` | the directories a library named by name is searched in ahead of the system's |
 | `libdir_count` | `usize` | how many |
+| `fwdirs` | `*str` | the directories a framework is searched in, a framework a claim names before it is made from the claim |
+| `fwdir_count` | `usize` | how many |
 | `stack_reserve` | `opt[u64]` | the main stack's reserve, none for the format's default |
 | `stack_commit` | `opt[u64]` | the main stack's commit, none for the format's default |
 | `symbols` | `bool` | the image keeps its symbol table |

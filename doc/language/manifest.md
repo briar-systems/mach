@@ -2039,6 +2039,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. On an entry of `kind = "module"` it is the import module's name and optional: absent, it is the key. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
+| `dir`     | absent: a framework of the system's | The directory a `source = "framework"` entry's bundle `<name>.framework` lies in, for a framework outside the system's. A template anchored as `path` is. Refused on any other source. See [Frameworks](#frameworks). |
 | `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
 | `sys`      | yes | Filter axis: an array of canonical `sys` values or `"*"` (any); `[]` matches none. |
 | `arch`     | yes | Filter axis over `arch`, same forms. |
@@ -2169,20 +2170,47 @@ libraries is refused, naming the symbol and both libraries. On Mach-O the entry'
 such as `@rpath/libMoltenVK.dylib`, since no file is read to learn it, and a bare
 name such as `MoltenVK` is refused before the link, naming the entry.
 
-Everything else is a file: a `static` entry, a `local` entry, a `framework`, and
-every entry on ELF and wasm. ELF stays file based because only the `.so` states
+Everything else is a file: a `static` entry, a `local` entry, a `framework` entry
+that states a `dir`, and every entry on ELF and wasm. ELF stays file based because only the `.so` states
 what an import needs there, its symbol versions and the size of data a copy
 relocation moves. A shared library whose symbols the build does not know, one
 whose imports come from C objects with no claim, is linked from its import
 library with a `local` entry.
 
-A `system` entry that is not linked from its claim, and a `framework` entry, is
-found by name through mink's library search as the link runs, in each `-L` directory, then the working directory, then the
-system's directories the target's host row states. A `local` entry names its
+A `system` entry that is not linked from its claim is found by name through
+mink's library search as the link runs, in each `-L` directory, then the working
+directory, then the system's directories the target's host row states. A
+`framework` entry is found as [Frameworks](#frameworks) says. A `local` entry names its
 file. Whether an input links **statically** or **dynamically** follows the file
 found — a loose `.o`/`.obj` or static `.a`/`.lib` links statically, and an ELF
 `.so`, Mach-O `.dylib` or PE `.dll` is recorded by its format's canonical loader
 name.
+
+### Frameworks
+
+A `framework` entry with no `dir` is a framework of the system's, linked from its
+claim as a shared system library is, and no file is searched for or read. The
+image loads it by its install name, its binary in its bundle in the system's
+framework directory, `/System/Library/Frameworks/<name>.framework/<name>` on
+macOS, which dyld finds there or in its shared cache. Each symbol the program
+takes from it is one the entry's `symbols` lists or a `#[library]` import of the
+entry, as for any library linked from its claim. So a macOS program links its
+system frameworks from any host with no SDK.
+
+A framework outside the system's is found as a file. Its entry states `dir`, the
+directory its bundle lies in, and the link looks in that directory for
+`<name>.framework/<name>.tbd`, then `<name>.framework/<name>`, and loads the
+framework by the install name the file states. A framework found in no such
+directory is refused, naming each directory searched.
+
+The link's framework directories are each `-F <dir>` the command line gives, in
+order, then the `dir` of each `framework` entry the link takes. A framework of
+the system's is looked for in them too, and one found there is linked from its
+file, so `-F` can stand a framework of the system's in for a build. One none of
+them holds is linked from its claim. A framework whose name is empty or holds a
+`/`, which names no bundle, is refused, with a note that no framework directory
+holds it. The same framework stated by two entries in different directories is
+refused.
 
 A `system` entry whose `name` is a bare library name is looked for as one kind
 alone, `kind = "shared"` unless the entry says `kind = "static"`. There is no
@@ -2409,8 +2437,8 @@ digest leaves the output as it is: same bytes, same modification time, same
 file. Every file's bytes are read and hashed every time; sizes and times decide
 nothing. A link that reads a library found by name in a search directory always
 runs, since the key names such a library and not its contents: a `system` or
-`framework` entry linked from a file, `-l`, or a claim of an archive's member
-naming a library found that way. Anything else, a missing or changed output,
+`framework` entry linked from a file, `-l`, or a claim naming a library or a
+framework found that way. Anything else, a missing or changed output,
 another key or a damaged record, links as before.
 
 `--no-cache` forces an uncached
