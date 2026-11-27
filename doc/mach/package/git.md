@@ -74,10 +74,10 @@ one committed entry of a tree listing
 ```mach
 pub rec Inspector {
     program:       str;
-    inherited_env: std.process.exec.Environment;
+    inherited_env: std.system.os.Environment;
     alloc:         *std.allocator.Allocator;
     env_ready:     bool;
-    env_inherited: std.process.exec.Environment;
+    env_inherited: std.system.os.Environment;
     env:           mach.host.environment.Strings;
     trees:         Vector[Tree];
     trees_ready:   bool;
@@ -92,7 +92,7 @@ a checkout drops the listings.
 ### inspector_init
 
 ```mach
-pub fun inspector_init(alloc: *std.allocator.Allocator, environ: std.process.exec.Environment) res[Inspector, mach.base.fail.Fail]
+pub fun inspector_init(alloc: *std.allocator.Allocator, environ: std.system.os.Environment) res[Inspector, mach.base.fail.Fail]
 ```
 
 an inspector whose git processes inherit `environ`, a session's environment
@@ -197,7 +197,7 @@ the committed mode of `<prefix><rel>` at HEAD, or "" when HEAD has no such entry
 ### inspector_pending
 
 ```mach
-pub fun inspector_pending(environ: std.process.exec.Environment) Inspector
+pub fun inspector_pending(environ: std.system.os.Environment) Inspector
 ```
 
 an inspector that resolves git on first use, its processes inheriting `environ`

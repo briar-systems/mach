@@ -34,9 +34,7 @@ use std_format: std.format;
 use io_writer:  std.io.writer;
 use std.print;
 use std.process.env;
-use std.sync.condition;
 use std.sync.mutex;
-use sync_thread:  std.sync.thread;
 use types_string: std.types.string;
 
 use mach.base.diagnostic;
@@ -46,12 +44,13 @@ use mach.base.duration;
 use base_source: mach.base.source;
 use mach.build.outcome;
 use mach.cli.exit;
+use mach.cli.ticker;
 use mach.host.interrupt;
+use host_terminal: mach.host.terminal;
 use mach.package.report;
 use mach.report.layout;
 use mach.report.readout;
 use mach.report.record;
-use std.terminal;
 
 val MAX_SPAN_LINES: usize = 10;
 
@@ -1675,7 +1674,7 @@ val LIVE_COLUMNS: usize = 80;
 
 # whether stderr is a terminal the live line can be drawn on, one whose TERM is set and not `dumb`
 fun live_capable() bool {
-    if (!terminal.is_terminal(2)) { ret false; }
+    if (!host_terminal.is_terminal(2)) { ret false; }
     var buf:     [64]u8;
     val res_get: res[opt[usize], env.EnvError] = env.get("TERM", ?buf[0], 64);
     if (sel res_get.err) { ret false; }
@@ -1713,12 +1712,10 @@ fun live_start(r: *Report) bool {
     if (r.drawing)       { ret true; }
     if (!live_capable()) { ret false; }
     readout.live_init(?r.live);
-    r.stop      = false;
     r.width     = live_width();
-    r.out_tty   = terminal.is_terminal(1);
+    r.out_tty   = host_terminal.is_terminal(1);
     r.shown_len = 0;
-    val err_spawned: sync_thread.Operation = sync_thread.spawn_with(drawer_main, r::*u8, ?r.drawer);
-    if (sel err_spawned.err) { ret false; }
+    if (!ticker.start(?r.ticker, ?r.lock, LIVE_PERIOD, drawer_tick, r::ptr)) { ret false; }
     r.drawing = true;
     ret true;
 }
@@ -1726,11 +1723,7 @@ fun live_start(r: *Report) bool {
 # stop drawing the live line and erase it
 fun live_stop(r: *Report) {
     if (!r.drawing) { ret; }
-    mutex.lock(?r.lock);
-    r.stop = true;
-    condition.signal(?r.wake);
-    mutex.unlock(?r.lock);
-    val err_joined: sync_thread.Operation = sync_thread.join(?r.drawer);
+    ticker.stop(?r.ticker);
     mutex.lock(?r.lock);
     live_erase(r);
     mutex.unlock(?r.lock);
@@ -1814,18 +1807,9 @@ fun owe_blank(r: *Report) {
     mutex.unlock(?r.lock);
 }
 
-# the drawer: every LIVE_PERIOD, the live line as the slot stands, until the report stops it
-fun drawer_main(arg: *u8) {
-    val r: *Report = arg::*Report;
-    mutex.lock(?r.lock);
-    for (!r.stop) {
-        val res_now: time.InstantClock = time.instant();
-        if (sel res_now.err) { brk; }
-        val status: condition.WaitStatus = condition.wait_until(?r.wake, ?r.lock, time.instant_add(res_now.ok, LIVE_PERIOD));
-        if (sel status.invalid || sel status.failed) { brk; }
-        if (!r.stop)                                 { live_draw(r); }
-    }
-    mutex.unlock(?r.lock);
+# the drawer's tick: the live line as the slot stands, the report's lock held
+fun drawer_tick(ctx: ptr) {
+    live_draw(ctx::*Report);
 }
 
 # draw the live line where the cursor stands at the start of a line, the report's lock held: the
@@ -2035,13 +2019,11 @@ pub rec Report {
     out_bare: bool;
     out_tty:  bool;
     owed:     bool;
-    # the live line: the slot the engine writes, whether the drawer runs and is told to stop,
-    # what wakes it, its thread, the terminal's width and the line on screen, none when shown_len is 0
+    # the live line: the slot the engine writes, whether the drawer runs, the ticker it runs on,
+    # the terminal's width and the line on screen, none when shown_len is 0
     live:      readout.Live;
     drawing:   bool;
-    stop:      bool;
-    wake:      condition.Condition;
-    drawer:    sync_thread.Thread;
+    ticker:    ticker.Ticker;
     width:     usize;
     shown:     [LIVE_LINE]u8;
     shown_len: usize;
@@ -2084,8 +2066,6 @@ pub fun report_init(r: *Report, format: Format) {
     r.out_tty   = false;
     r.owed      = false;
     r.drawing   = false;
-    r.stop      = false;
-    r.wake      = condition.make();
     r.width     = LIVE_COLUMNS;
     r.shown_len = 0;
     readout.live_init(?r.live);
@@ -2338,8 +2318,9 @@ pub fun report_skip(r: *Report, target: str, profile: str, reason: str) {
 # ret:  the worse of code and the kept refusal's
 pub fun report_dnit(r: *Report, code: i64) i64 {
     live_stop(r);
-    if (interrupt.taken()) {
-        report_interrupted(r, code);
+    val opt_event: opt[str] = interrupt.name();
+    if (sel opt_event.some) {
+        report_interrupted(r, code, opt_event.some);
         report_release(r);
         ret code;
     }
@@ -2366,10 +2347,10 @@ pub fun report_dnit(r: *Report, code: i64) i64 {
 
 # the one line a command an interrupt stopped ends with, past the silence the interrupt set:
 # `interrupted by <event>`, or under json the summary record with the outcome `interrupted`
-fun report_interrupted(r: *Report, code: i64) {
+fun report_interrupted(r: *Report, code: i64, event: str) {
     var w: io_writer.Writer = stderr_writer();
     if (r.format == FORMAT_HUMAN) {
-        std_format.format(?w, "interrupted by {}\n", interrupt.name());
+        std_format.format(?w, "interrupted by {}\n", event);
         ret;
     }
     var o: record.Record;
@@ -2378,7 +2359,7 @@ fun report_interrupted(r: *Report, code: i64) {
     record.int(?o, "warnings", r.warnings::i64);
     record.int(?o, "notes", r.notes::i64);
     record.text(?o, "outcome", "interrupted");
-    record.text(?o, "event", interrupt.name());
+    record.text(?o, "event", event);
     record.int(?o, "exit_code", code);
     record.end(?o);
 }

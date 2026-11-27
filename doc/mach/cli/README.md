@@ -12,9 +12,11 @@ diagnostics and progress
 | [`diagnostic`](diagnostic.md) | how a command reports: diagnostics, failures, the build readout and test results |
 | [`exit`](exit.md) | the exit codes of `mach`, and the code each kind of failure maps to |
 | [`rewrite`](rewrite.md) | the pass a command makes over source files, rewriting each into the text a transform makes of it: a project's own source tree, one named file, or a stream |
+| [`ticker`](ticker.md) | a thread that calls back on a period, where the host has a thread to give |
 | [`util`](util.md) | a command's project operand resolved to its root and manifest |
 
 | Directory | |
 | :--- | :--- |
 | [`cmd/`](cmd/README.md) | the table of commands and the dispatch that routes a `mach` invocation to one of them |
+| [`ticker/`](ticker/README.md) | a thread that calls back on a period, where the host has a thread to give |
 

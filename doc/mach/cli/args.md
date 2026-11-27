@@ -324,7 +324,7 @@ pub rec Call {
     spans:   *std.allocator.heap.Pool;
     inv:     *std.args.Parsed;
     report:  *mach.cli.diagnostic.Report;
-    environ: std.process.exec.Environment;
+    environ: std.system.os.Environment;
     # the texts the command's sessions read, which the failure it returns is located in
     sources: *mach.base.source.SourceMap;
 }
@@ -339,7 +339,7 @@ what dispatch hands a command's handler; dispatch owns every member and outlives
 | `spans` | `*std.allocator.heap.Pool` | the spans every heap of the command draws from and gives back to |
 | `inv` | `*std.args.Parsed` | the parsed command line |
 | `report` | `*mach.cli.diagnostic.Report` | where the command reports a failure it goes on past or that carries an origin, in the format `--report` selected |
-| `environ` | `std.process.exec.Environment` | the environment the command runs in, which the processes it starts inherit |
+| `environ` | `std.system.os.Environment` | the environment the command runs in, which the processes it starts inherit |
 
 ## Functions
 

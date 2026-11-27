@@ -46,7 +46,7 @@ makes none.
 
 Source: [`src/compile/offer.mach`](../../../src/compile/offer.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.session.module`](../session/module.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.compile.wake`](wake.md), [`mach.session.module`](../session/module.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -112,7 +112,7 @@ storage from `a`, the words of a failure from `words`. a refusal is a defect of 
 ```mach
 pub rec Handover {
     lock:      std.sync.mutex.Mutex;
-    woken:     std.sync.condition.Condition;
+    woken:     mach.compile.wake.Wake;
     handed:    *bool;
     offers:    *Candidate;
     count:     u32;
@@ -130,7 +130,7 @@ written under `lock`, and a hand-over or the pass's end wakes the waiters
 | Field | Type | |
 | :--- | :--- | :--- |
 | `lock` | `std.sync.mutex.Mutex` | held for every read and write of the rest |
-| `woken` | `std.sync.condition.Condition` | waited on by a run whose binds are not all handed over |
+| `woken` | `mach.compile.wake.Wake` | waited on by a run whose binds are not all handed over |
 | `handed` | `*bool` | per module, whether it was handed over |
 | `offers` | `*Candidate` | per module, its offer as handed over |
 | `count` | `u32` | the modules both cover |

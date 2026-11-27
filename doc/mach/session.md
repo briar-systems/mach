@@ -77,7 +77,7 @@ pub rec Session {
 
     # the environment the processes the session starts inherit: the process's own unless the
     # session's owner names another
-    environ: std.process.exec.Environment;
+    environ: std.system.os.Environment;
 }
 ```
 
