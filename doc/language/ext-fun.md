@@ -110,9 +110,9 @@ A character literal is a `u8` and is refused the same way.
 
 An argument of 32 bits or wider passes as written: `i32`/`u32`, `i64`/`u64`, `f64`,
 any pointer, and a record or vector passed by value. A **secret** (`^T`) may not
-enter a variadic tail: the callee is foreign code that prints or logs the value, so
-it is an observation boundary. Declassify it with `:>T` first. The refusal is
-`secret.variadic`.
+enter a variadic tail: its arguments have no declared type for the value to stay
+`^` in, and a secret reaches a public place only by an explicit declassification.
+Write `:>T` to pass it. The refusal is `secret.variadic`.
 
 ### Per-target argument passing
 
