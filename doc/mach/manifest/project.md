@@ -32,7 +32,7 @@ decode the `[project]` table of `t` into `m`: its id, version, src, work and
 | `itn` | interns the values |
 | `t` | the manifest's root table, its `[project]` already held to the schema |
 | `m` | the manifest the fields are set on |
-| **returns** | ok, or the refusal of a path, of an id that is not a project id, or of a `mach` value that is not a valid range |
+| **returns** | ok, or the refusal of a path, of an id that is not a project id, of a version that is not a version, or of a `mach` value that is not a valid range |
 
 ### expand_project_work
 
