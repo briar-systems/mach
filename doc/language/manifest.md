@@ -1231,10 +1231,11 @@ needs one of them:
 - **One thread.** A build compiles on the one thread the module has. `--threads 1` is
   accepted, and a count above one is refused as `cli.flag_value`, naming that the host
   has no threads.
-- **No child process.** A `[step]`, a `runner`, the processes `mach test` and `mach run`
-  start, and the git that `mach dep` fetches a dependency through are each refused where
-  they would start, by the diagnostic of the command (`process.spawn`, `git.command`),
-  whose cause reads `this host cannot start a process`. A path dependency, `mach check`,
+- **No child process.** Nothing is started, and a command says so where it would start
+  one, with the cause `this host cannot start a process`: a `[step]` as `step.spawn`, the
+  program or `runner` of `mach run` as `process.spawn`, and the git that `mach dep`
+  fetches a dependency through as `git.missing`. `mach test` builds its tests and fails
+  each as `test.failed`, could not be launched. A path dependency, `mach check`,
   `mach build`, `mach fmt` and `mach info` need none.
 - **No ending event.** Nothing interrupts the module, so a command runs to its end.
 - **No terminal control.** No descriptor is taken to be a terminal, so there is no live
