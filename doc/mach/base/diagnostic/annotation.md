@@ -13,9 +13,15 @@ Uses types from [`mach.base.source`](../source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
+| [`ChildKind`](#childkind) | `def` |  |
+| [`Child`](#child) | `rec` | a note or a help line attached to a diagnostic |
 | [`Related`](#related) | `rec` | another place a report concerns: the other edge of a cycle, the other claim of a collision |
 | [`Edit`](#edit) | `rec` | one rewrite of a fix: the bytes at `loc` become `replacement` |
 | [`Fix`](#fix) | `rec` | a machine-applicable rewrite of the input, applied whole |
+
+| On `ChildKind` | |
+| :--- | :--- |
+| [`CHILD_NOTE`](#childkind), [`CHILD_HELP`](#childkind) | |
 
 | On `Related` | |
 | :--- | :--- |
@@ -28,6 +34,33 @@ Uses types from [`mach.base.source`](../source.md).
 | [`fix_copy`](#fix_copy) | a copy of `src` owning its label, its edits and their replacements through `a`, released with `fix_dnit` |
 
 ---
+
+## ChildKind
+
+```mach
+pub def ChildKind: u8
+```
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `CHILD_NOTE` | `0` |  |
+| `CHILD_HELP` | `1` |  |
+
+## Child
+
+```mach
+pub rec Child {
+    kind: ChildKind;
+    text: str;
+}
+```
+
+a note or a help line attached to a diagnostic
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `ChildKind` | CHILD_NOTE or CHILD_HELP |
+| `text` | `str` | the line, owned by the allocator of the report that holds it |
 
 ## Related
 

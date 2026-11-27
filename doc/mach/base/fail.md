@@ -6,8 +6,8 @@ the compiler's one failure type, and how a refusal of the machine becomes one
 
 every pass, the linker, the query engine, the session and the build return a `Fail`: reported,
 when diagnostics already say it, a compiler defect, the user's input, or the environment's
-refusal. a failure may point at a source location and carry related places and a fix, and it
-records whether it owns its text and its places. `refusal` is the one way a refused std
+refusal. a failure may point at a source location and carry related places, notes and a fix,
+and it records whether it owns its text and its places. `refusal` is the one way a refused std
 operation becomes a failure, naming the operation and the path it acted on.
 
 Source: [`src/base/fail.mach`](../../../src/base/fail.mach)
@@ -35,6 +35,8 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`placed`](#placed) | the same failure with every span still waiting for its file, its own, each related one and each fix edit's, placed in `file` |
 | [`with_related`](#with_related) | the same failure naming the `n` locations at `locs` as its related places, in order, each unlabelled; a nil location is skipped |
 | [`with_fix`](#with_fix) | the same failure carrying the rewrite `label` names, which replaces the span `s` of the file the failure points into, or the bytes it points at when `s` is none, with `replacement` |
+| [`with_note`](#with_note) | the same failure carrying `text` as a note after any it carries, a line saying more than the failure's text, such as how the input it concerns was reached |
+| [`notes_of`](#notes_of) | the notes a failure carries, in order, empty for one that carries none; they share the failure's places' lifetime |
 | [`fix_of`](#fix_of) | the rewrite a failure carries, none when it carries no fix; it shares the failure's places' lifetime |
 | [`related_of`](#related_of) | the related places a failure names, empty for one that names no other; they share the failure's places' lifetime |
 | [`borrowing_places`](#borrowing_places) | the same failure borrowing its places, for a view of places a holder owns: the places it owned before are the caller's to release |
@@ -49,9 +51,9 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed): the text gains " |
 | [`retain`](#retain) | a copy of the failure that owns its text and its places through `a`, for a failure that outlives the storage its message was made in; released with `dnit` |
 | [`dnit`](#dnit) | release what a failure owns through `a`: its text and its places, each when it owns them |
-| [`places_retain`](#places_retain) | a copy of the failure whose places, every related place and its fix, are owned through `a`, its text left as it is; for a holder that keeps the text apart |
+| [`places_retain`](#places_retain) | a copy of the failure whose places, every related place, its notes and its fix, are owned through `a`, its text left as it is; for a holder that keeps the text apart |
 | [`places_dnit`](#places_dnit) | release the places a failure owns through `a`, as `places_retain` made them; borrowed places are left alone |
-| [`without_places`](#without_places) | the same failure pointing nowhere, naming no related place and carrying no fix, for a holder whose places were released or never copied |
+| [`without_places`](#without_places) | the same failure pointing nowhere, naming no related place and carrying no note or fix, for a holder whose places were released or never copied |
 | [`same_places`](#same_places) | whether two failures hold the same places: the same location and the same related and fix storage, as a holder that copied them once sees its own copy |
 | [`unit`](#unit) | the unit outcome of an operation whose value is not needed |
 | [`prefixed`](#prefixed) | `cause` with `context` in front of its text, which follows in parentheses, joined into `a`, which owns the new text; the class, the kind and the places are kept |
@@ -115,9 +117,9 @@ kept and copied without an allocation. a failure
 that carries text records whether it owns it: owned text was allocated
 through the allocator `dnit` is given and is released there, borrowed text
 (a literal, an interned text, storage someone else releases) never is. a
-failure that names related places or a fix records whether it owns their
-storage in the same way, all of it or none: `places_retain`, `retain`,
-`with_related` and `with_fix` own it
+failure that names related places, notes or a fix records whether it owns
+their storage in the same way, all of it or none: `places_retain`, `retain`,
+`with_related`, `with_note` and `with_fix` own it
 
 ### reported
 
@@ -252,6 +254,26 @@ the failure points into, or the bytes it points at when `s` is none, with `repla
 label and the replacement are copied, so the failure owns its places through `a` as
 `places_retain` leaves them. a failure with no kind carries none, one that already carries a
 fix keeps it, and one whose copy is refused is that refusal
+
+### with_note
+
+```mach
+pub fun with_note(a: *std.allocator.Allocator, f: Fail, text: str) Fail
+```
+
+the same failure carrying `text` as a note after any it carries, a line saying more than the
+failure's text, such as how the input it concerns was reached. the text is copied, so the
+failure owns its places through `a` as `places_retain` leaves them. a failure with no kind
+carries none, and one whose copy is refused is that refusal
+
+### notes_of
+
+```mach
+pub fun notes_of(f: Fail) Vector[mach.base.diagnostic.annotation.Child]
+```
+
+the notes a failure carries, in order, empty for one that carries none; they share the
+failure's places' lifetime
 
 ### fix_of
 
@@ -389,7 +411,7 @@ it owns them
 pub fun places_retain(a: *std.allocator.Allocator, f: Fail) res[Fail, std.allocator.Error]
 ```
 
-a copy of the failure whose places, every related place and its fix, are owned through `a`,
+a copy of the failure whose places, every related place, its notes and its fix, are owned through `a`,
 its text left as it is; for a holder that keeps the text apart. released with `places_dnit`
 
 ### places_dnit
@@ -408,7 +430,7 @@ pub fun without_places(f: Fail) Fail
 ```
 
 the same failure pointing nowhere, naming no related place and carrying no
-fix, for a holder whose places were released or never copied
+note or fix, for a holder whose places were released or never copied
 
 ### same_places
 

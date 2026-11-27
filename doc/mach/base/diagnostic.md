@@ -17,8 +17,6 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | Type | | |
 | :--- | :--- | :--- |
 | [`Origin`](#origin) | `def` | the phase or command that produced a diagnostic |
-| [`ChildKind`](#childkind) | `def` |  |
-| [`Child`](#child) | `rec` | a note or a help line attached to a diagnostic |
 | [`FixId`](#fixid) | `def` | a fix's position in its diagnostic's fix list |
 | [`Diagnostic`](#diagnostic) | `rec` | one diagnostic; its severity is its kind's, read with `is_error` |
 | [`DiagnosticStore`](#diagnosticstore) | `rec` | the diagnostics of a build, in the order they were committed |
@@ -31,10 +29,6 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | :--- | :--- |
 | [`ORIGIN_NONE`](#origin), [`ORIGIN_BUILD`](#origin), [`ORIGIN_LOAD`](#origin), [`ORIGIN_RESOLVE`](#origin), [`ORIGIN_SEMA`](#origin), [`ORIGIN_LOWER`](#origin), [`ORIGIN_CODEGEN`](#origin), [`ORIGIN_LINK`](#origin), [`ORIGIN_TEST`](#origin) | |
 | [`origin_name`](#origin_name) | the stable name of an origin |
-
-| On `ChildKind` | |
-| :--- | :--- |
-| [`CHILD_NOTE`](#childkind), [`CHILD_HELP`](#childkind) | |
 
 | On `Diagnostic` | |
 | :--- | :--- |
@@ -73,6 +67,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | :--- | :--- |
 | [`builder_init`](#builder_init) | a builder for a diagnostic of kind `k` |
 | [`builder_initf`](#builder_initf) | a builder for a diagnostic of kind `k` whose message is `fmt` formatted with `args`; a format the allocator refuses is a failure, never a substitute message |
+| [`failure_builder`](#failure_builder) | a builder of the diagnostic the failure `f` reads as, through `a`: its kind and text, at its place, naming its related places and carrying its notes and its fix, each copied |
 | [`builder_dnit`](#builder_dnit) | release what a builder owns; a nil builder, or one already committed or released, owns nothing |
 | [`attach_note`](#attach_note) | attach a note, copied through the builder's allocator |
 | [`attach_help`](#attach_help) | attach a help line, copied through the builder's allocator |
@@ -135,33 +130,6 @@ the stable name of an origin
 | `o` | the origin |
 | **returns** | its name, or none for ORIGIN_NONE and a tag outside the catalog |
 
-## ChildKind
-
-```mach
-pub def ChildKind: u8
-```
-
-| Name | Value | |
-| :--- | :--- | :--- |
-| `CHILD_NOTE` | `0` |  |
-| `CHILD_HELP` | `1` |  |
-
-## Child
-
-```mach
-pub rec Child {
-    kind: ChildKind;
-    text: str;
-}
-```
-
-a note or a help line attached to a diagnostic
-
-| Field | Type | |
-| :--- | :--- | :--- |
-| `kind` | `ChildKind` | CHILD_NOTE or CHILD_HELP |
-| `text` | `str` | the line, owned by the allocator of the diagnostic that holds it |
-
 ## FixId
 
 ```mach
@@ -178,7 +146,7 @@ pub rec Diagnostic {
     origin:   Origin;
     loc:      mach.base.source.Location;
     message:  str;
-    children: Vector[Child];
+    children: Vector[mach.base.diagnostic.annotation.Child];
     related:  Vector[mach.base.diagnostic.annotation.Related];
     fixes:    Vector[mach.base.diagnostic.annotation.Fix];
 }
@@ -543,7 +511,7 @@ pub rec DiagnosticBuilder {
     origin:   Origin;
     loc:      mach.base.source.Location;
     message:  str;
-    children: Vector[Child];
+    children: Vector[mach.base.diagnostic.annotation.Child];
     related:  Vector[mach.base.diagnostic.annotation.Related];
     fixes:    Vector[mach.base.diagnostic.annotation.Fix];
 }
@@ -568,6 +536,16 @@ pub fun builder_initf(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.
 
 a builder for a diagnostic of kind `k` whose message is `fmt` formatted with `args`; a
 format the allocator refuses is a failure, never a substitute message
+
+### failure_builder
+
+```mach
+pub fun failure_builder(a: *std.allocator.Allocator, f: mach.base.fail.Fail) res[DiagnosticBuilder, mach.base.fail.Fail]
+```
+
+a builder of the diagnostic the failure `f` reads as, through `a`: its kind and text, at its
+place, naming its related places and carrying its notes and its fix, each copied. the caller
+attaches anything more and commits it
 
 ### builder_dnit
 
