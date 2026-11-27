@@ -1237,9 +1237,10 @@ needs one of them:
 - **No child process.** Nothing is started, and a command says so where it would start
   one, with the cause `this host cannot start a process`: a `[step]` as `step.spawn`, the
   program or `runner` of `mach run` as `process.spawn`, and the git that `mach dep`
-  fetches a dependency through as `git.missing`. `mach test` builds its tests and fails
-  each as `test.failed`, could not be launched. A path dependency, `mach check`,
-  `mach build`, `mach fmt` and `mach info` need none.
+  fetches a dependency through as `git.missing`. `mach test` refuses each selection whose
+  tests it would launch as `process.spawn`, before it builds one, and `mach test --list`
+  builds and lists them. A path dependency, `mach check`, `mach build`, `mach fmt` and
+  `mach info` need none.
 - **No ending event.** Nothing interrupts the module, so a command runs to its end.
 - **No terminal control.** No descriptor is taken to be a terminal, so there is no live
   progress line.

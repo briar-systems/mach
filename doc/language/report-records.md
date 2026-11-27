@@ -227,10 +227,10 @@ a `test` record per test in the order the tests finish, and closes with a
 
 ```json
 {"schema":3,"record":"run_start","tests":4}
-{"schema":3,"record":"test","name":"app.bin.main#passes","module":"app.bin.main","file":"src/bin/main.mach","line":9,"index":0,"target":"linux-x86_64","profile":"debug","outcome":"pass","code":0,"timeout_ns":0,"duration_ns":459535,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
-{"schema":3,"record":"test","name":"app.bin.main#fails_on_purpose","module":"app.bin.main","file":"src/bin/main.mach","line":13,"index":1,"target":"linux-x86_64","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":641207,"exe":"./out/linux-x86_64/debug/test/app/app","output":"./out/linux-x86_64/debug/test/app/log/1.log","origin":"test"}
-{"schema":3,"record":"test","name":"app.bin.main#skips_here","module":"app.bin.main","file":"src/bin/main.mach","line":17,"index":2,"target":"linux-x86_64","profile":"debug","outcome":"skip","code":77,"timeout_ns":0,"duration_ns":803249,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
-{"schema":3,"record":"test","name":"app.parser#rejects_trailing_comma","module":"app.parser","file":"src/parser.mach","line":5,"index":3,"target":"linux-x86_64","profile":"debug","outcome":"pass","code":0,"timeout_ns":0,"duration_ns":964561,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#passes","module":"app.bin.main","file":"src/bin/main.mach","line":9,"index":0,"target":"linux-x86_64","profile":"debug","outcome":"pass","cause":null,"code":0,"timeout_ns":0,"duration_ns":459535,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#fails_on_purpose","module":"app.bin.main","file":"src/bin/main.mach","line":13,"index":1,"target":"linux-x86_64","profile":"debug","outcome":"exit","cause":null,"code":3,"timeout_ns":0,"duration_ns":641207,"exe":"./out/linux-x86_64/debug/test/app/app","output":"./out/linux-x86_64/debug/test/app/log/1.log","origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#skips_here","module":"app.bin.main","file":"src/bin/main.mach","line":17,"index":2,"target":"linux-x86_64","profile":"debug","outcome":"skip","cause":null,"code":77,"timeout_ns":0,"duration_ns":803249,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.parser#rejects_trailing_comma","module":"app.parser","file":"src/parser.mach","line":5,"index":3,"target":"linux-x86_64","profile":"debug","outcome":"pass","cause":null,"code":0,"timeout_ns":0,"duration_ns":964561,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
 {"schema":3,"record":"run_end","passed":2,"failed":1,"skipped":1,"total":4,"duration_ns":1574518,"mismatch":1,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"origin":"test"}
 {"schema":3,"record":"skip","target":"linux-aarch64","profile":"debug","reason":"not native to this host"}
 ```
@@ -252,6 +252,7 @@ A `test` record adds how it ended:
 | Member | Type | Meaning |
 |---|---|---|
 | `outcome` | string | `"pass"`, `"skip"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
+| `cause` | string or `null` | what refused its launch when its outcome is `"spawn"`, as the system said it, otherwise `null` |
 | `code` | integer | its exit code, or `0` when it has none |
 | `timeout_ns` | integer | the bound it exceeded in nanoseconds when its outcome is `"timeout"`, otherwise `0` |
 | `duration_ns` | integer | how long it ran, in nanoseconds |
