@@ -252,7 +252,7 @@ A `test` record adds how it ended:
 | Member | Type | Meaning |
 |---|---|---|
 | `outcome` | string | `"pass"`, `"skip"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
-| `cause` | string or `null` | what refused its launch when its outcome is `"spawn"`, as the system said it, otherwise `null` |
+| `cause` | string or `null` | what refused its launch, as the system said it, when its outcome is `"spawn"` and the refusal was the system's, otherwise `null` |
 | `code` | integer | its exit code, or `0` when it has none |
 | `timeout_ns` | integer | the bound it exceeded in nanoseconds when its outcome is `"timeout"`, otherwise `0` |
 | `duration_ns` | integer | how long it ran, in nanoseconds |
