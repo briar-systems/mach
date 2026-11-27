@@ -599,7 +599,11 @@ naming the type that closes it.
   a function still starts at the target's own entry alignment: 16 bytes on
   x86-64 and aarch64, and no padding on riscv. The
   bytes before an entry are an instruction that traps. `align` only raises the
-  target's alignment, so a value below it changes nothing.
+  target's alignment, so a value below it changes nothing. A target that aligns no
+  function's entry, as wasm and SPIR-V, refuses it where it is written
+  (`target.unsupported_op`).
+- On a target that does not address memory physically, as SPIR-V, a global has
+  no address, and `align` on a `var` / `val` is refused where it is written.
 - `align` does not apply to `def` aliases (transparent, no layout of their
   own).
 
@@ -828,8 +832,10 @@ fun f_hot(x: i64) i64 {
 pub var g_sec: u64 = 100;
 ```
 
-The named section is created if absent, and the globals of one object that
-name it share that one section, each at its own aligned offset. A function's
+The name is the section's name in the object, or a wasm object's data segment
+name, and a linked image that has no named sections, as a flat image or a wasm
+module, holds none. The named section is created if absent, and the globals of
+one object that name it share that one section, each at its own aligned offset. A function's
 section holds code, a `var`'s writable data, a `val`'s read-only data and a
 `#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
@@ -840,6 +846,10 @@ A function or global that nothing refers to is not in the image, in a named
 section or not, unless it is stated with `#[at]`, so a table a loader or the
 hardware reads by its address, as an interrupt vector table, is stated with
 `#[at]` or referred to from the entry's code. Naming a section keeps nothing.
+
+A target that places no function in a section, as wasm and SPIR-V, refuses
+`section` on a function where it is written, and a target that does not address
+memory physically, as SPIR-V, refuses it on a global (`target.unsupported_op`).
 
 ### `at(offset)` — placement in the image
 
@@ -866,7 +876,9 @@ val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
   is the same address: from the start of the global's region, or from the base,
   where the image's first loaded byte lies. A system whose loader maps the
   image places it where it chooses, so an offset means nothing there, and mink
-  refuses it.
+  refuses it. A target that does not address memory physically, as SPIR-V, has
+  no image to place a global in, and refuses `at` where it is written
+  (`target.unsupported_op`).
 
 ### `export` — a shared library's export
 
@@ -1055,6 +1067,10 @@ a thread entry point whose register state at entry *is* the interface.
   entry and returns, where it switches the timing mode, and a naked body writes
   its own. Both combinations are rejected in sema. `inline("never")` is
   redundant: the inliner declines a naked function unconditionally.
+- **A target that writes every entry itself refuses it.** Wasm and SPIR-V
+  define each function's entry and return in their own form, so `naked` there
+  is refused where it is written (`target.unsupported_op`). A naked function
+  shared between targets is declared under a `$if` that leaves such a target out.
 - **No unwind entry.** A naked function states no frame, so the object holds no
   `.eh_frame` FDE, `.pdata` or compact unwind record for it, whatever the
   profile's `unwind` key says: its body is entered with no frame the compiler

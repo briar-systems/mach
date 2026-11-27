@@ -2,7 +2,9 @@
 
 # mach.cli.cmd.info
 
-`mach info`: the version and the host target, or with `targets` every target a build can be made for
+`mach info`: the version and the host target, or with `targets` every target a build can be made
+for, as a page for a person or, under `--report json` and `--report lines`, as the `host` and
+`target` records (doc/language/report-records.md)
 
 Source: [`src/cli/cmd/info.mach`](../../../../src/cli/cmd/info.mach)
 
@@ -29,7 +31,8 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 
 `mach info`: print "mach \<version>" and the host target this binary resolves for the
 machine it runs on, or with the verb `targets` every target a build can be made for; any other
-verb is an error
+verb is an error. under `--report json` and `--report lines` the page is a `host` record and
+the listing a `target` record a row, in place of the text
 
 | Parameter | |
 | :--- | :--- |

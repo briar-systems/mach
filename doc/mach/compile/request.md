@@ -208,7 +208,8 @@ pub rec BuildRequest {
     # presentation only, no part of any hash
     overrides: bool;
     debug:     bool;
-    # whether mach and mirl run their verifiers: opt-in, no part of any hash
+    # whether mach and mirl run their verifiers: opt-in, no part of any hash, and a build that
+    # verifies compiles every module, as a cached object holds no verification
     verify: bool;
     # whether mirl reports each optimisation pass that changed each function: presentation only, no part of any
     # hash, and a build that reports compiles every module, as a cached object holds no report

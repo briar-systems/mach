@@ -30,6 +30,7 @@ Uses types from [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.v
 
 | On `Release` | |
 | :--- | :--- |
+| [`release_free`](#release_free) | free the strings a release owns |
 | [`releases_dnit`](#releases_dnit) | free every release in a list and then the list itself |
 
 | Constants | |
@@ -54,6 +55,14 @@ pub rec Release {
 one release: its version (whose pre-release text borrows from `text`), the tag that
 names it and the commit it points at, all owned by the list's allocator
 
+### release_free
+
+```mach
+pub fun release_free(a: *std.allocator.Allocator, r: *Release)
+```
+
+free the strings a release owns
+
 ### releases_dnit
 
 ```mach
@@ -71,10 +80,11 @@ free every release in a list and then the list itself
 
 ```mach
 pub rec Shipped {
-    manifest: mach.manifest.model.Manifest;
-    excluded: str;
-    detail:   str;
-    mach:     str;
+    manifest:   mach.manifest.model.Manifest;
+    excluded:   str;
+    detail:     str;
+    mach:       str;
+    mach_range: opt[mach.manifest.version.Range];
 }
 ```
 
@@ -84,7 +94,8 @@ another version, and `detail` is what the manifest's load said, or nil. releases
 for one reason are reported together, with the newest one's detail. `mach` is the compiler
 range the release states when the running compiler is outside it, read before the schema
 the release may predate: resolution refuses the release by it, and `manifest` is not read.
-the manifest is owned by the caller
+`mach_range` is that range parsed, none when the running compiler is not outside one. the
+manifest is owned by the caller
 
 ## Releases
 

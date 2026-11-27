@@ -151,7 +151,7 @@ ref = "branch/main"
 | Key       | Type   | Meaning |
 |-----------|--------|---------|
 | `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. It must start with a letter or `_` and hold only letters, digits and `_`, so that a `use` path can name it, and a manifest with any other id is refused. `mach init` derives one from the directory's name, writing each `-` as `_`. Read by `$project.id`. |
-| `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
+| `version` | string | Project version, a [semver 2.0.0](https://semver.org) version: `major.minor.patch`, each a number without a leading zero, optionally followed by a `-pre-release` and a `+build` (`1.2.3`, `1.3.0-rc.1`, `1.3.0+ci.4`). Anything else, a two-part `1.2` or a range such as `^1.2.3` included, is refused. A release's tag names this version (see [dependencies.md](dependencies.md#releases-and-resolution)). Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.arch}`/`{target.sys}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
 | `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^7"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
@@ -489,7 +489,7 @@ A mnemonic or a register that needs an extension the target does not select,
 outside such a function, is refused, naming the instruction and what it needs:
 
 ```
-error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, or in the function's `#[extension]`
+error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, in the function's `#[extension]`, or in the block's head for that block alone
 ```
 
 The check runs where the block is assembled, so `mach build` reports it and
@@ -771,6 +771,10 @@ code_model  small
 linkage     static
 object      elf
 ```
+
+Under `--report json` and `--report lines` neither text is written: the table is a
+`target` record a row and the page one `host` record, which state the same catalog with
+nothing to cut out of a cell ([report-records.md](report-records.md#info-records)).
 
 A value outside its axis's set is refused when the target resolves, so a typo is
 caught rather than silently never matching.
@@ -2415,7 +2419,9 @@ another key or a damaged record, links as before.
 
 `--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`
-removes the tree with the rest of the output.
+removes the tree with the rest of the output. `--verify` and `--passes` build
+the same way, since a cached object carries no verifier run and no pass report:
+a build asked to verify or to report compiles every module and links again.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step
