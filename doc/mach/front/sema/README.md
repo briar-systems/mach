@@ -35,6 +35,5 @@
 | [`surface`](surface.md) | the typed surface a module publishes to its importers: each public symbol's type and bound constant, and the field recipes of the types they reach |
 | [`template`](template.md) | the template part of a module's interface: what an importer's lowering reads to emit an instance of one of the module's generic, comptime-parameter or pack functions |
 | [`typename`](typename.md) | a semantic type spelled as a program writes it, for diagnostics and debug names |
-| [`variadic`](variadic.md) | whether a function body reaches a C variadic call, directly or through what it calls, which decides how a pack spreads into one |
 | [`variant`](variant.md) | the generic unions an annotation instantiates must have variants agreeing on secrecy under their arguments, which no check of the generic declaration can answer |
 

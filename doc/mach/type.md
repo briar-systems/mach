@@ -43,6 +43,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`Type`](#type) | `rec` | one interned type |
 | [`Side`](#side) | `rec` | what a table keeps beside its types: the memos, each a pure function of a type and the projection, dense by type index, and the visited sets of the scans its walks open, scratch that holds no fact |
 | [`TypeInterner`](#typeinterner) | `rec` | the type table: every type interned once and named by its `TypeId` |
+| [`Elements`](#elements-1) | `rec` | the elements of an array type, as a `$each` walks them |
 | [`Projected`](#projected) | `def` | a fact of a type that reads the field tables, so it holds for one projection |
 | [`Remap`](#remap) | `rec` | where each type a merged layer made landed in the table it was merged into: an id below the layer's own range is its base's and stands, one in it is mapped |
 
@@ -113,6 +114,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`intern_pack`](#intern_pack) | the one type of a variadic pack |
 | [`intern_case_selector`](#intern_case_selector) | the type of a selector naming one case of a tag |
 | [`is_case_selector`](#is_case_selector) | whether `tid` is a case selector type |
+| [`elements`](#elements) | the elements of `tid` as an array, `[N]T` or `^[N]T`: an outer `^` qualifies each element, as every element of a secret array is secret |
 | [`is_pack`](#is_pack) | whether `tid` is the variadic pack type |
 | [`case_selector_tag_type`](#case_selector_tag_type) | the tag a case selector type selects from |
 | [`intern_nominal`](#intern_nominal) | the type of a named record, union or tag |
@@ -1190,6 +1192,21 @@ whether `tid` is a case selector type
 | `tid` | the type asked about |
 | **returns** | true when it is, false for every other type and an id the store does not hold |
 
+### elements
+
+```mach
+pub fun elements(ti: *TypeInterner, tid: TypeId) res[opt[Elements], mach.base.fail.Fail]
+```
+
+the elements of `tid` as an array, `[N]T` or `^[N]T`: an outer `^` qualifies each element,
+as every element of a secret array is secret
+
+| Parameter | |
+| :--- | :--- |
+| `ti` | the type store |
+| `tid` | the type asked about |
+| **returns** | the elements, none for a type that is no array, or the failure growing the store |
+
 ### is_pack
 
 ```mach
@@ -1680,6 +1697,22 @@ pub fun fold(layer: *TypeInterner) err[mach.base.fail.Fail]
 `layer` folded into its base, which took nothing since the layer was made: each type, parameter,
 handle operand and field table the layer made appended there in order, so every id the layer
 gave names the same type in the base. its side's memos hold for the base after, uncut (side_take)
+
+## Elements
+
+```mach
+pub rec Elements {
+    elem:  TypeId;
+    count: u32;
+}
+```
+
+the elements of an array type, as a `$each` walks them
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `elem` | `TypeId` | the element type, `^` over the array's element where the array is secret whole |
+| `count` | `u32` | the element count |
 
 ## Projected
 
