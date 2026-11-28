@@ -19,5 +19,5 @@ Source: [`src/base/version.mach`](../../../src/base/version.mach)
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `MACH_VERSION` | `str` | `"7.3.0"` |  |
+| `MACH_VERSION` | `str` | `"7.3.1"` |  |
 
