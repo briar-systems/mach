@@ -39,7 +39,7 @@ In every function, a secret is refused wherever its value would show in timing:
 - an address, as in `@p` or `p[i]` through a secret pointer
 - an operand of `/` or `%`
 - an operand of float arithmetic
-- an argument of a variadic pack or a C-variadic call
+- an argument of a C-variadic call
 
 ```mach error secret value used as a branch condition
 fun same(given: ^u64, key: ^u64) u1 {
