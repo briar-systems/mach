@@ -33,6 +33,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`store_known`](#store_known) | store `v`, the tag place `eid` read in place when `borrowed`, to `dst`: the known case alone where `known_case` finds one, and the whole value otherwise, as `store_stated` stores it |
 | [`try_lower_comptime_intrinsic`](#try_lower_comptime_intrinsic) | lower a call of a comptime intrinsic a runtime value stands for: a comptime path, `$type_name`, `$type_id`, `$zeroize`, or a layout measurement as `$size_of` |
 | [`expr_span_of`](#expr_span_of) | where expression `eid` is written; an expression its syntax lacks records an internal failure and has the empty span |
+| [`lower_into`](#lower_into) | the value a store into `dest` consumes, as `lower_stored_rvalue` gives it, with `dest` armed as the place an aggregate value of `eid` is built in when `armed` holds |
 | [`lower_stored_rvalue`](#lower_stored_rvalue) | the value a store consumes |
 | [`branch_on`](#branch_on) | branch to `then_b` where the condition `eid` holds, else to `else_b` |
 | [`condition_value`](#condition_value) | the truth a branch tests of `v`, the value of the condition `eid`: a comparison, a logical operator or a runtime `sel` as it is, any other value compared equal to 1 |
@@ -177,6 +178,16 @@ pub fun expr_span_of(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.
 
 where expression `eid` is written; an expression its syntax lacks records an internal failure
 and has the empty span
+
+### lower_into
+
+```mach
+pub fun lower_into(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, armed: bool, dest: mach.lower.value.Value, in_place: bool, borrowed: *bool, built: *bool) res[mach.lower.value.Value, mach.base.fail.Fail]
+```
+
+the value a store into `dest` consumes, as `lower_stored_rvalue` gives it, with `dest` armed as the place an
+aggregate value of `eid` is built in when `armed` holds. `built` says it was built there, leaving nothing to store.
+whatever destination was armed before is armed again after
 
 ### lower_stored_rvalue
 
