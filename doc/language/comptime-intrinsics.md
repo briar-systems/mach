@@ -486,7 +486,8 @@ about storage.**
 | `$pointee_of` | no: `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no: the spelling is `^T` |
 | `$type_id` | no: `^T` is a different type from `T` |
-| `$fields` / `$cases` | no: a secret aggregate is refused, not walked |
+| `$fields` | no: a secret record is refused, not walked |
+| `$cases` | yes: naming a tag's cases reads no value |
 | type comparison (`f.type == u64`) | no: `^u64` is not `u64` |
 
 ## The type operand
