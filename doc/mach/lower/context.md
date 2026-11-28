@@ -202,6 +202,7 @@ pub rec LoopFrame {
     exit:        mirl.ir.id.Block;
     fin_depth:   u32;
     scope_depth: u32;
+    temps:       usize;
 }
 ```
 
@@ -213,6 +214,7 @@ a loop the walk is inside, which `brk` and `cnt` branch out of
 | `exit` | `mirl.ir.id.Block` | the block `brk` branches to |
 | `fin_depth` | `u32` | the `fin` blocks open when the loop began, which a jump out of it runs down to |
 | `scope_depth` | `u32` | the locals whose storage had begun when the loop began, whose storage a jump out of it does not end |
+| `temps` | `usize` | the temporaries begun when the loop began, whose storage a jump out of it does not end |
 
 ## Machine
 
