@@ -9,6 +9,16 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.3.1] - 2026-11-28
+
+### Changed
+- Builds against masc 0.2.3, mirl 0.5.1 and std 10.3.0. Through std 10.3.0 the compiler's own `std.math.bits` calls compile to the target's instruction where it has one, and its `^` copies move 16-byte chunks on x86_64 and aarch64.
+
+### Fixed
+- On x86_64, where SSE4.1 is not selected, a scalar float held in a stack slot and then written to lane 0 of a float vector came out with the vector's other lanes zeroed. Every 7.x release through 7.3.0 has it, with and without `-O`, and 7.3.0 reached it in more code. Fixed through masc 0.2.3, whose x86 table stated a register-to-register `movss` or `movsd` as overwriting its whole destination.
+- `-O --verify` on vulkan SPIR-V refused a valid program with an internal error in 7.3.0, where a pass that retyped a value left a debug record behind. Fixed through mirl 0.5.1. Generated code was not affected.
+- A `#[constant_time]` pack function that forwards its arguments to another, `count(va...)`, is no longer refused as passing a secret when every element of the instance is public. Each instance decides from its own elements, and one with a `^` element is still refused at the call that formed it (#5075).
+
 ## [7.3.0] - 2026-11-28
 
 ### Added

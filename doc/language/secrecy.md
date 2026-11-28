@@ -773,7 +773,10 @@ A constant-time function may pass a secret only to a callee that
 "Passing a secret" reaches through pointers: an argument whose type holds a
 secret anywhere it reaches, as `*^u8` or a record with a `^` field, as
 `$holds_secret` answers, counts, and the refusal is `secret.call_untrusted`,
-naming the type. masc's walk checks the same at the machine level from the
+naming the type. A pack spread (`count(va...)`) passes the instance's elements,
+so each instance of a pack function decides it from its own element types: one
+whose elements are all public may forward them anywhere, and one with an element
+holding a secret is refused at the call that formed it. masc's walk checks the same at the machine level from the
 callee's declaration, or the one a marked function type states, and the calling
 convention: a secret in a register or
 stack slot the callee's declaration says is public is refused, and so is any
