@@ -11,7 +11,7 @@ records in a tab-separated encoding for line tools ([below](#the-lines-encoding)
 each diagnostic, a failure
 raised outside the compiler's diagnostics (a manifest, dependency, build-step,
 link or command-line refusal) included, each [note](#notes) a command writes, each test result under `mach test`, the build
-readout under `-v` and `-vv`, and a closing summary. The records are the contract: the human text may change from
+readout under `-v` and `-vv`, the host and the targets `mach info` shows, and a closing summary. The records are the contract: the human text may change from
 release to release, and a record changes only under the
 [stability rule](#stability). The flag changes no exit code.
 
@@ -29,7 +29,9 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
   the same reports. The results the human rendering writes to stdout are not
   written. Stdout keeps the listings a command writes, such as `mach test
   --list`, `mach dep list` or the listing `mach check --declassified` writes,
-  which stay plain lines.
+  which stay plain lines. The page of `mach info` and the table of `mach info
+  targets` are not kept: [info records](#info-records) are written in their
+  place, and stdout stays empty.
 - Every line mach writes to stderr is a record, a JSON object on a line of its
   own, and the last one is the [summary](#the-summary-record). Output a build
   step or a test writes itself is not mach's and is not a record.
@@ -119,9 +121,16 @@ the constant-time validator does.
 ## Failures
 
 A failure raised outside the compiler's diagnostics is a diagnostic record, as
-the human rendering shows it as a diagnostic: the snippet at its place and its
-related places. Its `severity` is `"error"`, its `code` the
-failure's key, and its `notes` and `help` are empty.
+the human rendering shows it as a diagnostic: the snippet at its place, its
+related places and its notes. Its `severity` is `"error"`, its `code` the
+failure's key, its `notes` the lines the failure carries, in order, and its
+`help` is empty. A refusal of a dependency's manifest carries one note naming
+the chain of projects from the root that reaches the dependency, such as
+`"reached through app -> lib"`. A failure met while cleaning up after the
+failure is a note on it, such as `"cleanup also failed: cannot remove the build
+step staging area '...' (permission denied)"`, and so is a later check of a
+build step that also failed, such as `"the step also failed: ..."`. The
+`message` is always the primary failure's own text.
 
 ```json
 {"schema":3,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`. an image takes its entry symbol from a module its artifact's entry reaches, so write a `use` of the module that defines it in that entry","origin":"link","primary":{"file":"mach.toml","line":43,"column":9,"end_line":43,"end_column":24,"byte_start":622,"byte_end":637},"related":[],"notes":[],"help":[],"fixes":[]}
@@ -218,10 +227,10 @@ a `test` record per test in the order the tests finish, and closes with a
 
 ```json
 {"schema":3,"record":"run_start","tests":4}
-{"schema":3,"record":"test","name":"app.bin.main#passes","module":"app.bin.main","file":"src/bin/main.mach","line":9,"index":0,"target":"linux-x86_64","profile":"debug","outcome":"pass","code":0,"timeout_ns":0,"duration_ns":459535,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
-{"schema":3,"record":"test","name":"app.bin.main#fails_on_purpose","module":"app.bin.main","file":"src/bin/main.mach","line":13,"index":1,"target":"linux-x86_64","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":641207,"exe":"./out/linux-x86_64/debug/test/app/app","output":"./out/linux-x86_64/debug/test/app/log/1.log","origin":"test"}
-{"schema":3,"record":"test","name":"app.bin.main#skips_here","module":"app.bin.main","file":"src/bin/main.mach","line":17,"index":2,"target":"linux-x86_64","profile":"debug","outcome":"skip","code":77,"timeout_ns":0,"duration_ns":803249,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
-{"schema":3,"record":"test","name":"app.parser#rejects_trailing_comma","module":"app.parser","file":"src/parser.mach","line":5,"index":3,"target":"linux-x86_64","profile":"debug","outcome":"pass","code":0,"timeout_ns":0,"duration_ns":964561,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#passes","module":"app.bin.main","file":"src/bin/main.mach","line":9,"index":0,"target":"linux-x86_64","profile":"debug","outcome":"pass","cause":null,"code":0,"timeout_ns":0,"duration_ns":459535,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#fails_on_purpose","module":"app.bin.main","file":"src/bin/main.mach","line":13,"index":1,"target":"linux-x86_64","profile":"debug","outcome":"exit","cause":null,"code":3,"timeout_ns":0,"duration_ns":641207,"exe":"./out/linux-x86_64/debug/test/app/app","output":"./out/linux-x86_64/debug/test/app/log/1.log","origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#skips_here","module":"app.bin.main","file":"src/bin/main.mach","line":17,"index":2,"target":"linux-x86_64","profile":"debug","outcome":"skip","cause":null,"code":77,"timeout_ns":0,"duration_ns":803249,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.parser#rejects_trailing_comma","module":"app.parser","file":"src/parser.mach","line":5,"index":3,"target":"linux-x86_64","profile":"debug","outcome":"pass","cause":null,"code":0,"timeout_ns":0,"duration_ns":964561,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
 {"schema":3,"record":"run_end","passed":2,"failed":1,"skipped":1,"total":4,"duration_ns":1574518,"mismatch":1,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"origin":"test"}
 {"schema":3,"record":"skip","target":"linux-aarch64","profile":"debug","reason":"not native to this host"}
 ```
@@ -243,6 +252,7 @@ A `test` record adds how it ended:
 | Member | Type | Meaning |
 |---|---|---|
 | `outcome` | string | `"pass"`, `"skip"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
+| `cause` | string or `null` | what refused its launch, as the system said it, when its outcome is `"spawn"` and the refusal was the system's, otherwise `null` |
 | `code` | integer | its exit code, or `0` when it has none |
 | `timeout_ns` | integer | the bound it exceeded in nanoseconds when its outcome is `"timeout"`, otherwise `0` |
 | `duration_ns` | integer | how long it ran, in nanoseconds |
@@ -265,6 +275,79 @@ that skipped (exit 77, see [test.md](test.md#semantics)) has the outcome
 
 None of these records carries a `severity` or counts in a summary total. The
 summary's `outcome` and `exit_code` say whether a test failed.
+
+## Info records
+
+Under `mach info` the page is one `host` record, and under `mach info targets`
+the table is one `target` record a row, in the table's order. The text is not
+written. Both are read from the catalog the text is written from, so a record
+says what its row of the table says, with no cell to cut and no mark to read.
+
+```json
+{"schema":3,"record":"host","mach":"7.3.0","name":"linux-x86_64","sys":"linux","arch":"x86_64","env":null,"abi":"sysv64","isa":"cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2","code_model":"small","linkage":"static","object":"elf"}
+```
+
+```
+host	schema=3	mach=7.3.0	name=linux-x86_64	sys=linux	arch=x86_64	abi=sysv64	isa=cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2	code_model=small	linkage=static	object=elf
+```
+
+A **host** record is the compiler's version and the target the host resolves to,
+each part as the target took it:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `mach` | string | the compiler's version |
+| `name` | string | the host as `-t` takes it, `<sys>-<arch>` |
+| `sys` | string | its system |
+| `arch` | string | its architecture |
+| `env` | string or `null` | its environment, `null` for a host that states none |
+| `abi` | string or `null` | its calling convention, `null` where its architecture names none |
+| `isa` | string or `null` | the instruction set it stands on, whole as `--isa` takes it, `null` where its system states none |
+| `code_model` | string or `null` | its code model, `null` where the host offers none |
+| `linkage` | string or `null` | how an executable is linked for it, `null` where the host runs none |
+| `object` | string | its object format |
+
+A **target** record is one target a build can be made for and what a target
+spelled so accepts:
+
+```json
+{"schema":3,"record":"target","name":"linux-riscv32","sys":"linux","arch":"riscv32","envs":[{"default":true,"name":null,"linkages":[{"default":true,"name":"static","abi":null}]},{"default":false,"name":"gnu","linkages":[{"default":true,"name":"pie","abi":null},{"default":false,"name":"dynamic","abi":null},{"default":false,"name":"static","abi":null}]}],"abis":[{"default":false,"name":"ilp32"},{"default":false,"name":"ilp32f"},{"default":false,"name":"ilp32d"}],"code_models":[{"default":true,"name":"medany"}],"needs_isa":true}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `name` | string | the target as `-t` takes it, `<sys>-<arch>` |
+| `sys` | string | its system, as a manifest's `sys` names it |
+| `arch` | string | its architecture, as a manifest's `arch` names it |
+| `envs` | array of choice | the environments a target of the row can take, each with its `linkages` |
+| `abis` | array of choice | the calling conventions it accepts |
+| `code_models` | array of choice | the code models it accepts, empty where it has none |
+| `needs_isa` | boolean | whether the target must name its instruction set, with `--isa` or a manifest's `isa`: `true` where its system bounds the machine not at all |
+
+A **choice** is an object, one value of a part of the target:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `default` | boolean | whether the target takes this choice when it names none. No choice of a list is the default where the target must name one, as `linux-riscv32` must name its calling convention |
+| `name` | string or `null` | the choice as its flag and its manifest key take it: `--env` and `env`, `--abi` and `abi`, `--code-model` and `code_model`, `--linkage` and `linkage`. `null` only in `envs`, for the hosts that state no environment, which a target takes by naming none, so that element is always the default |
+| `linkages` | array of choice | in `envs` only: how an executable may be linked under the environment, empty where the target runs no executable there, as `vulkan-spirv` runs none |
+| `abi` | string or `null` | in `linkages` only: the calling convention the linkage holds under. `null` where the environment's linkages are the same whatever the convention. Where they follow the convention, each convention lists its own linkages and marks its own default, so a tool keeps the linkages whose `abi` is `null` or the convention it chose |
+
+`abis` and `code_models` are the row's, read with nothing narrowed, and
+`linkages` those of each environment, as the table lists them. A boolean is
+`true` or `false` in both encodings. Under `lines` every choice opens with its
+`default`, which is never left out, so each `envs.default` opens an environment
+and each `envs.linkages.default` after it a linkage of that environment:
+
+```
+target	schema=3	name=linux-riscv32	sys=linux	arch=riscv32	envs.default=true	envs.linkages.default=true	envs.linkages.name=static	envs.default=false	envs.name=gnu	envs.linkages.default=true	envs.linkages.name=pie	envs.linkages.default=false	envs.linkages.name=dynamic	envs.linkages.default=false	envs.linkages.name=static	abis.default=false	abis.name=ilp32	abis.default=false	abis.name=ilp32f	abis.default=false	abis.name=ilp32d	code_models.default=true	code_models.name=medany	needs_isa=true
+```
+
+A target that runs no executable and has no code model lists neither:
+
+```json
+{"schema":3,"record":"target","name":"vulkan-spirv","sys":"vulkan","arch":"spirv","envs":[{"default":true,"name":null,"linkages":[]},{"default":false,"name":"vulkan1.0","linkages":[]},{"default":false,"name":"vulkan1.1","linkages":[]},{"default":false,"name":"vulkan1.2","linkages":[]},{"default":false,"name":"vulkan1.3","linkages":[]}],"abis":[{"default":true,"name":"shader"}],"code_models":[],"needs_isa":false}
+```
 
 ## Readout records
 
@@ -445,7 +528,7 @@ other member as `key=value` in the record's order, each part separated by one
 tab. A member of a nested object is keyed by the path to it joined with `.`
 (`primary.line=12`), each element of an array repeats the array's key
 (`notes=first` then `notes=second`, `related.file=a` per related site), so an
-empty array writes nothing, and a `null` member is left out. In a value a tab, a newline and a backslash are
+empty array writes nothing, and a `null` member is left out. A boolean is written `true` or `false`. In a value a tab, a newline and a backslash are
 written `\t`, `\n` and `\\`, so every tab on a line is a separator. Nothing is
 quoted, padded or aligned, and `awk -F'\t' '$1=="test"'` selects every test
 record.
@@ -463,6 +546,8 @@ summary	schema=3	errors=0	warnings=0	notes=0	outcome=failure	exit_code=1	time_us
   counted. Schema 2 wrote a failure as a diagnostic record, where schema 1 wrote
   it as a `"failure"` record.
 - `rebuilt` in a `built` object is a compatible addition under schema 3.
+- The `host` and `target` records of `mach info`, and the boolean members they
+  carry, are compatible additions under schema 3.
 - **Compatible changes keep the version:** a new member in a record or a span,
   a new record type, and a new value of an enumerated member (`severity`,
   `origin`, `record`). A tool ignores members it does not know, skips records

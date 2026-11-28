@@ -9,7 +9,7 @@ empty or placeholder text
 
 Source: [`src/manifest/refusal.mach`](../../../src/manifest/refusal.mach)
 
-Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md).
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.manifest.version`](version.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -31,6 +31,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | [`span_site`](#span_site) | where `sp` is written in the manifest being parsed, as a range whose file `parse` names once the manifest parses; the zero place for a value the parser did not write |
 | [`element_sites`](#element_sites) | where each element of `arr` is written, in order, as `span_site` places it; nil for an empty array |
 | [`at_sites`](#at_sites) | `f` pointing at the first spanned place of the `n` at `sites`, naming the spanned ones after it as related |
+| [`range_at`](#range_at) | `text`, the value of the manifest key `label`, read as a version range: every place a manifest's range enters the compiler reads it through here, so a range that does not parse is refused at its key in the same words whichever reader met it first |
 
 ---
 
@@ -152,4 +153,22 @@ pub fun at_sites(alloc: *std.allocator.Allocator, f: mach.base.fail.Fail, sites:
 
 `f` pointing at the first spanned place of the `n` at `sites`, naming the
 spanned ones after it as related
+
+### range_at
+
+```mach
+pub fun range_at(alloc: *std.allocator.Allocator, label: str, text: str, at: toml.value.Span) res[mach.manifest.version.Range, mach.base.fail.Fail]
+```
+
+`text`, the value of the manifest key `label`, read as a version range: every place a
+manifest's range enters the compiler reads it through here, so a range that does not parse
+is refused at its key in the same words whichever reader met it first
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns a refusal's text |
+| `label` | the key as the refusal names it, `[project].mach` or `[dep.<id>].version` |
+| `text` | the value, which the range's pre-release identifiers borrow, so it outlives the range |
+| `at` | where the value is written, the zero span when it is not |
+| **returns** | the range, or its refusal pointing at `at` |
 

@@ -17,7 +17,7 @@ bare `# ---` that opens a docstring's component block is not one.
 the test tree's shell scripts, manifests, harness configuration and C and assembly fixtures are held to
 the same rule: a `#` comment in each, and a `//` or `/* */` comment in C.
 
-usage: doc-markers.py [root ...]   (doc/language, src and test by default; a root holding .md files only is
+usage: doc-markers.py [root ...]   (doc/language, doc/guide, src and test by default; a root holding .md files only is
 checked as documentation and any other as source; GH_REPO names the repository; gh reads GH_TOKEN)
 """
 import os
@@ -169,7 +169,7 @@ def issue_state(repo, number, cache):
 
 
 def main():
-    roots = sys.argv[1:] or ["doc/language", "src", "test"]
+    roots = sys.argv[1:] or ["doc/language", "doc/guide", "src", "test"]
     repo = os.environ.get("GH_REPO", "briar-systems/mach")
     cache, failed = {}, 0
     for root in roots:

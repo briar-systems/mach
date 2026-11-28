@@ -118,7 +118,7 @@ failure.
 | check | command |
 |---|---|
 | formatter | `"$MACH" fmt --check .` |
-| committed reference | `"$MACH" doc . -o out/docgen -q`, then compare `out/docgen/mach` with `doc/mach`: every page and nothing else |
+| committed reference | `"$MACH" doc . -o doc -q`, then `git status --short doc/mach` prints nothing: the run rewrites every page and removes any other |
 | editor library | `"$MACH" check . -a editor` |
 | documented flags are accepted | `python3 .github/scripts/doc-flags.py "$MACH" doc` |
 | doc and source markers cite open issues | `GH_TOKEN=$(gh auth token) GH_REPO=briar-systems/mach python3 .github/scripts/doc-markers.py` |

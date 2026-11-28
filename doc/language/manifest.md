@@ -151,7 +151,7 @@ ref = "branch/main"
 | Key       | Type   | Meaning |
 |-----------|--------|---------|
 | `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. It must start with a letter or `_` and hold only letters, digits and `_`, so that a `use` path can name it, and a manifest with any other id is refused. `mach init` derives one from the directory's name, writing each `-` as `_`. Read by `$project.id`. |
-| `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
+| `version` | string | Project version, a [semver 2.0.0](https://semver.org) version: `major.minor.patch`, each a number without a leading zero, optionally followed by a `-pre-release` and a `+build` (`1.2.3`, `1.3.0-rc.1`, `1.3.0+ci.4`). Anything else, a two-part `1.2` or a range such as `^1.2.3` included, is refused. A release's tag names this version (see [dependencies.md](dependencies.md#releases-and-resolution)). Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.arch}`/`{target.sys}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
 | `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^7"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
@@ -489,7 +489,7 @@ A mnemonic or a register that needs an extension the target does not select,
 outside such a function, is refused, naming the instruction and what it needs:
 
 ```
-error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, or in the function's `#[extension]`
+error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, in the function's `#[extension]`, or in the block's head for that block alone
 ```
 
 The check runs where the block is assembled, so `mach build` reports it and
@@ -761,7 +761,7 @@ vulkan-spirv           *none,vulkan1.0,vulkan1.1,vulkan1.2,vulkan1.3  *shader   
 value a line, the keys in a column of their own:
 
 ```
-mach        7.2.0
+mach        7.3.0
 host        linux-x86_64
 isa         cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2
 sys         linux
@@ -771,6 +771,10 @@ code_model  small
 linkage     static
 object      elf
 ```
+
+Under `--report json` and `--report lines` neither text is written: the table is a
+`target` record a row and the page one `host` record, which state the same catalog with
+nothing to cut out of a cell ([report-records.md](report-records.md#info-records)).
 
 A value outside its axis's set is refused when the target resolves, so a typo is
 caught rather than silently never matching.
@@ -1187,7 +1191,10 @@ pub fun add(a: i32, b: i32) i32 {
   freestanding targets need `_start` too.
 - **A `bin` with no `_start`** is still a module of its exports, as it was before
   `kind = "module"` built one on wasm. That form is deprecated and mach 8 refuses
-  it: state `kind = "module"` for a module of exports.
+  it: state `kind = "module"` for a module of exports. Until then the build warns
+  at the artifact's `kind` (`artifact.entryless_bin`), each build of it, a link left
+  up to date included, since the link decides it: an archive or a `-l` input can
+  define the `_start` the build's own objects do not.
 - **Memory.** As on `wasi`: the stack lies at the bottom of linear memory, from its
   base down to address zero, 64 KiB unless `stack_reserve` states its size, and the
   data starts at the base, so a stack overflow traps below address zero. The memory's
@@ -1215,6 +1222,36 @@ const { instance } = await WebAssembly.instantiate(bytes, imports);
 console.log(instance.exports.add(2, 3));
 const memory = new Uint8Array(instance.exports.memory.buffer);
 ```
+
+### The compiler as a wasi program
+
+mach itself builds for `wasi-wasm32` (`mach build . -t wasi-wasm32 -a mach` in the
+compiler's own project), and a release ships it as `mach.wasm`, for a host that has a
+WASI runtime and no native compiler, a browser among them. It is the same compiler,
+built without what preview 1 cannot give a program, and it says so where a command
+needs one of them:
+
+- **One thread.** A build compiles on the one thread the module has. `--threads 1` is
+  accepted, and a count above one is refused as `cli.flag_value`, naming that the host
+  has no threads.
+- **No child process.** Nothing is started, and a command says so where it would start
+  one, with the cause `this host cannot start a process`: a `[step]` as `step.spawn`, the
+  program or `runner` of `mach run` as `process.spawn`, and the git that `mach dep`
+  fetches a dependency through as `git.missing`. `mach test` refuses each selection whose
+  tests it would launch as `process.spawn`, before it builds one, and `mach test --list`
+  builds and lists them. A path dependency, `mach check`, `mach build`, `mach fmt` and
+  `mach info` need none.
+- **No ending event.** Nothing interrupts the module, so a command runs to its end.
+- **No terminal control.** No descriptor is taken to be a terminal, so there is no live
+  progress line.
+- **No object cache.** The cache keys every object on the compiler that made it, by the
+  digest of the running image's file, and a wasm module cannot read its own image. So
+  nothing in `obj/` is restored and every build compiles every module, as under
+  `--no-cache`. `-vv` reports it under the cache phase.
+
+Each of these is a capability the build asks std for (`std.system.capability`), not the
+name of the system, so a later preview that has threads or processes gets them by
+claiming the group.
 
 ### UEFI targets
 
@@ -1507,6 +1544,7 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `secret.target_unenforceable` | an `#[constant_time]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
 | `readout.clock_refused` | the clock refuses a read while the back end times a module, so a row of the build's stage times is incomplete | no |
 | `link.report` | a link that succeeds reports something about the image as a whole, one warning per line mink reports | no |
+| `artifact.entryless_bin` | a `bin` links with no entry where its system takes an image with none, so it is a module of its exports, a form mach 8 refuses: a freestanding `wasm32` `bin` that defines no `_start` (see [Freestanding wasm](#freestanding-wasm)). State `kind = "module"` | no |
 
 A kind decided by source warns or not from the source text alone, whatever the
 target, goal or profile. Only such a key is reported when an `#[expect]`
@@ -2039,6 +2077,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. On an entry of `kind = "module"` it is the import module's name and optional: absent, it is the key. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
+| `dir`     | absent: a framework of the system's | The directory a `source = "framework"` entry's bundle `<name>.framework` lies in, for a framework outside the system's. A template anchored as `path` is. Refused on any other source. See [Frameworks](#frameworks). |
 | `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
 | `sys`      | yes | Filter axis: an array of canonical `sys` values or `"*"` (any); `[]` matches none. |
 | `arch`     | yes | Filter axis over `arch`, same forms. |
@@ -2169,20 +2208,47 @@ libraries is refused, naming the symbol and both libraries. On Mach-O the entry'
 such as `@rpath/libMoltenVK.dylib`, since no file is read to learn it, and a bare
 name such as `MoltenVK` is refused before the link, naming the entry.
 
-Everything else is a file: a `static` entry, a `local` entry, a `framework`, and
-every entry on ELF and wasm. ELF stays file based because only the `.so` states
+Everything else is a file: a `static` entry, a `local` entry, a `framework` entry
+that states a `dir`, and every entry on ELF and wasm. ELF stays file based because only the `.so` states
 what an import needs there, its symbol versions and the size of data a copy
 relocation moves. A shared library whose symbols the build does not know, one
 whose imports come from C objects with no claim, is linked from its import
 library with a `local` entry.
 
-A `system` entry that is not linked from its claim, and a `framework` entry, is
-found by name through mink's library search as the link runs, in each `-L` directory, then the working directory, then the
-system's directories the target's host row states. A `local` entry names its
+A `system` entry that is not linked from its claim is found by name through
+mink's library search as the link runs, in each `-L` directory, then the working
+directory, then the system's directories the target's host row states. A
+`framework` entry is found as [Frameworks](#frameworks) says. A `local` entry names its
 file. Whether an input links **statically** or **dynamically** follows the file
 found — a loose `.o`/`.obj` or static `.a`/`.lib` links statically, and an ELF
 `.so`, Mach-O `.dylib` or PE `.dll` is recorded by its format's canonical loader
 name.
+
+### Frameworks
+
+A `framework` entry with no `dir` is a framework of the system's, linked from its
+claim as a shared system library is, and no file is searched for or read. The
+image loads it by its install name, its binary in its bundle in the system's
+framework directory, `/System/Library/Frameworks/<name>.framework/<name>` on
+macOS, which dyld finds there or in its shared cache. Each symbol the program
+takes from it is one the entry's `symbols` lists or a `#[library]` import of the
+entry, as for any library linked from its claim. So a macOS program links its
+system frameworks from any host with no SDK.
+
+A framework outside the system's is found as a file. Its entry states `dir`, the
+directory its bundle lies in, and the link looks in that directory for
+`<name>.framework/<name>.tbd`, then `<name>.framework/<name>`, and loads the
+framework by the install name the file states. A framework found in no such
+directory is refused, naming each directory searched.
+
+The link's framework directories are each `-F <dir>` the command line gives, in
+order, then the `dir` of each `framework` entry the link takes. A framework of
+the system's is looked for in them too, and one found there is linked from its
+file, so `-F` can stand a framework of the system's in for a build. One none of
+them holds is linked from its claim. A framework whose name is empty or holds a
+`/`, which names no bundle, is refused, with a note that no framework directory
+holds it. The same framework stated by two entries in different directories is
+refused.
 
 A `system` entry whose `name` is a bare library name is looked for as one kind
 alone, `kind = "shared"` unless the entry says `kind = "static"`. There is no
@@ -2409,13 +2475,15 @@ digest leaves the output as it is: same bytes, same modification time, same
 file. Every file's bytes are read and hashed every time; sizes and times decide
 nothing. A link that reads a library found by name in a search directory always
 runs, since the key names such a library and not its contents: a `system` or
-`framework` entry linked from a file, `-l`, or a claim of an archive's member
-naming a library found that way. Anything else, a missing or changed output,
+`framework` entry linked from a file, `-l`, or a claim naming a library or a
+framework found that way. Anything else, a missing or changed output,
 another key or a damaged record, links as before.
 
 `--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`
-removes the tree with the rest of the output.
+removes the tree with the rest of the output. `--verify` and `--passes` build
+the same way, since a cached object carries no verifier run and no pass report:
+a build asked to verify or to report compiles every module and links again.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step

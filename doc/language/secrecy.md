@@ -135,13 +135,22 @@ of a count at or above the operand width ([operators.md](operators.md#bitwise))
 is a compare to an all-ones-or-zero mask and a mask on the count and the
 value, with no branch, so it reveals nothing the shift itself would not.
 
-A secret value passed to a variadic pack is also rejected, including a secret
-wrapped inside an aggregate. A pointer to secret storage (`*^u8`) is accepted:
-the pack's instance keeps its type, so its body reads `^u8` through it and every
-gate below holds there. A pack function that wipes several buffers is written so.
-A C variadic accepts neither, as its callee is untyped foreign code. Printing a
-pointer to secret storage through `std.format` is refused at the call, since its
-type has no rendering there: the weld keeps it from becoming a `ptr`.
+A variadic pack takes a secret value like any other argument. Its instance keeps
+each element's type, so its body reads the `^` element and every gate below
+holds there, as it does for a pointer to secret storage (`*^u8`). Formatting a
+secret is refused by the library that formats, not by the language: `std.format`
+and `std.print` render no `^` type, since output is a public place, and refuse a
+`^` argument at the call, telling the author to write `:>` there. A pointer to
+secret storage is refused the same way, as the weld keeps it from becoming a
+`ptr`.
+
+A C variadic accepts neither a secret value nor a value holding one
+(`secret.variadic`). Its extra arguments have no declared type for the value to
+stay `^` in, and a secret reaches a public place only by an explicit
+declassification, so the author writes `:>` to pass one. A pack spread into a
+C variadic (`c_printf(fmt, va...)`) is that many extra arguments, and each
+pack instance holds each of its elements to the same rule at the spread, the
+narrow-integer and `f32` promotions included.
 
 The gates hold in **every** function, whether or not it carries
 `#[constant_time]`. Branching, indexing, addressing or dividing on a `^` value
@@ -282,19 +291,27 @@ whether `u32` is `U` stripped, so it checks only that the target is public and
 each instance settles the equality under its concrete arguments, the way every
 other secrecy gate is checked against the instance.
 
-## Secrets have no compile-time value
+## A secret chooses no code or layout
 
 A module constant whose type holds a secret (`val K: ^u64 = 7;`, a `^[N]u8`
 array, a record or tag with a secret field) is a run-time value like any other
-secret. It has no compile-time value: wherever the compiler asks for one, a
-read of it is refused as `secret.comptime`. That covers every comptime
-argument (`take(K)` for `fun take($c: u64)`), an array, window or field length
-(`[K]u8`, `a[0, K]`), `$size_of`, `$align_of` and `$length_of` of a type that
-spells one, a `$if` gate in a function or at module scope, a `$each` over a
-secret constant array, a decorator argument (`#[align(K)]`), and a public field
-or element read of a secret constant (`K[0]`). A literal is public, and a public
-field of a constant that holds a secret elsewhere keeps its compile-time value
-(`C.count` of `R{count: 4, key: 9}`).
+secret. A compile-time value chooses which code or layout exists, and choosing
+by a secret is the compile-time form of branching on it, so wherever the
+compiler asks for a compile-time value a read of a secret is refused as
+`secret.comptime`. That covers every comptime argument (`take(K)` for
+`fun take($c: u64)`), an array, window or field length (`[K]u8`, `a[0, K]`),
+`$size_of`, `$align_of` and `$length_of` of a type that spells one, a `$if`
+gate in a function or at module scope, a decorator argument (`#[align(K)]`),
+and a public field or element read of a secret constant (`K[0]`). A literal is
+public, and a public field of a constant that holds a secret elsewhere keeps
+its compile-time value (`C.count` of `R{count: 4, key: 9}`).
+
+A `$each` over a secret constant array, `[N]^T` or `^[N]T`, is accepted: the
+count comes from the array's type, and each element is a run-time `^T` in the
+body, held there to every gate above. `$if (x == 1)` on one is refused as a
+branch on a secret (`secret.branch`), `b[x]` as a secret index
+(`secret.index`), and a length (`[x]u8`) or a comptime argument (`take(x)`) as
+`secret.comptime`, the same as the constant itself would be.
 
 `:>` of a constant is itself compile-time evaluable, so an author who means the
 value writes the declassification where it is used, as anywhere else:
@@ -315,8 +332,8 @@ Inside a `#[constant_time]` function that cast is listed by
 `mach check --declassified` like any other. A constant's own initializer may
 read secret constants when its declared type holds a secret
 (`val K2: ^u64 = K + 1;`), and the value it binds is secret in turn. A comptime
-parameter declared with a type that holds a secret (`$c: ^u64`) is a
-contradiction, and its declaration is refused. Mach has no explicit tag
+parameter declared with a type that holds a secret (`$c: ^u64`) would choose
+code by a secret, and its declaration is refused. Mach has no explicit tag
 discriminator values and no field defaults, so neither can name a secret.
 `#[embed]` cannot produce a secret array: the embedded bytes are public by
 type (`[_]u8` or `[N]u8`, and `^[_]u8` is refused as `embed.type`), so a key

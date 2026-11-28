@@ -9,6 +9,44 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.3.0] - 2026-11-28
+
+### Added
+- `#[intrinsic("mirl", "ir", name)]` declares a function as one of mirl's own operations on every target: `popcnt`, `clz`, `ctz` and `bswap`. A call lowers to the operation, the declaration is held to the operation's signature where it is written, and a function value of it links. A body, a type, `$` or pack parameter, another set or a name outside the list is refused (#5032).
+- The compiler ships as a wasi program. A release publishes `mach-<version>-wasm32-wasi.tar.gz`, holding `mach.wasm` and `LICENSE` and listed in `SHA256SUMS`. It runs on one thread, starts no process, takes no ending event, draws no terminal and keeps no object cache, and the manual's "The compiler as a wasi program" says how each is refused (#5038).
+- A `source = "framework"` link entry takes `dir`, the directory its bundle lies in, a project-relative path carried to consumers as a local `path` is. `build` and `test` take `-F, --framework-dir <dir>`, repeatable, and `run` refuses it as it refuses `-L`. An entry with `dir` is found there or refused with every directory searched (#5028).
+- `mach info` and `mach info targets` write one `host` record, or one `target` record per catalog row, under `--report json` and `--report lines`, in place of their text. Records gain booleans, and the schema stays 3 (#5026).
+- A failure carries notes. A refused dependency manifest says `reached through <chain>`, and a cleanup that also failed or a step's later failed check is a note where its text was joined into the message. A failure record's `notes` hold them (#5065).
+- The guide machlang.org/docs renders lives in `doc/guide`, so a release's tag carries the guide for that release, its links opening that release's `doc/language` (#5044).
+
+### Changed
+- A pack function takes `^` arguments, its body checked for each `^` element as any function's is. `$cases` of a `^` tag walks the tag's cases, and `$each` walks a `^` constant array, `[N]^T` or `^[N]T`, each element a run-time `^T` in the body. `sel` on a `^` tag's case and a `^` argument in a C variadic tail stay refused (#5072, #5077).
+- **Breaking:** a pack spread into a C variadic, `c_printf(fmt, va...)`, is checked element by element in each instance, for secrecy and the narrow integer and `f32` promotions, as a plain argument is, and refused at the call that formed the instance. A chain of more than 64 pack functions passed such an element through unchecked (#5072).
+- **Breaking:** a placement decorator the target cannot honour is refused at the decorator as `target.unsupported_op`, with and without `--verify`, where the build dropped it, or stopped with an internal error under `--verify`. That is a function's `#[align]`, `#[section]` or `#[naked]` on freestanding wasm32, wasi-wasm32 or vulkan SPIR-V, and a global's `#[at]`, `#[align]` or `#[section]` on vulkan SPIR-V. Leave it out, or declare it under a `$if` that leaves the target out (#5059).
+- **Breaking:** `--threads` above 1 is refused as `cli.flag_value` on a host with no threads, as under the wasi compiler (#5038).
+- **Breaking:** `[project].version` is held to the version grammar, `major.minor.patch` with an optional `-pre` and `+build`, and anything else is refused as `version.invalid` at the value. `$project.version.*` and the windows version resource read it by the same grammar. No released project of the family is affected (#5043).
+- A manifest's version range is parsed once, where it enters, and carried parsed, so a range in a dependency's manifest is refused at its key in that file, in the words the manifest check uses (#5052).
+- `mach dep pull`, `dep update`, `dep add`, `dep remove`, `dep verify` and `dep outdated` hold the root manifest to the full manifest check before they act, so an invalid root is refused before anything moves. `dep list` still lists it, with the refusal as a note (#5055).
+- `dep update <name>`, `dep add` and `dep remove` read every pin they must keep before they move anything. A pin that cannot be read refuses the command, naming the dependency and `mach dep pull`, and a pin no release tag names is refused as `dep.unpinned`, where either was left free to move (#5051).
+- `mach dep list` shows a range that does not parse as `invalid` with a note, and `mach dep outdated` shows a pin whose release cannot be read as `unknown`, where they read as satisfied and as no pin (#5047).
+- A build with `--verify` turns the object cache off and compiles and verifies every module, as `--passes` does, where it could answer `unchanged` from cached objects no verifier had read. It writes no cached object either (#5058).
+- A verifier refusal is worded in mirl's terms, its rule, why and symbol, at the source place mirl states for it (#5054).
+- A freestanding `wasm32` `bin` that defines no `_start` warns at its `kind` as `artifact.entryless_bin`, on a fresh link and on an up-to-date one. A profile's `allow` acknowledges it (#5017).
+- `mach test` says why a test could not be launched, `test <name> could not be launched (<cause>)`, and the `test` record gains `cause`. A host that starts no process refuses each group the run would launch before building it, as `process.spawn` (#5068).
+- Every temporary's storage begins and ends around the statement or condition that makes it, where only an expression statement's or a declaration's were marked, so temporaries share frame storage. mach's own frames take about 6% fewer bytes (#5076).
+- `doc/language/decorators.md` says that `#[section]` names the object's section, or a wasm object's data segment, and that a linked image with no named sections holds none (#5062).
+- Builds against mirl 0.5.0, mink 0.2.0, masc 0.2.2 and std 10.2.0, by way of masc 0.2.0 and mirl 0.3.2 (#5016) and mirl 0.3.4 (#5025). Through mirl 0.5.0 a `^` value is optimized as any other outside constant-time functions, frame slots of different sizes share storage there, the slots made for one call last only for that call and a by-value stack argument is copied once, store-to-load forwarding crosses blocks, `--verify` refuses a use of a slot's address outside the slot's lifetime, and on wasm the globals naming one section share one data segment, so the link keeps or drops them together (#5062). mink 0.2.0 links a system framework from its claim with no SDK and reports the entry an image starts at, and std 10.2.0 adds `handle_identity`, append in `std.filesystem` and `capability.HAS_TERMINAL`.
+
+### Fixed
+- A darwin build on two or more threads with a link entry that lists `symbols` stopped with `lower: the owner named strings outside a unit's merge`. A listed symbol's link name is now made once, before code generation (#5027).
+- A `source = "framework"` entry links on macOS 11 and later and from any host. A framework entry with no `dir` is the system's, made from its claim as `/System/Library/Frameworks/<N>.framework/<N>` unless a given framework directory holds it, where mach searched `/System/Library/Frameworks` for a library file that is not there (#5028).
+- Releases 7.0.0 through 7.2.0 could stop with an internal compiler error on rare code, where one instruction read a value three or more times and was then taken out. They did not emit wrong code. Fixed through mirl 0.5.0.
+- `#[extension]` hands mirl only the extensions the target's own instruction set declares, so a name only another set declares admits nothing there, as the decorator's page says (#5029).
+- On windows a failed build withdraws its earlier outputs and `mach clean` cleans, where both refused a path joined with `\` at the project root (#5030).
+- `--emit asm` for `freestanding-x86_64 --abi win64` and `freestanding-aarch64 --abi aapcs64win` builds, where it was an internal error, and the x86-64 `.eh_frame` is right inside each epilogue, through mirl 0.3.4 (#5025).
+- On windows the compiler identifies its own file through std, so a project on a FAT or exFAT volume builds, where it failed with `cannot digest the linked artifact` (#5031).
+- A WebAssembly object names each function it imports from another object, as a call into std or an `ext fun` linked from an archive, by the function's own name. It could name one by bytes the compiler had already freed, so the link refused the build over a garbled undefined symbol, or a `wasi` module imported the garbled name in place of what the call needed (#5016).
+
 ## [7.2.0] - 2026-11-26
 
 ### Added

@@ -200,12 +200,11 @@ stable-ABI symbol**. A pack cannot appear on a body-less `fun` or an
 function pointer value, since its type `fun(...) R` matches no function
 pointer type. It is source-level only.
 
-A `^` secret may not be passed to a pack, including a secret nested inside an
-aggregate argument (`secret.variadic`). A pack instance is typed per call site
-and commonly feeds formatting or logging, so admitting one would launder a
-secret straight to an observable sink. A pointer to secret storage is
-admitted, since the address is public and the instance's body stays gated on
-the secret pointee. See [secrecy.md](secrecy.md).
+A `^` secret may be passed to a pack, as may a pointer to secret storage. A
+pack instance is typed per call site, so its body is gated on the secret
+element as any function's is. A pack that formats decides for itself: `std.format`
+and `std.print` render no `^` type and refuse a `^` argument at the call. See
+[secrecy.md](secrecy.md).
 
 ## Cross-module packs
 

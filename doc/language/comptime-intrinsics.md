@@ -486,7 +486,8 @@ about storage.**
 | `$pointee_of` | no: `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no: the spelling is `^T` |
 | `$type_id` | no: `^T` is a different type from `T` |
-| `$fields` / `$cases` | no: a secret aggregate is refused, not walked |
+| `$fields` | no: a secret record is refused, not walked |
+| `$cases` | yes: naming a tag's cases reads no value |
 | type comparison (`f.type == u64`) | no: `^u64` is not `u64` |
 
 ## The type operand
@@ -765,8 +766,9 @@ rejected wherever it is used: in `sel`, in a projection and in a literal head.
 `$discriminant_of(T)` produces the actual unsigned integer type used to store
 the discriminator (`u8`, `u16`, `u32`, or `u64`). It may inspect outer-secret
 types (`$discriminant_of(^T)`) because it reports storage metadata rather than
-the active case. Conversely, `$cases(^T)` is refused, matching current shape query
-conventions.
+the active case. `$cases(^T)` enumerates `T`'s cases for the same reason: naming a
+type's cases reads no value. Testing which case a `^T` value holds, `sel v.[c]`,
+stays refused as a branch on a secret (`secret.tag_case`).
 
 `$offset_of(T, payload_case)` reuses the layout intrinsic to report the offset
 of the payload area that holds the case. Naming a payloadless case is an error. Like `$size_of` and

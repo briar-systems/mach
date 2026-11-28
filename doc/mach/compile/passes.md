@@ -25,13 +25,14 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`test_key_for`](#test_key_for) | the back-half key of a module's test object: its stable id with the test bit |
 | [`has_test_object`](#has_test_object) | the module gets a test object in this build: a test build, and a module whose source declares a test or a `#[testing]` declaration |
 | [`test_build`](#test_build) | whether this build's goal builds tests |
-| [`prepare_codegen_pass`](#prepare_codegen_pass) | the import libraries the declarations name, which every lowering reads, registered before any is |
+| [`prepare_codegen_pass`](#prepare_codegen_pass) | the import libraries the declarations name and the symbols the link entries list, which every unit's claims read, pinned before any unit runs |
 | [`run_test_pass`](#run_test_pass) | the test stage's computation: each test object's typed inputs, then each test object |
 | [`run_codegen_pass`](#run_codegen_pass) | each module in topological order, its front-end products given back once its own unit is done |
 | [`codegen_modules_reached`](#codegen_modules_reached) | how many modules, in topological order, the codegen pass lowered or would have: every one for an artifact taken whole, whose one unit lowers them all, else those up to the unit it reached |
 | [`compile_module`](#compile_module) | the mirl module `m`, the project's own, compiled into an object, which owns its storage in the session's backing allocator, the warnings mirl gave reported on `diags` |
 | [`run_link_pass`](#run_link_pass) | the link stage's computation: the current objects, then the link the build's job names, which runs only when one of its inputs moved |
 | [`prepare_link`](#prepare_link) | before the link stage's operation: when the artifact on disk is not what the link last wrote to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the database's next revision, so the link runs again |
+| [`entryless_told`](#entryless_told) | warn into `diags` of a bin whose link left `absent`, its system's optional entry symbol, undefined, so it is a module of its exports, at the artifact's `kind` where the manifest states it |
 | [`prepare_object_cache`](#prepare_object_cache) | key the loaded modules and read `obj/` under their keys (compile/cache), reported as the cache phase carved out of resolve, which it precedes |
 | [`module_in_current_project`](#module_in_current_project) | whether a module's path starts with the configured project's id |
 
@@ -168,7 +169,8 @@ whether this build's goal builds tests
 pub fun prepare_codegen_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
-the import libraries the declarations name, which every lowering reads, registered before any is
+the import libraries the declarations name and the symbols the link entries list, which every
+unit's claims read, pinned before any unit runs
 
 ### run_test_pass
 
@@ -229,6 +231,15 @@ pub fun prepare_link(p: *mach.compile.project.Project, artifact: str) err[mach.b
 before the link stage's operation: when the artifact on disk is not what the link last wrote
 to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the
 database's next revision, so the link runs again
+
+### entryless_told
+
+```mach
+pub fun entryless_told(p: *mach.compile.project.Project, diags: *mach.base.diagnostic.DiagnosticStore, absent: str) err[mach.base.fail.Fail]
+```
+
+warn into `diags` of a bin whose link left `absent`, its system's optional entry symbol,
+undefined, so it is a module of its exports, at the artifact's `kind` where the manifest states it
 
 ### prepare_object_cache
 

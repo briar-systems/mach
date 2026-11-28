@@ -360,14 +360,15 @@ the normal object carries the front end's
 ### link_stands
 
 ```mach
-pub fun link_stands(p: *mach.compile.project.Project, artifact: str) res[bool, mach.base.fail.Fail]
+pub fun link_stands(p: *mach.compile.project.Project, artifact: str) res[opt[str], mach.base.fail.Fail]
 ```
 
 the link that would write `artifact` need not run: this build compiled nothing, the link reads
 no input found by name and its last run read no file a search found, its key and the files that
 run read beyond its keyed inputs key it as the record of the artifact's path does, and the file
 there hashes to the digest that record holds. every file is read and hashed every time, never
-trusted from its metadata
+trusted from its metadata. a link that stands answers the optional entry symbol its record says
+it left absent, a copy in the project's allocator the caller frees, nil for none
 
 ### note_link
 

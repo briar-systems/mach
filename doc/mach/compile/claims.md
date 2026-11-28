@@ -21,7 +21,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | Functions | |
 | :--- | :--- |
 | [`state`](#state) | add to `o` the claims of every link requirement of `p`'s unit, nothing for none |
-| [`described`](#described) | whether the link makes the library the requirement `req` names from its claim: a shared system library on a target whose link does, which no file is looked for for |
+| [`described`](#described) | whether the link takes the library or framework the requirement `req` names from its claim alone, on a target whose link makes one from its claim: a shared system library, which no file is looked for for, and a framework that states no directory, which the link makes from its claim unless a framework directory the command line gives holds it |
+| [`pin_listed`](#pin_listed) | pin each symbol a link entry of `p`'s unit lists to the entry's library, under the name the target's objects spell it with |
 
 ---
 
@@ -41,6 +42,19 @@ add to `o` the claims of every link requirement of `p`'s unit, nothing for none
 pub fun described(req: *mach.manifest.link.LinkRequirement, describes: bool) bool
 ```
 
-whether the link makes the library the requirement `req` names from its claim: a
-shared system library on a target whose link does, which no file is looked for for
+whether the link takes the library or framework the requirement `req` names from its claim
+alone, on a target whose link makes one from its claim: a shared system library, which no file
+is looked for for, and a framework that states no directory, which the link makes from its
+claim unless a framework directory the command line gives holds it
+
+### pin_listed
+
+```mach
+pub fun pin_listed(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
+```
+
+pin each symbol a link entry of `p`'s unit lists to the entry's library, under the name the
+target's objects spell it with. the names are made here, before any pass, since a pass on a
+crew names strings only by merging units, and every claim and the link read them from the pins.
+a symbol two libraries claim is refused
 

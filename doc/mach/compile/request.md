@@ -55,6 +55,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | Constants | |
 | :--- | :--- |
+| [`PARALLEL`](#constants) | whether a run can have more than one worker: the host has threads to give them |
 | [`HASH_SIZE`](#constants) | |
 
 ---
@@ -77,20 +78,21 @@ a binary profile lever as the command line sets it
 
 ```mach
 pub rec Overrides {
-    output:       *u8;
-    work:         *u8;
-    views:        mach.compile.view.Set;
-    verify:       bool;
-    passes:       bool;
-    dep_warnings: bool;
-    optimize:     Lever;
-    debug:        Lever;
-    threads:      u32;
-    include_deps: bool;
-    no_cache:     bool;
-    declassified: bool;
-    link_tokens:  Vector[*u8];
-    lib_dirs:     Vector[*u8];
+    output:         *u8;
+    work:           *u8;
+    views:          mach.compile.view.Set;
+    verify:         bool;
+    passes:         bool;
+    dep_warnings:   bool;
+    optimize:       Lever;
+    debug:          Lever;
+    threads:        u32;
+    include_deps:   bool;
+    no_cache:       bool;
+    declassified:   bool;
+    link_tokens:    Vector[*u8];
+    lib_dirs:       Vector[*u8];
+    framework_dirs: Vector[*u8];
 }
 ```
 
@@ -208,7 +210,8 @@ pub rec BuildRequest {
     # presentation only, no part of any hash
     overrides: bool;
     debug:     bool;
-    # whether mach and mirl run their verifiers: opt-in, no part of any hash
+    # whether mach and mirl run their verifiers: opt-in, no part of any hash, and a build that
+    # verifies compiles every module, as a cached object holds no verification
     verify: bool;
     # whether mirl reports each optimisation pass that changed each function: presentation only, no part of any
     # hash, and a build that reports compiles every module, as a cached object holds no report
@@ -239,8 +242,9 @@ pub rec BuildRequest {
     # "" for none
     work: str;
 
-    link_tokens: Vector[LinkToken];
-    lib_dirs:    Vector[str];
+    link_tokens:    Vector[LinkToken];
+    lib_dirs:       Vector[str];
+    framework_dirs: Vector[str];
 
     include_deps: bool;
     no_cache:     bool;
@@ -358,7 +362,8 @@ canonical path inside the project root, taken as written
 pub fun workers(asked: u32) u32
 ```
 
-the workers a run uses: the `--threads` count, or the host's processor count when none was given
+the workers a run uses: the `--threads` count, or the host's processor count when none was given.
+a host with no threads runs one, and a count above one is refused there where it is parsed
 
 | Parameter | |
 | :--- | :--- |
@@ -369,5 +374,6 @@ the workers a run uses: the `--threads` count, or the host's processor count whe
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
+| `PARALLEL` | `bool` | `capability.HAS_THREADS` | whether a run can have more than one worker: the host has threads to give them |
 | `HASH_SIZE` | `usize` | `32` |  |
 

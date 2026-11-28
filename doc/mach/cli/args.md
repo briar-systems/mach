@@ -25,7 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | On `CliArgs` | |
 | :--- | :--- |
 | [`build_cli_invocation`](#build_cli_invocation) | the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors, and the overrides, each typed as the request reads it: `-o` and `-w` as raw argument pointers or nil, the LEVERS as given, `--threads` as a count or 0 when absent |
-| [`collect_link_inputs`](#collect_link_inputs) | fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs |
+| [`collect_link_inputs`](#collect_link_inputs) | fill c.overrides.link_tokens, c.overrides.lib_dirs and c.overrides.framework_dirs in command-line order: every `-l` value and every operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs and every `-F` value to framework_dirs |
 
 | On `EntryArgs` | |
 | :--- | :--- |
@@ -79,6 +79,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`EMIT`](#constants) | `--emit <kind>`, once per product |
 | [`THREADS`](#constants) | `--threads <n>` |
 | [`LIB_DIR`](#constants) | `--library-dir <dir>`, `-L` |
+| [`FRAMEWORK_DIR`](#constants) | `--framework-dir <dir>`, `-F` |
 | [`LIB`](#constants) | `--library <name>`, `-l` |
 | [`DEP_WARNINGS`](#constants) | `--dep-warnings` |
 | [`NO_CACHE`](#constants) | `--no-cache` |
@@ -136,8 +137,8 @@ pub fun build_cli_invocation(a: *std.allocator.Allocator, inv: *std.args.Parsed)
 the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors,
 and the overrides, each typed as the request reads it: `-o` and `-w` as raw argument
 pointers or nil, the LEVERS as given, `--threads` as a count or 0 when absent.
-include_deps is false for the command to set, and link_tokens and lib_dirs are
-left empty for collect_link_inputs
+include_deps is false for the command to set, and link_tokens, lib_dirs and framework_dirs
+are left empty for collect_link_inputs
 
 | Parameter | |
 | :--- | :--- |
@@ -151,14 +152,14 @@ left empty for collect_link_inputs
 pub fun collect_link_inputs(a: *std.allocator.Allocator, c: *CliArgs, inv: *std.args.Parsed) err[mach.base.fail.Fail]
 ```
 
-fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every
-operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs. an operand
-input.token_is_path does not accept names no link input and is refused. both vectors are
-reinitialised first
+fill c.overrides.link_tokens, c.overrides.lib_dirs and c.overrides.framework_dirs in command-line
+order: every `-l` value and every operand after the first, the project, go to link_tokens, every
+`-L` value to lib_dirs and every `-F` value to framework_dirs. an operand input.token_is_path does
+not accept names no link input and is refused. the vectors are reinitialised first
 
 | Parameter | |
 | :--- | :--- |
-| `a` | allocator for the two vectors |
+| `a` | allocator for the vectors |
 | `c` | the arguments to fill |
 | `inv` | the invocation |
 | **returns** | ok, or err when an operand names no link input or a push fails |
@@ -323,7 +324,7 @@ pub rec Call {
     spans:   *std.allocator.heap.Pool;
     inv:     *std.args.Parsed;
     report:  *mach.cli.diagnostic.Report;
-    environ: std.process.exec.Environment;
+    environ: std.system.os.Environment;
     # the texts the command's sessions read, which the failure it returns is located in
     sources: *mach.base.source.SourceMap;
 }
@@ -338,7 +339,7 @@ what dispatch hands a command's handler; dispatch owns every member and outlives
 | `spans` | `*std.allocator.heap.Pool` | the spans every heap of the command draws from and gives back to |
 | `inv` | `*std.args.Parsed` | the parsed command line |
 | `report` | `*mach.cli.diagnostic.Report` | where the command reports a failure it goes on past or that carries an origin, in the format `--report` selected |
-| `environ` | `std.process.exec.Environment` | the environment the command runs in, which the processes it starts inherit |
+| `environ` | `std.system.os.Environment` | the environment the command runs in, which the processes it starts inherit |
 
 ## Functions
 
@@ -469,6 +470,7 @@ command that takes no `-v`
 | `EMIT` | `std.args.Flag` | `std_args.Flag{long: "emit", short: 0, value: "asm\|ir\|ir-opt\|obj\|exe", repeat: true, negatable: false, help: "a product to write, once each (default: exe)"}` | `--emit <kind>`, once per product |
 | `THREADS` | `std.args.Flag` | `std_args.Flag{long: "threads", short: 0, value: "n", repeat: false, negatable: false, help: "how many threads a build compiles and links on, and test processes run at once (default: host CPUs)"}` | `--threads <n>` |
 | `LIB_DIR` | `std.args.Flag` | `std_args.Flag{long: "library-dir", short: 'L', value: "dir", repeat: true, negatable: false, help: "add a library search directory"}` | `--library-dir <dir>`, `-L` |
+| `FRAMEWORK_DIR` | `std.args.Flag` | `std_args.Flag{long: "framework-dir", short: 'F', value: "dir", repeat: true, negatable: false, help: "add a framework search directory"}` | `--framework-dir <dir>`, `-F` |
 | `LIB` | `std.args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
 | `DEP_WARNINGS` | `std.args.Flag` | `std_args.Flag{long: "dep-warnings", short: 0, value: nil, repeat: false, negatable: false, help: "also show dependencies' warnings, each under its own allow and #[expect]"}` | `--dep-warnings` |
 | `NO_CACHE` | `std.args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |

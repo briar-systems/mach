@@ -15,7 +15,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | Type | | |
 | :--- | :--- | :--- |
 | [`Builder`](#builder) | `rec` | the state lowering emits a module's code through |
-| [`Temps`](#temps) | `rec` | how the scoping of temporaries stood before a statement took it over (`temps_begin`) |
+| [`Opening`](#opening) | `rec` | where a scope of temporaries opened: past instruction `after` of `block`, or with `after` NO_INSTRUCTION at the block's start, past the entry's stack slots when it is the entry |
+| [`Temps`](#temps) | `rec` | how the scoping of temporaries stood before a scope took it over (`temps_begin`) |
 
 | On `Builder` | |
 | :--- | :--- |
@@ -111,9 +112,12 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_classify`](#emit_classify) | `x` made secret: a block parameter declared secret, which the branch into it passes `x` |
 | [`emit_declassify`](#emit_declassify) | `x` made public: a constant as it is, an aggregate copied a word at a time into a public slot of its own, any other value through a declassify |
 | [`emit_alloca`](#emit_alloca) | a stack slot of `ty` for a temporary, made in the entry block so every path reaches it (`temp_alloca`) |
-| [`temps_begin`](#temps_begin) | take over the scoping of temporaries for the statement about to be lowered: `on` for a statement that evaluates its expressions once, from the block it begins in, and hands no temporary's address past its end, as an expression statement or a declaration does |
-| [`temps_end`](#temps_end) | end the storage of every temporary begun since `kept` was taken, the latest first, where control still reaches, and give the scoping back to the enclosing statement |
-| [`temp_alloca`](#temp_alloca) | a stack slot of `ty` aligned to `align` for a temporary of the statement being lowered, made in the entry block |
+| [`temps_begin`](#temps_begin) | open the scope of temporaries of a statement or a condition about to be lowered, here |
+| [`temps_mark`](#temps_mark) | how many temporaries have begun, where a loop's body starts: a `brk` or `cnt` ends those begun past it |
+| [`temps_close`](#temps_close) | end the storage of every temporary begun past `from`, the latest first, here, where control still reaches |
+| [`temps_drop`](#temps_drop) | give the scoping back to the enclosing scope, the closed scope's temporaries ended on every way out of it already |
+| [`temps_end`](#temps_end) | close the scope `kept` was taken for here and give the scoping back to the enclosing scope |
+| [`temp_alloca`](#temp_alloca) | a stack slot of `ty` aligned to `align` for a temporary of the scope being lowered, made in the entry block, its storage begun where the scope opened (`temps_begin`) |
 | [`alloca_aligned`](#alloca_aligned) | a stack slot of `ty` aligned to `align`, made in the entry block so every path reaches it |
 | [`emit_whole`](#emit_whole) | the aggregate `v` held whole: itself where it is, a constant as its own value, and one at an address read from it whole, as secret as `v` and stated as its type |
 | [`emit_extract`](#emit_extract) | member `k` of the aggregate `v` held whole: a structure's member, an array's element or a union's member read from its first byte |
@@ -136,9 +140,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_vec_insert`](#emit_vec_insert) | `vec` with lane `lane` replaced by `x`: a constant lane in place, any other through the vector's bytes in a slot |
 | [`emit_vec_build`](#emit_vec_build) | a vector of `ty` from one value per lane |
 | [`emit_shuffle`](#emit_shuffle) | lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty` |
-| [`emit_unary`](#emit_unary) | a lanewise or scalar operation of one operand |
-| [`emit_binary`](#emit_binary) | a lanewise or scalar operation of two operands |
-| [`emit_ternary`](#emit_ternary) | a lanewise or scalar operation of three operands |
+| [`emit_operation`](#emit_operation) | the operation `code` at the cursor over the `n` values at `values`, its operands in order |
 | [`emit_atomic_load`](#emit_atomic_load) | an atomic read of the integer `ty` at `addr` |
 | [`emit_atomic_store`](#emit_atomic_store) | an atomic write of `x` to `addr` |
 | [`emit_atomic_rmw`](#emit_atomic_rmw) | an atomic read-modify-write, giving the value held before |
@@ -218,9 +220,9 @@ pub rec Builder {
     sources:  *mach.base.source.SourceMap;
     files:    std.collections.vector.Vector[u32];
     failure:  opt[mach.base.fail.Fail];
-    # the block the statement whose temporaries are scoped began in, none outside one (`temps_begin`)
-    temp_at: opt[mirl.ir.id.Block];
-    # the temporaries whose storage has begun and not ended, the statement's last
+    # where the scope of the statement or condition being lowered opened, none outside one (`temps_begin`)
+    temp_open: opt[Opening];
+    # the temporaries whose storage has begun and not ended, the innermost scope's last
     temps: std.collections.vector.Vector[mach.lower.value.Value];
 }
 ```
@@ -1377,13 +1379,68 @@ a stack slot of `ty` for a temporary, made in the entry block so every path reac
 ### temps_begin
 
 ```mach
-pub fun temps_begin(b: *Builder, on: bool) Temps
+pub fun temps_begin(b: *Builder) Temps
 ```
 
-take over the scoping of temporaries for the statement about to be lowered: `on` for a statement that evaluates its
-expressions once, from the block it begins in, and hands no temporary's address past its end, as an expression
-statement or a declaration does. any other statement scopes none of its own, and the statements nested in it scope
-theirs
+open the scope of temporaries of a statement or a condition about to be lowered, here. the storage of every
+temporary it makes begins here (`temp_alloca`) and ends where it closes (`temps_close`, `temps_end`), the one
+owner of every temporary's markers. a scope opens where control enters what it scopes and closes on every way out,
+so each temporary is begun on every path to an end, once, and ended on every path that began it.
+
+what makes that hold is that no expression contains a statement. the only branches an expression makes are its
+own: `&&`, `||`, the debug profile's guard trap and a classification (`emit_classify`), each producing a bool or
+another value and joining again, or trapping. so every block of a scope is dominated by its opening, and the
+program cannot take a temporary's address, so nothing reads one past its scope:
+
+- an expression statement, a declaration, an assignment and an `asm` statement open where they begin and close
+  where they end. a value a declaration binds is copied out of the temporary or read from it whole before the
+  end (`emit_whole`). mirl takes such a load apart where it stands, or copies a large one into a slot of its
+  own there, and moves a load's bytes to a store from memory to memory only with no write of memory between
+  them, which a marker is, so no read of the temporary lands past its end
+- a condition of an `if`, of each arm of an `or` chain and of a loop opens where its evaluation begins, the
+  loop's at the head of its header, so once per evaluation, and closes at the head of each block it branches to,
+  each reached from the condition alone. the branch reads only the truth the condition computed
+- a `ret` opens like a statement and never closes: its value may be held in a temporary until the return, past
+  the `fin` bodies it replays, and the function's end ends every storage. each replayed `fin` statement scopes
+  only its own temporaries, so nothing ends the return's on the way into them
+- a `brk` or `cnt` ends every temporary of the scopes it leaves inside its loop, after the `fin` bodies it
+  replays, before it branches (`temps_close` from the loop's mark). a condition's temporaries have ended by then
+- a block, `if`, loop, `$if`, `$each` or `fin` statement makes no temporary of its own past its conditions, and
+  each statement nested in it opens its own scope
+
+the rule every statement kind keeps: a scope makes all its temporaries before it lowers any statement nested in
+it. its temporaries begin where it opened, so one made after a nested statement would be begun on the paths of a
+`brk`, `cnt` or `ret` inside that statement, which end only what has been made by then, and a `cnt` would begin
+it again. a statement kind that evaluates an expression after a nested body, as a loop's step would, opens a
+scope of its own where that expression is evaluated, as a condition does. one that holds a temporary across a
+nested body, as a scrutinee held across arms would, makes it before the body, so a jump out ends it.
+
+lowered in a block that has ended, nothing is scoped, as nothing there runs
+
+### temps_mark
+
+```mach
+pub fun temps_mark(b: *Builder) usize
+```
+
+how many temporaries have begun, where a loop's body starts: a `brk` or `cnt` ends those begun past it
+
+### temps_close
+
+```mach
+pub fun temps_close(b: *Builder, from: usize) err[mach.base.fail.Fail]
+```
+
+end the storage of every temporary begun past `from`, the latest first, here, where control still reaches. the
+temporaries stay their scopes' own, so a scope closed on several ways out ends them on each
+
+### temps_drop
+
+```mach
+pub fun temps_drop(b: *Builder, kept: Temps)
+```
+
+give the scoping back to the enclosing scope, the closed scope's temporaries ended on every way out of it already
 
 ### temps_end
 
@@ -1391,10 +1448,7 @@ theirs
 pub fun temps_end(b: *Builder, kept: Temps) err[mach.base.fail.Fail]
 ```
 
-end the storage of every temporary begun since `kept` was taken, the latest first, where control still reaches, and
-give the scoping back to the enclosing statement. each was begun in the block its statement began in, which every
-point of the statement lies past, so it is begun on every path to the statement's end, once, as the statement runs
-no loop, and the statement reads it nowhere past its end
+close the scope `kept` was taken for here and give the scoping back to the enclosing scope
 
 ### temp_alloca
 
@@ -1402,10 +1456,8 @@ no loop, and the statement reads it nowhere past its end
 pub fun temp_alloca(b: *Builder, ty: Type, align: u64) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
-a stack slot of `ty` aligned to `align` for a temporary of the statement being lowered, made in the entry block. its
-storage begins here, before its first write, where the statement scopes its temporaries and lowering still stands in
-the block the statement began in, and ends where the statement ends (`temps_end`). made past a branch of the
-statement, it is not marked, since the statement's end is reached by paths that did not begin it
+a stack slot of `ty` aligned to `align` for a temporary of the scope being lowered, made in the entry block, its
+storage begun where the scope opened (`temps_begin`)
 
 ### alloca_aligned
 
@@ -1619,29 +1671,13 @@ pub fun emit_shuffle(b: *Builder, ty: Type, x: mach.lower.value.Value, y: mach.l
 
 lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty`
 
-### emit_unary
+### emit_operation
 
 ```mach
-pub fun emit_unary(b: *Builder, code: Opcode, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
+pub fun emit_operation(b: *Builder, code: Opcode, values: *mach.lower.value.Value, n: u32) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
-a lanewise or scalar operation of one operand
-
-### emit_binary
-
-```mach
-pub fun emit_binary(b: *Builder, code: Opcode, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
-```
-
-a lanewise or scalar operation of two operands
-
-### emit_ternary
-
-```mach
-pub fun emit_ternary(b: *Builder, code: Opcode, x: mach.lower.value.Value, y: mach.lower.value.Value, z: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
-```
-
-a lanewise or scalar operation of three operands
+the operation `code` at the cursor over the `n` values at `values`, its operands in order
 
 ### emit_atomic_load
 
@@ -2166,21 +2202,33 @@ emit_cbr with a failure kept as the builder's
 | `then_b` | the block taken where `c` holds |
 | `else_b` | the block taken otherwise |
 
+## Opening
+
+```mach
+pub rec Opening {
+    block: mirl.ir.id.Block;
+    after: mirl.ir.id.Instruction;
+}
+```
+
+where a scope of temporaries opened: past instruction `after` of `block`, or with `after` NO_INSTRUCTION at the
+block's start, past the entry's stack slots when it is the entry
+
 ## Temps
 
 ```mach
 pub rec Temps {
-    at:   opt[mirl.ir.id.Block];
+    open: opt[Opening];
     from: usize;
 }
 ```
 
-how the scoping of temporaries stood before a statement took it over (`temps_begin`)
+how the scoping of temporaries stood before a scope took it over (`temps_begin`)
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `at` | `opt[mirl.ir.id.Block]` | the block the enclosing statement began in, none where it scopes none |
-| `from` | `usize` | how many temporaries had begun before the statement |
+| `open` | `opt[Opening]` | where the enclosing scope opened, none outside one |
+| `from` | `usize` | how many temporaries had begun before the scope |
 
 ## Functions
 

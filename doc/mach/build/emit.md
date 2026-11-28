@@ -26,6 +26,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | :--- | :--- |
 | [`artifact_product_name`](#artifact_product_name) | the name the artifact's product goes by, its `bin_name`, empty when that is not interned |
 | [`emit_static_archive`](#emit_static_archive) | the archive of the build's objects, each unit's, read back from `inputs` in their order, as mink's archive writer lays one out in the variant its registry states for the target's format, its index naming each member's exported symbols |
+| [`framework_dirs`](#framework_dirs) | the directories a framework is searched in into `out`, in order and each once: each `-F` directory, then the `dir` of each framework entry of the link that states one |
 | [`object_count`](#object_count) | the objects every program of the build links: each unit's |
 | [`ordered_inputs`](#ordered_inputs) | the build's objects as the link's inputs, in the link's order: the units' in the topological order of their modules |
 | [`ordered_inputs_free`](#ordered_inputs_free) | release the input array `ordered_inputs` returned |
@@ -124,6 +125,15 @@ the archive of the build's objects, each unit's, read back from `inputs` in thei
 order, as mink's archive writer lays one out in the variant its
 registry states for the target's format, its index naming each member's exported symbols
 
+### framework_dirs
+
+```mach
+pub fun framework_dirs(p: *mach.compile.project.Project, out: *Vector[str]) err[mach.base.fail.Fail]
+```
+
+the directories a framework is searched in into `out`, in order and each once: each `-F`
+directory, then the `dir` of each framework entry of the link that states one
+
 ### object_count
 
 ```mach
@@ -186,8 +196,7 @@ pub fun external_inputs(p: *mach.compile.project.Project, unit: *mach.build.plan
 
 the inputs the unit links beyond its objects, in link order: the manifest's link entries,
 those its dependencies cascade, then the command line's. an input named twice is linked
-once, and each library registers the symbols it claims. a library the link makes from
-the claims the objects carry is no input of its own
+once. a library the link makes from the claims the objects carry is no input of its own
 
 ### object_inputs
 

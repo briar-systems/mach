@@ -10,7 +10,7 @@ its model directly, with source roots in place of dependencies.
 
 Source: [`src/manifest/model.mach`](../../../src/manifest/model.mach)
 
-Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.session.query`](../session/query.md), [`mach.target.input`](../target/input.md).
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.manifest.version`](version.md), [`mach.session.query`](../session/query.md), [`mach.target.input`](../target/input.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -468,6 +468,7 @@ pub rec DepDef {
     path:    mach.base.intern.StrId;
     ref:     mach.base.intern.StrId;
     version: mach.base.intern.StrId;
+    range:   opt[mach.manifest.version.Range];
 }
 ```
 
@@ -479,6 +480,7 @@ one `[dep.<name>]` table as parsed. exactly one of `git` and `path` is set
 | `git` | `mach.base.intern.StrId` | the `git` clone URL, or STR_NIL for a path dependency |
 | `path` | `mach.base.intern.StrId` | the `path` directory, or STR_NIL for a git dependency |
 | `ref` | `mach.base.intern.StrId` | the `ref` key, required with `git` unless `version` is written, and rejected with `path`; one of `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`. STR_NIL for a path dependency a git dependency names exactly one of `ref` (an exact or branch selector) and `version` (a release range); STR_NIL marks the one it does not |
+| `range` | `opt[mach.manifest.version.Range]` | `version` parsed, which its pre-release identifiers borrow from; none with no `version` |
 
 ## LinkSource
 
@@ -502,6 +504,7 @@ pub rec LinkDef {
     source:             LinkSource;
     lib_name:           mach.base.intern.StrId;
     path:               mach.base.intern.StrId;
+    dir:                mach.base.intern.StrId;
     symbols:            *mach.base.intern.StrId;
     symbol_count:       u32;
     sys:                *mach.base.intern.StrId;
@@ -516,6 +519,7 @@ pub rec LinkDef {
     versions:           LinkVersions;
     at:                 mach.base.source.Location;
     path_at:            mach.base.source.Location;
+    dir_at:             mach.base.source.Location;
 }
 ```
 
@@ -528,6 +532,7 @@ and freed by `dnit`
 | `source` | `LinkSource` | the required `source` key |
 | `lib_name` | `mach.base.intern.StrId` | the `name` key, required for system and framework sources and rejected for local; STR_NIL for local |
 | `path` | `mach.base.intern.StrId` | the `path` key, required for a local source and rejected otherwise; a project-relative path template, STR_NIL for non-local |
+| `dir` | `mach.base.intern.StrId` | the `dir` key, written only on a framework source: the directory its bundle lies in, a project-relative path template; STR_NIL when absent |
 | `symbols` | `*mach.base.intern.StrId` | the `symbols` array; every entry non-empty and unique; nil when absent |
 | `symbol_count` | `u32` | length of `symbols` |
 | `sys` | `*mach.base.intern.StrId` | the required `sys` filter axis, each value canonical or "*"; nil for `[]`, which matches no target |
@@ -542,6 +547,7 @@ and freed by `dnit`
 | `versions` | `LinkVersions` | the `current_version` and `compatibility_version` keys, written only on a system source of the shared kind; unstated when absent |
 | `at` | `mach.base.source.Location` | where the table's key is written |
 | `path_at` | `mach.base.source.Location` | where the `path` value is written, the zero place when absent |
+| `dir_at` | `mach.base.source.Location` | where the `dir` value is written, the zero place when absent |
 
 ### link_def
 
@@ -662,8 +668,9 @@ no manifest, whose modules are the files under the directory
 pub rec Manifest {
     id:      mach.base.intern.StrId;
     version: mach.base.intern.StrId;
-    # the required compiler range [project].mach states
-    mach: mach.base.intern.StrId;
+    # the required compiler range [project].mach states, as written and as parsed from it
+    mach:       mach.base.intern.StrId;
+    mach_range: mach.manifest.version.Range;
     # where the `[project]` table and its `mach` value are written, each place's
     # path the interner's; the zero place when not written
     project_at:     mach.base.source.Location;

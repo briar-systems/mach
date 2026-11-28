@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 | :--- | :--- | :--- |
 | [`Entry`](#entry) | `rec` | one variable, NAME=value in std.runtime.native units, so an inherited variable with no UTF-8 spelling is carried as it is |
 | [`Environment`](#environment) | `rec` | a child's environment, one entry per name by the host's name identity |
-| [`Strings`](#strings) | `rec` | a nil-terminated array of native NAME=value entries, owned, for exec.NativeEnvironment.given |
+| [`Strings`](#strings) | `rec` | a nil-terminated array of native NAME=value entries, owned, for system_os.NativeEnvironment.given |
 
 | On `Entry` | |
 | :--- | :--- |
@@ -159,7 +159,7 @@ drop the entry at `index`, keeping the order of the rest
 ### capture
 
 ```mach
-pub fun capture(a: *std.allocator.Allocator, e: std.process.exec.Environment) res[Environment, mach.base.fail.Fail]
+pub fun capture(a: *std.allocator.Allocator, e: std.system.os.Environment) res[Environment, mach.base.fail.Fail]
 ```
 
 the environment `e` describes, in native units: a given UTF-8 array, or this
@@ -185,7 +185,7 @@ pub rec Strings {
 ```
 
 a nil-terminated array of native NAME=value entries, owned, for
-exec.NativeEnvironment.given
+system_os.NativeEnvironment.given
 
 ### strings_dnit
 
