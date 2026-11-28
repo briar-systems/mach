@@ -119,18 +119,25 @@ pub rec Builder {
     sources:  *base_source.SourceMap;
     files:    vector.Vector[u32];
     failure:  opt[fail.Fail];
-    # the block the statement whose temporaries are scoped began in, none outside one (`temps_begin`)
-    temp_at: opt[id.Block];
-    # the temporaries whose storage has begun and not ended, the statement's last
+    # where the scope of the statement or condition being lowered opened, none outside one (`temps_begin`)
+    temp_open: opt[Opening];
+    # the temporaries whose storage has begun and not ended, the innermost scope's last
     temps: vector.Vector[value.Value];
 }
 
-# how the scoping of temporaries stood before a statement took it over (`temps_begin`)
+# where a scope of temporaries opened: past instruction `after` of `block`, or with `after` NO_INSTRUCTION at the
+# block's start, past the entry's stack slots when it is the entry
+pub rec Opening {
+    block: id.Block;
+    after: id.Instruction;
+}
+
+# how the scoping of temporaries stood before a scope took it over (`temps_begin`)
 # ---
-# at:   the block the enclosing statement began in, none where it scopes none
-# from: how many temporaries had begun before the statement
+# open: where the enclosing scope opened, none outside one
+# from: how many temporaries had begun before the scope
 pub rec Temps {
-    at:   opt[id.Block];
+    open: opt[Opening];
     from: usize;
 }
 
@@ -164,7 +171,7 @@ pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_record.Target, ct
     b.sources   = sources;
     b.files     = vector.init[u32](a);
     b.failure   = opt[fail.Fail].none{};
-    b.temp_at   = opt[id.Block].none{};
+    b.temp_open = opt[Opening].none{};
     b.temps     = vector.init[value.Value](a);
     ret b;
 }
@@ -1521,55 +1528,100 @@ pub fun emit_alloca(b: *Builder, ty: Type) res[value.Value, fail.Fail] {
     ret temp_alloca(b, ty, align_of(b, ty));
 }
 
-# take over the scoping of temporaries for the statement about to be lowered: `on` for a statement that evaluates its
-# expressions once, from the block it begins in, and hands no temporary's address past its end, as an expression
-# statement or a declaration does. any other statement scopes none of its own, and the statements nested in it scope
-# theirs
-pub fun temps_begin(b: *Builder, on: bool) Temps {
-    val kept: Temps = Temps{at: b.temp_at, from: b.temps.len};
-    if (on) { b.temp_at = opt[id.Block].some{b.block}; }
-    or      { b.temp_at = opt[id.Block].none{}; }
+# open the scope of temporaries of a statement or a condition about to be lowered, here. the storage of every
+# temporary it makes begins here (`temp_alloca`) and ends where it closes (`temps_close`, `temps_end`), the one
+# owner of every temporary's markers. a scope opens where control enters what it scopes and closes on every way out,
+# so each temporary is begun on every path to an end, once, and ended on every path that began it:
+#
+# - an expression statement, a declaration, an assignment and an `asm` statement open where they begin and close
+#   where they end. whatever branches their expressions make (`&&`, `||`, an `if` or `sel` expression) join again
+#   before that end, and the program cannot take a temporary's address, so nothing reads one past it. a value a
+#   declaration binds is copied out of the temporary or read from it whole before the end (`emit_whole`), and a
+#   marker writes its slot, so no read is moved past it
+# - a condition of an `if`, of each arm of an `or` chain and of a loop opens where its evaluation begins, the
+#   loop's at the head of its header, so once per evaluation, and closes at the head of each block it branches to,
+#   each reached from the condition alone. the branch reads only the truth the condition computed
+# - a `ret` opens like a statement and never closes: its value may be held in a temporary until the return, past
+#   the `fin` bodies it replays, and the function's end ends every storage. each replayed `fin` statement scopes
+#   only its own temporaries
+# - a `brk` or `cnt` ends every temporary of the scopes it leaves inside its loop, after the `fin` bodies it
+#   replays, before it branches (`temps_close` from the loop's mark). a condition's temporaries have ended by then
+# - a statement nested in another opens its own scope, and the enclosing statement's scope holds only what it
+#   evaluates itself, as a `$each` or a block does nothing past its statements
+#
+# lowered in a block that has ended, nothing is scoped, as nothing there runs
+pub fun temps_begin(b: *Builder) Temps {
+    val kept: Temps = Temps{open: b.temp_open, from: b.temps.len};
+    b.temp_open = opt[Opening].none{};
+    if (sel b.fn.some) {
+        if (!terminated(b)) {
+            var after: id.Instruction = b.m.functions.data[b.fn.some].body.blocks.data[b.block].last;
+            # the entry holding only its stack slots, the slots made later still stand ahead of the scope
+            if (after != id.NO_INSTRUCTION && b.block == b.entry && after == b.slot_last) { after = id.NO_INSTRUCTION; }
+            b.temp_open = opt[Opening].some{Opening{block: b.block, after: after}};
+        }
+    }
     ret kept;
 }
 
-# end the storage of every temporary begun since `kept` was taken, the latest first, where control still reaches, and
-# give the scoping back to the enclosing statement. each was begun in the block its statement began in, which every
-# point of the statement lies past, so it is begun on every path to the statement's end, once, as the statement runs
-# no loop, and the statement reads it nowhere past its end
-pub fun temps_end(b: *Builder, kept: Temps) err[fail.Fail] {
-    var failed: err[fail.Fail] = err[fail.Fail].ok{};
-    if (!terminated(b)) {
-        var i: usize = b.temps.len;
-        for (i > kept.from) {
-            i = i - 1;
-            val err_ended: err[fail.Fail] = emit_scope(b, b.temps.data[i], false);
-            if (sel err_ended.err) {
-                failed = err_ended;
-                brk;
-            }
-        }
-    }
-    b.temps.len = kept.from;
-    b.temp_at   = kept.at;
-    ret failed;
+# how many temporaries have begun, where a loop's body starts: a `brk` or `cnt` ends those begun past it
+pub fun temps_mark(b: *Builder) usize {
+    ret b.temps.len;
 }
 
-# a stack slot of `ty` aligned to `align` for a temporary of the statement being lowered, made in the entry block. its
-# storage begins here, before its first write, where the statement scopes its temporaries and lowering still stands in
-# the block the statement began in, and ends where the statement ends (`temps_end`). made past a branch of the
-# statement, it is not marked, since the statement's end is reached by paths that did not begin it
+# end the storage of every temporary begun past `from`, the latest first, here, where control still reaches. the
+# temporaries stay their scopes' own, so a scope closed on several ways out ends them on each
+pub fun temps_close(b: *Builder, from: usize) err[fail.Fail] {
+    if (terminated(b)) { ret err[fail.Fail].ok{}; }
+    var i: usize = b.temps.len;
+    for (i > from) {
+        i = i - 1;
+        val err_ended: err[fail.Fail] = emit_scope(b, b.temps.data[i], false);
+        if (sel err_ended.err) { ret err_ended; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# give the scoping back to the enclosing scope, the closed scope's temporaries ended on every way out of it already
+pub fun temps_drop(b: *Builder, kept: Temps) {
+    b.temps.len = kept.from;
+    b.temp_open = kept.open;
+}
+
+# close the scope `kept` was taken for here and give the scoping back to the enclosing scope
+pub fun temps_end(b: *Builder, kept: Temps) err[fail.Fail] {
+    val err_closed: err[fail.Fail] = temps_close(b, kept.from);
+    temps_drop(b, kept);
+    ret err_closed;
+}
+
+# a stack slot of `ty` aligned to `align` for a temporary of the scope being lowered, made in the entry block, its
+# storage begun where the scope opened (`temps_begin`)
 pub fun temp_alloca(b: *Builder, ty: Type, align: u64) res[value.Value, fail.Fail] {
     val res_slot: res[value.Value, fail.Fail] = alloca_aligned(b, ty, align);
     if (sel res_slot.err) { ret res_slot; }
-    if (sel b.temp_at.some) {
-        if (b.temp_at.some == b.block && !terminated(b)) {
-            val err_begun: err[fail.Fail] = emit_scope(b, res_slot.ok, true);
+    if (sel b.temp_open.some) {
+        if (!terminated(b)) {
+            val err_begun: err[fail.Fail] = begin_at(b, b.temp_open.some, res_slot.ok);
             if (sel err_begun.err) { ret res[value.Value, fail.Fail].err{err_begun.err}; }
             val res_pushed: res[usize, A.Error] = vector.push[value.Value](?b.temps, res_slot.ok);
             if (sel res_pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_pushed.err)}; }
         }
     }
     ret res_slot;
+}
+
+# the begin of the storage of `slot` placed where a scope opened, the cursor left where it stood
+fun begin_at(b: *Builder, at: Opening, slot: value.Value) err[fail.Fail] {
+    val saved:         mbuild.Cursor       = mbuild.cursor(?b.mb);
+    val opt_loc_saved: opt[debug.Location] = b.mb.location;
+    if (at.after != id.NO_INSTRUCTION)                           { mbuild.after(?b.mb, at.after); }
+    or (at.block == b.entry && b.slot_last != id.NO_INSTRUCTION) { mbuild.after(?b.mb, b.slot_last); }
+    or                                                           { mbuild.at_start(?b.mb, at.block); }
+    val err_begun: err[fail.Fail] = emit_scope(b, slot, true);
+    b.mb.cursor   = saved;
+    b.mb.location = opt_loc_saved;
+    ret err_begun;
 }
 
 # a stack slot of `ty` aligned to `align`, made in the entry block so every path
