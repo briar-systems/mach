@@ -2357,6 +2357,8 @@ fun extend_int_value(ctx: *lower_context.LowerContext, v: value.Value, from: typ
 fun lower_assign(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
     val opt_stored: opt[res[value.Value, fail.Fail]] = lower_vector_store(ctx, e);
     if (sel opt_stored.some) { ret opt_stored.some; }
+    val opt_handed: opt[res[value.Value, fail.Fail]] = lower_assign_into(ctx, eid, e);
+    if (sel opt_handed.some) { ret opt_handed.some; }
 
     # the snapshot is only needed when the value is used again or the destination's address
     # expression can write memory
@@ -2380,6 +2382,90 @@ fun lower_assign(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_e
     # a borrowed source may change later, and the destination holds the value it wrote
     if (borrowed) { ret res[value.Value, fail.Fail].ok{value.retype(ptr, rhs.ty)}; }
     ret res[value.Value, fail.Fail].ok{rhs};
+}
+
+# `place = f(...)` as a statement, where the call returns an aggregate and finding the place reads nothing
+# (`place_reads_nothing`): the call is handed the place as its destination, as a declaration hands its slot, so its
+# result is stored straight there with no temporary between. the place is formed ahead of the call, which no program
+# can tell from forming it after, since forming it reads no value and has no effect, and the store still follows the
+# call. whether the call then builds its result in the place is mirl's to prove (`mirl.legal.handover`), which copies
+# it in after the call where the call could reach the place. none for any other assignment, which stores what the
+# right side gave
+fun lower_assign_into(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]] {
+    val none: opt[res[value.Value, fail.Fail]] = opt[res[value.Value, fail.Fail]].none{};
+    if (!ast_id.expr_same(eid, ctx.discard_eid)) { ret none; }
+    val rhs:          ast_id.ExprId                 = e.data.binary.rhs;
+    val lhs:          ast_id.ExprId                 = e.data.binary.lhs;
+    val res_rhs_expr: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, rhs);
+    if (sel res_rhs_expr.err)                            { ret none; }
+    if (res_rhs_expr.ok.kind != ast_expr.EXPR_KIND_CALL) { ret none; }
+    val sem: type_kind.TypeId = lower_context.expr_type_of(ctx, lhs);
+    if (type_is_volatile_record(ctx, sem) || lower_context.type_contains_secret(ctx, sem)) { ret none; }
+    if (access_is_volatile(ctx, lhs) || !place_reads_nothing(ctx, lhs))                    { ret none; }
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, lhs);
+    if (sel res_ir.err)                   { ret none; }
+    if (!is_aggregate_ir(ctx, res_ir.ok)) { ret none; }
+    val res_lhs: res[value.Value, fail.Fail] = lower_lvalue(ctx, lhs);
+    if (sel res_lhs.err) { ret opt[res[value.Value, fail.Fail]].some{res_lhs}; }
+    var dest: value.Value = res_lhs.ok;
+    dest.held = res_ir.ok;
+    val saved_armed: bool          = ctx.into_armed;
+    val saved_eid:   ast_id.ExprId = ctx.into_eid;
+    val saved_slot:  value.Value   = ctx.into_slot;
+    val saved_hit:   bool          = ctx.into_hit;
+    ctx.into_armed = true;
+    ctx.into_eid   = rhs;
+    ctx.into_slot  = dest;
+    ctx.into_hit   = false;
+    var borrowed: bool                        = false;
+    val res_v:    res[value.Value, fail.Fail] = lower_stored_rvalue(ctx, rhs, true, ?borrowed);
+    val built:    bool                        = ctx.into_hit;
+    ctx.into_armed = saved_armed;
+    ctx.into_eid   = saved_eid;
+    ctx.into_slot  = saved_slot;
+    ctx.into_hit   = saved_hit;
+    if (sel res_v.err) { ret opt[res[value.Value, fail.Fail]].some{res_v}; }
+    if (!built) {
+        val err_store: err[fail.Fail] = store_known(ctx, rhs, res_v.ok, borrowed, res_lhs.ok, sem, false);
+        if (sel err_store.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{err_store.err}}; }
+    }
+    ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].ok{value.retype(res_lhs.ok, res_ir.ok)}};
+}
+
+# whether finding the place `eid` names reads no value and has no effect: a variable local to the function, or a
+# field of a record reached through fields alone from one. an index reads its index, a member through a pointer
+# reads the pointer, a tag's payload checks its case, a union member and a projection name a part of storage some
+# other way, and a global or a module-qualified name is storage a call may reach, so each keeps the order the
+# language states, the right side before the place
+fun place_reads_nothing(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool {
+    var cur:   ast_id.ExprId = eid;
+    var depth: u32           = 0;
+    for (depth < WRITE_FREE_DEPTH) {
+        val res_expression: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, cur);
+        if (sel res_expression.err) { ret false; }
+        var held: ast_expr.Expr  = res_expression.ok;
+        val e:    *ast_expr.Expr = ?held;
+        if (e.kind == ast_expr.EXPR_KIND_MEMBER) {
+            if (!resolve.symbol_is_nil(lower_context.expr_symbol_of(ctx, cur)))                                                      { ret false; }
+            if (!type.is_record(ctx.s.types, type.strip_secret(ctx.s.types, lower_context.expr_type_of(ctx, e.data.member.object)))) { ret false; }
+            cur = e.data.member.object;
+        }
+        or {
+            if (e.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
+            val sid:       resolve.SymbolId     = lower_context.expr_symbol_of(ctx, cur);
+            val opt_named: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, sid);
+            if (sel opt_named.none) { ret false; }
+            val sym: *resolve.Symbol = opt_named.some;
+            if (sym.kind != resolve.SYM_VAR)                                              { ret false; }
+            if ((sym.flags & (resolve.SYM_FLAG_MODULE | resolve.SYM_FLAG_COMPTIME)) != 0) { ret false; }
+            val opt_ord: opt[u32] = pack_elem_ordinal(ctx, sid);
+            if (sel opt_ord.some) { ret false; }
+            val opt_local: opt[value.Value] = lower_context.lookup_local(ctx, sid);
+            ret sel opt_local.some;
+        }
+        depth = depth + 1;
+    }
+    ret false;
 }
 
 # the value a store consumes. when `in_place` holds, nothing writes memory between this read
