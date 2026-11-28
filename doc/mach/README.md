@@ -1,6 +1,6 @@
 # mach
 
-Version 7.2.0.
+Version 7.3.0.
 
 | Artifact | Kind | Entry |
 | :--- | :--- | :--- |

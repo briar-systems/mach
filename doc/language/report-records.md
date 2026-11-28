@@ -284,11 +284,11 @@ written. Both are read from the catalog the text is written from, so a record
 says what its row of the table says, with no cell to cut and no mark to read.
 
 ```json
-{"schema":3,"record":"host","mach":"7.2.0","name":"linux-x86_64","sys":"linux","arch":"x86_64","env":null,"abi":"sysv64","isa":"cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2","code_model":"small","linkage":"static","object":"elf"}
+{"schema":3,"record":"host","mach":"7.3.0","name":"linux-x86_64","sys":"linux","arch":"x86_64","env":null,"abi":"sysv64","isa":"cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2","code_model":"small","linkage":"static","object":"elf"}
 ```
 
 ```
-host	schema=3	mach=7.2.0	name=linux-x86_64	sys=linux	arch=x86_64	abi=sysv64	isa=cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2	code_model=small	linkage=static	object=elf
+host	schema=3	mach=7.3.0	name=linux-x86_64	sys=linux	arch=x86_64	abi=sysv64	isa=cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2	code_model=small	linkage=static	object=elf
 ```
 
 A **host** record is the compiler's version and the target the host resolves to,
