@@ -761,7 +761,7 @@ vulkan-spirv           *none,vulkan1.0,vulkan1.1,vulkan1.2,vulkan1.3  *shader   
 value a line, the keys in a column of their own:
 
 ```
-mach        7.2.0
+mach        7.3.0
 host        linux-x86_64
 isa         cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2
 sys         linux
